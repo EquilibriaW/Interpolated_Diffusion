@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+
+checkpoints/
+outputs/
+runs/
+cache/
+
+*.pt
+*.npz
