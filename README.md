@@ -1,30 +1,27 @@
 # Interpolated Diffusion for Particle Maze Trajectories
 
-This repository implements two phases of trajectory diffusion for a Particle Maze domain:
+This repository implements a **two-stage generative pipeline** for trajectory diffusion in Particle Maze (and optional D4RL Maze2D):
 
-- **Phase 1 (full-sequence refinement)**: Treats "keyframes + interpolation" as a deterministic corruption operator `C_K`. A diffusion model learns to invert this corruption on the residual.
-- **Phase 2 (causal / diffusion-forcing style)**: A causal transformer denoiser uses per-timestep diffusion levels and inference-like rollouts.
+- **Stage 1 (Keypoint diffusion)**: sample sparse anchors (keypoints) from Gaussian noise using a transformer over **K tokens only**.
+- **Stage 2 (Interpolation-corruption denoiser)**: treat anchor density as the discrete corruption level and predict the clean trajectory **x0** (or delta) from an interpolated sequence.
 
-The code is designed to run on a single RTX 3090 (24GB) using mixed precision, gradient accumulation, and checkpointing where needed.
+The code is designed to run on a single RTX 3090/4090 using mixed precision, gradient accumulation, and checkpointing.
 
 ## Theory / Motivation
 
-We treat "keyframes + interpolation" as a deterministic corruption `C_K` applied to a clean trajectory `x`:
+We treat **anchor density as the "noise level"** (not Gaussian noise on residuals):
 
-- Choose keyframe index set `K` (mask `M`), always including endpoints.
-- Keep `x` at `K`, fill missing steps via interpolation: `y = C_K(x)`.
-- Define residual `r = x - y`. Residual is exactly zero at keyframes.
+1. Sample nested masks `{M_0 ... M_S}` with increasing anchor counts (M_S is sparsest).
+2. Corrupt a clean trajectory by deterministic interpolation:
+   - `x_s = Interp(x0 | M_s)`
+3. Train a denoiser `f_theta(x_s, M_s, s, cond) -> x0` (or delta = x0 - x_s).
 
-We train a diffusion model on residual `r`, conditioned on `y`, mask `M`, and maze condition `c`.
-At inference, we sample residual `r_hat` via reverse diffusion, clamp keyframes (`r[K]=0`), and output `x_hat = y + r_hat`.
+At inference:
+1. **Stage 1** samples keypoints `z` at `M_S` from Gaussian noise.
+2. Interpolate to full sequence: `x_S = Interp(z | M_S)`.
+3. **Stage 2** does a **one-step jump** `x_hat0 = f_theta(x_S, s=S, M_S, cond)` and clamps anchors.
 
-Key insight: interpolation is a cheap proposal ("half step"); diffusion corrects it ("full step").
-We then test how many reverse steps are needed for high-quality correction.
-
-Phase 2 moves to a causal/diffusion-forcing setup:
-- The model is causal in time.
-- Each timestep `i` has its own diffusion level `t_i` (per-frame noise).
-- Training matches inference-like rollouts with a clean past + noisy future mixture.
+This aligns “high noise ↔ few anchors” and makes the keypoint attention compute cheap: O(K^2).
 
 ## Install
 
@@ -66,64 +63,74 @@ If you already have a working D4RL install, no further changes are needed.
   - `models/`
     - `encoders.py`        # CNN encoder for maze/SDF and start/goal embed
     - `transformer.py`     # Transformer blocks (bi-dir + causal)
-    - `denoiser_fullseq.py`
-    - `denoiser_causal.py`
+    - `denoiser_keypoints.py`
+    - `denoiser_interp_levels.py`
+    - `denoiser_interp_levels_causal.py`
   - `train/`
-    - `train_fullseq.py`
-    - `train_causal.py`
+    - `train_keypoints.py`
+    - `train_interp_levels.py`
+    - `train_interp_levels_causal.py`
+    - `train_fullseq.py`   # alias -> train_interp_levels
+    - `train_causal.py`    # alias -> train_interp_levels_causal
   - `eval/`
     - `metrics.py`
     - `visualize.py`
   - `sample/`
-    - `sample_fullseq.py`
-    - `sample_causal.py`
+    - `sample_keypoints.py`
+    - `sample_generate.py`
+    - `sample_generate_causal.py`
+    - `sample_fullseq.py`  # alias -> sample_generate
+    - `sample_causal.py`   # alias -> sample_generate_causal
   - `utils/`
     - `seed.py`, `device.py`, `logging.py`, `ema.py`, `checkpoint.py`
 - `tests/`
 
-## Phase 1: Full-Sequence Residual Diffusion
+## Stage 1: Keypoint Diffusion (Gaussian DDPM)
 
 ### Train
 
 ```bash
-python -m src.train.train_fullseq --T 64 --N_train 1000 --batch 256 --steps 20000 --use_sdf 1
+python -m src.train.train_keypoints --dataset particle --T 64 --K 8 --steps 20000
 ```
 
 ### Train on D4RL Maze2d
 
 ```bash
-python -m src.train.train_fullseq --dataset d4rl --env_id maze2d-medium-v1 --T 64 --batch 256 --with_velocity 1
+python -m src.train.train_keypoints --dataset d4rl --env_id maze2d-medium-v1 --T 64 --K 8 --steps 20000
 ```
 
-### Sample
+### Sample keypoints
 
 ```bash
-python -m src.sample.sample_fullseq --ckpt <path> --ddim_steps 50
-python -m src.sample.sample_fullseq --ckpt <path> --ddim_steps 10
-python -m src.sample.sample_fullseq --ckpt <path> --ddim_steps 2
-python -m src.sample.sample_fullseq --ckpt <path> --ddim_steps 1
+python -m src.sample.sample_keypoints --ckpt <path> --T 64 --K 8 --ddim_steps 20
 ```
 
-The sampler writes metrics and PNG plots into the output directory and prints a short summary.
-
-## Phase 2: Causal / Diffusion-Forcing-Style Variant
+## Stage 2: Interpolation-Corruption Denoiser (x0-pred)
 
 ### Train
 
 ```bash
-python -m src.train.train_causal --T 64 --chunk 16 --N_train 1000 --batch 256 --steps 20000
+python -m src.train.train_interp_levels --dataset particle --T 64 --K_min 8 --levels 3 --steps 20000
 ```
 
 ### Train on D4RL Maze2d
 
 ```bash
-python -m src.train.train_causal --dataset d4rl --env_id maze2d-medium-v1 --T 64 --chunk 16 --batch 256 --with_velocity 1
+python -m src.train.train_interp_levels --dataset d4rl --env_id maze2d-medium-v1 --T 64 --K_min 8 --levels 3 --steps 20000
 ```
 
-### Sample
+## End-to-End Generation (keypoints -> interpolate -> one-step denoise)
 
 ```bash
-python -m src.sample.sample_causal --ckpt <path> --chunk 16 --ddim_steps 5
+python -m src.sample.sample_generate --dataset particle --T 64 --K_min 8 --levels 3 --n_samples 16 --out_dir runs/gen
+python -m src.sample.sample_generate --dataset d4rl --env_id maze2d-medium-v1 --T 64 --K_min 8 --levels 3 --n_samples 16 --out_dir runs/gen
+```
+
+## Causal Variant (optional)
+
+```bash
+python -m src.train.train_interp_levels_causal --dataset particle --T 64 --K_min 8 --levels 3 --steps 20000
+python -m src.sample.sample_generate_causal --dataset particle --T 64 --K_min 8 --levels 3 --n_samples 16 --out_dir runs/gen_causal
 ```
 
 ## Notes
