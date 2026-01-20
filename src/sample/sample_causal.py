@@ -147,6 +147,8 @@ def main():
             t_lin = torch.linspace(0.0, 1.0, args.T, device=device).unsqueeze(-1)
             baseline_t = start_t + t_lin * (goal_t - start_t)
             occ_t = cond_t["occ"][0]
+            if occ_t.dim() == 3:
+                occ_t = occ_t[0]
             gt_t = x_gt_t[:, :2]
 
             m_pred = compute_metrics(occ_t, x_gen, goal_t, gt_t)
