@@ -148,7 +148,9 @@ def main():
             right = goal if end == args.T - 1 else _heuristic_right(left, goal, L, remaining)
             local_T = L + 1
 
-            mask_local = sample_fixed_k_mask(local_T, min(args.K_min, local_T), generator=gen, device=device, ensure_endpoints=True)
+            mask_local = sample_fixed_k_mask(
+                local_T, min(args.K_min, local_T), generator=gen, device=device, ensure_endpoints=True
+            )
             idx_local = torch.where(mask_local)[0].unsqueeze(0)
             known = (idx_local == 0) | (idx_local == local_T - 1)
             known_values = torch.zeros((1, idx_local.shape[1], data_dim), device=device)
@@ -165,14 +167,24 @@ def main():
             x_seed.scatter_(1, idx_exp, z_hat)
             x_s = interpolate_from_mask(x_seed, mask_local.unsqueeze(0), recompute_velocity=bool(args.recompute_vel))
 
-            s_level = torch.full((1,), args.levels, device=device, dtype=torch.long)
-            delta_hat = interp_model(x_s, s_level, mask_local.unsqueeze(0), cond)
-            x_hat = x_s + delta_hat
-            x_hat = torch.where(mask_local.view(1, local_T, 1), x_s, x_hat)
+            # Build a sequence with full prefix context (0..cur-2) and current chunk (cur-1..end).
+            full_len = end + 1
+            x_full = torch.zeros((1, full_len, data_dim), device=device)
+            mask_full = torch.zeros((1, full_len), dtype=torch.bool, device=device)
+            if cur > 1:
+                x_full[0, : cur - 1] = x_gen[: cur - 1]
+                mask_full[0, : cur - 1] = True
+            x_full[0, cur - 1 : full_len] = x_s[0]
+            mask_full[0, cur - 1 : full_len] = mask_local
 
-            x_gen[cur : end + 1, :2] = x_hat[0, 1:, :2]
+            s_level = torch.full((1,), args.levels, device=device, dtype=torch.long)
+            delta_hat = interp_model(x_full, s_level, mask_full, cond)
+            x_hat = x_full + delta_hat
+            x_hat = torch.where(mask_full.unsqueeze(-1), x_full, x_hat)
+
+            x_gen[cur : end + 1, :2] = x_hat[0, cur : end + 1, :2]
             if data_dim > 2 and args.recompute_vel:
-                x_gen[cur : end + 1, 2:] = x_hat[0, 1:, 2:]
+                x_gen[cur : end + 1, 2:] = x_hat[0, cur : end + 1, 2:]
             cur = end + 1
 
         if data_dim > 2 and args.recompute_vel:

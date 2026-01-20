@@ -2,6 +2,7 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .encoders import MazeConditionEncoder
 from .transformer import TransformerEncoder
@@ -24,7 +25,6 @@ class InterpLevelDenoiser(nn.Module):
         super().__init__()
         self.data_dim = data_dim
         self.in_proj = nn.Linear(data_dim + 1, d_model)
-        self.pos_emb = nn.Embedding(512, d_model)
         self.level_emb = nn.Embedding(max_levels + 1, d_model)
         self.level_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
         self.cond_enc = MazeConditionEncoder(use_sdf=use_sdf, d_cond=d_cond)
@@ -41,11 +41,21 @@ class InterpLevelDenoiser(nn.Module):
         )
         self.out = nn.Linear(d_model, data_dim)
 
+    def _positional_embedding(self, T: int, device: torch.device, dim: int) -> torch.Tensor:
+        pos = torch.linspace(0.0, 1.0, T, device=device)
+        half = dim // 2
+        freqs = torch.exp(-torch.log(torch.tensor(10000.0, device=device)) * torch.arange(0, half, device=device) / half)
+        args = pos.unsqueeze(-1) * freqs.unsqueeze(0)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        if dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+        return emb
+
     def forward(self, x_s: torch.Tensor, s: torch.Tensor, mask: torch.Tensor, cond: Dict[str, torch.Tensor]):
         B, T, D = x_s.shape
         x = torch.cat([x_s, mask.unsqueeze(-1).float()], dim=-1)
         h = self.in_proj(x)
-        pos = self.pos_emb(torch.arange(T, device=x_s.device))
+        pos = self._positional_embedding(T, x_s.device, h.shape[-1])
         h = h + pos.unsqueeze(0)
         level = self.level_proj(self.level_emb(s))
         h = h + level.unsqueeze(1)
