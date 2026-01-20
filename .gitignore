@@ -2,11 +2,20 @@ __pycache__/
 *.pyc
 .DS_Store
 .venv/
+.pytest_cache/
 
 checkpoints/
 outputs/
 runs/
 cache/
+.cache/
+.d4rl/
+.matplotlib/
+.micromamba/
+miniconda/
+mujoco210/
+mujoco210-linux-x86_64.tar.gz
+config/
 
 *.pt
 *.npz
