@@ -16,6 +16,20 @@ def _cell_to_xy(cell, h, w):
 
 
 def _maybe_import_d4rl():
+    mujoco_candidates = [
+        os.environ.get("MUJOCO_PY_MUJOCO_PATH", ""),
+        "/workspace/mujoco210",
+        os.path.expanduser("~/.mujoco/mujoco210"),
+    ]
+    for candidate in mujoco_candidates:
+        if candidate and os.path.isdir(candidate):
+            os.environ.setdefault("MUJOCO_PY_MUJOCO_PATH", candidate)
+            bin_path = os.path.join(candidate, "bin")
+            ld_paths = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
+            if bin_path not in ld_paths:
+                ld_paths.append(bin_path)
+                os.environ["LD_LIBRARY_PATH"] = ":".join(ld_paths)
+            break
     try:
         import gym
         import d4rl  # noqa: F401
