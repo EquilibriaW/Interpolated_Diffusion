@@ -204,19 +204,19 @@ def main():
 
         if step > 0 and step % args.save_every == 0:
             ckpt_path = os.path.join(args.ckpt_dir, f"ckpt_{step:07d}.pt")
-        meta = {
-            "stage": "keypoints",
-            "T": args.T,
-            "K": args.K,
-            "data_dim": data_dim,
-            "N_train": args.N_train,
-            "schedule": args.schedule,
-            "use_sdf": bool(args.use_sdf),
-            "with_velocity": bool(args.with_velocity),
-            "dataset": args.dataset,
-            "env_id": args.env_id,
-            "d4rl_flip_y": bool(args.d4rl_flip_y),
-        }
+            meta = {
+                "stage": "keypoints",
+                "T": args.T,
+                "K": args.K,
+                "data_dim": data_dim,
+                "N_train": args.N_train,
+                "schedule": args.schedule,
+                "use_sdf": bool(args.use_sdf),
+                "with_velocity": bool(args.with_velocity),
+                "dataset": args.dataset,
+                "env_id": args.env_id,
+                "d4rl_flip_y": bool(args.d4rl_flip_y),
+            }
             save_checkpoint(ckpt_path, model, optimizer, step, ema, meta=meta)
 
     final_path = os.path.join(args.ckpt_dir, "ckpt_final.pt")
@@ -229,6 +229,9 @@ def main():
         "schedule": args.schedule,
         "use_sdf": bool(args.use_sdf),
         "with_velocity": bool(args.with_velocity),
+        "dataset": args.dataset,
+        "env_id": args.env_id,
+        "d4rl_flip_y": bool(args.d4rl_flip_y),
     }
     save_checkpoint(final_path, model, optimizer, args.steps, ema, meta=meta)
     writer.flush()
