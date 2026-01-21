@@ -33,7 +33,7 @@ def build_argparser():
     p.add_argument("--use_sdf", type=int, default=0)
     p.add_argument("--with_velocity", type=int, default=0)
     p.add_argument("--cache_dir", type=str, default=None)
-    p.add_argument("--dataset", type=str, default="particle", choices=["particle", "synthetic", "d4rl"])
+    p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl"])
     p.add_argument("--env_id", type=str, default="maze2d-medium-v1")
     p.add_argument("--num_samples", type=int, default=100000)
     p.add_argument("--d4rl_flip_y", type=int, default=1)
@@ -86,6 +86,8 @@ def _build_keypoint_batch(x0: torch.Tensor, K: int, cond: dict, generator: torch
 
 def main():
     args = build_argparser().parse_args()
+    if args.dataset != "d4rl":
+        raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl with Maze2D envs.")
     seed = args.seed if args.seed is not None else get_seed_from_env()
     set_seed(seed, deterministic=bool(args.deterministic))
 
@@ -202,16 +204,19 @@ def main():
 
         if step > 0 and step % args.save_every == 0:
             ckpt_path = os.path.join(args.ckpt_dir, f"ckpt_{step:07d}.pt")
-            meta = {
-                "stage": "keypoints",
-                "T": args.T,
-                "K": args.K,
-                "data_dim": data_dim,
-                "N_train": args.N_train,
-                "schedule": args.schedule,
-                "use_sdf": bool(args.use_sdf),
-                "with_velocity": bool(args.with_velocity),
-            }
+        meta = {
+            "stage": "keypoints",
+            "T": args.T,
+            "K": args.K,
+            "data_dim": data_dim,
+            "N_train": args.N_train,
+            "schedule": args.schedule,
+            "use_sdf": bool(args.use_sdf),
+            "with_velocity": bool(args.with_velocity),
+            "dataset": args.dataset,
+            "env_id": args.env_id,
+            "d4rl_flip_y": bool(args.d4rl_flip_y),
+        }
             save_checkpoint(ckpt_path, model, optimizer, step, ema, meta=meta)
 
     final_path = os.path.join(args.ckpt_dir, "ckpt_final.pt")

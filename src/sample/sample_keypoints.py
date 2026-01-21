@@ -30,7 +30,7 @@ def build_argparser():
     p.add_argument("--use_ema", type=int, default=1)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--override_meta", type=int, default=0)
-    p.add_argument("--dataset", type=str, default="particle", choices=["particle", "synthetic", "d4rl"])
+    p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl"])
     p.add_argument("--env_id", type=str, default="maze2d-medium-v1")
     p.add_argument("--d4rl_flip_y", type=int, default=1)
     return p
@@ -99,6 +99,8 @@ def main():
     args = build_argparser().parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     _ensure_mujoco_env()
+    if args.dataset != "d4rl":
+        raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl with Maze2D envs.")
 
     meta = {}
     if os.path.exists(args.ckpt):
@@ -117,6 +119,22 @@ def main():
             args.use_sdf = int(bool(meta.get("use_sdf")))
         if meta.get("with_velocity") is not None:
             args.with_velocity = int(bool(meta.get("with_velocity")))
+        if meta.get("dataset") is not None:
+            if args.dataset != meta.get("dataset"):
+                raise ValueError(
+                    f"Keypoint checkpoint dataset mismatch: ckpt={meta.get('dataset')} args={args.dataset}. "
+                    "Use --override_meta 1 to force."
+                )
+            args.dataset = meta.get("dataset")
+        if meta.get("env_id") is not None:
+            if args.env_id != meta.get("env_id"):
+                raise ValueError(
+                    f"Keypoint checkpoint env_id mismatch: ckpt={meta.get('env_id')} args={args.env_id}. "
+                    "Use --override_meta 1 to force."
+                )
+            args.env_id = meta.get("env_id")
+        if meta.get("d4rl_flip_y") is not None:
+            args.d4rl_flip_y = int(bool(meta.get("d4rl_flip_y")))
 
     device = get_device(args.device)
     data_dim = 4 if args.with_velocity else 2

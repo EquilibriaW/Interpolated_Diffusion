@@ -35,7 +35,7 @@ def build_argparser():
     p.add_argument("--with_velocity", type=int, default=0)
     p.add_argument("--recompute_vel", type=int, default=1)
     p.add_argument("--cache_dir", type=str, default=None)
-    p.add_argument("--dataset", type=str, default="particle", choices=["particle", "synthetic", "d4rl"])
+    p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl"])
     p.add_argument("--env_id", type=str, default="maze2d-medium-v1")
     p.add_argument("--num_samples", type=int, default=100000)
     p.add_argument("--d4rl_flip_y", type=int, default=1)
@@ -140,6 +140,8 @@ def build_interp_level_batch(
 
 def main():
     args = build_argparser().parse_args()
+    if args.dataset != "d4rl":
+        raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl with Maze2D envs.")
     seed = args.seed if args.seed is not None else get_seed_from_env()
     set_seed(seed, deterministic=bool(args.deterministic))
 
