@@ -12,6 +12,7 @@ from src.diffusion.ddpm import _timesteps, ddim_step
 from src.diffusion.schedules import make_alpha_bars, make_beta_schedule
 from src.models.denoiser_keypoints import KeypointDenoiser
 from src.utils.device import get_device
+from src.utils.normalize import logit_pos, sigmoid_pos
 
 
 def build_argparser():
@@ -27,6 +28,8 @@ def build_argparser():
     p.add_argument("--ddim_steps", type=int, default=20)
     p.add_argument("--use_sdf", type=int, default=0)
     p.add_argument("--with_velocity", type=int, default=0)
+    p.add_argument("--logit_space", type=int, default=0)
+    p.add_argument("--logit_eps", type=float, default=1e-5)
     p.add_argument("--use_ema", type=int, default=1)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--override_meta", type=int, default=0)
@@ -119,6 +122,10 @@ def main():
             args.use_sdf = int(bool(meta.get("use_sdf")))
         if meta.get("with_velocity") is not None:
             args.with_velocity = int(bool(meta.get("with_velocity")))
+        if meta.get("logit_space") is not None:
+            args.logit_space = int(bool(meta.get("logit_space")))
+        if meta.get("logit_eps") is not None:
+            args.logit_eps = float(meta.get("logit_eps"))
         if meta.get("dataset") is not None:
             if args.dataset != meta.get("dataset"):
                 raise ValueError(
@@ -196,7 +203,11 @@ def main():
             B = cond["start_goal"].shape[0]
             idx, _ = sample_fixed_k_indices_batch(B, args.T, args.K, device=device, ensure_endpoints=True)
             known_mask, known_values = _build_known_mask_values(idx, cond, data_dim, args.T)
+            if args.logit_space:
+                known_values = logit_pos(known_values, eps=args.logit_eps)
             z_hat = _sample_ddim(model, schedule, idx, known_mask, known_values, cond, args.ddim_steps, args.T)
+            if args.logit_space:
+                z_hat = sigmoid_pos(z_hat)
             all_samples.append({"idx": idx.detach().cpu(), "z": z_hat.detach().cpu()})
 
     torch.save(all_samples, os.path.join(args.out_dir, "keypoints.pt"))

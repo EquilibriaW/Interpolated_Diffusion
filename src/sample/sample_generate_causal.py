@@ -15,6 +15,7 @@ from src.models.denoiser_interp_levels_causal import InterpLevelCausalDenoiser
 from src.models.denoiser_keypoints import KeypointDenoiser
 from src.utils.clamp import apply_clamp
 from src.utils.device import get_device
+from src.utils.normalize import logit_pos, sigmoid_pos
 
 
 def build_argparser():
@@ -33,6 +34,8 @@ def build_argparser():
     p.add_argument("--use_sdf", type=int, default=0)
     p.add_argument("--with_velocity", type=int, default=0)
     p.add_argument("--recompute_vel", type=int, default=1)
+    p.add_argument("--logit_space", type=int, default=0)
+    p.add_argument("--logit_eps", type=float, default=1e-5)
     p.add_argument("--use_ema", type=int, default=1)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl"])
@@ -159,6 +162,10 @@ def main():
             args.use_sdf = int(bool(meta.get("use_sdf")))
         if meta.get("with_velocity") is not None:
             args.with_velocity = int(bool(meta.get("with_velocity")))
+        if meta.get("logit_space") is not None:
+            args.logit_space = int(bool(meta.get("logit_space")))
+        if meta.get("logit_eps") is not None:
+            args.logit_eps = float(meta.get("logit_eps"))
         if meta.get("dataset") is not None:
             if args.dataset != meta.get("dataset"):
                 raise ValueError(
@@ -311,6 +318,8 @@ def main():
             known_values[:, :, :2] = torch.where(
                 (idx_local == local_T - 1).unsqueeze(-1), right.view(1, 1, 2), known_values[:, :, :2]
             )
+            if args.logit_space:
+                known_values = logit_pos(known_values, eps=args.logit_eps)
 
             cond_chunk = {k: v for k, v in cond.items()}
             cond_chunk["start_goal"] = torch.cat([left, right], dim=0).view(1, 4)
@@ -318,6 +327,8 @@ def main():
             z_hat = _sample_keypoints_ddim(
                 kp_model, schedule, idx_local, known_mask, known_values, cond_chunk, args.ddim_steps, local_T
             )
+            if args.logit_space:
+                z_hat = sigmoid_pos(z_hat)
 
             x_s = interpolate_from_indices(idx_local, z_hat, local_T, recompute_velocity=bool(args.recompute_vel))
 

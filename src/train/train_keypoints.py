@@ -15,6 +15,7 @@ from src.utils.checkpoint import load_checkpoint, save_checkpoint
 from src.utils.device import get_autocast_dtype, get_device
 from src.utils.ema import EMA
 from src.utils.logging import create_writer
+from src.utils.normalize import logit_pos
 from src.utils.seed import get_seed_from_env, set_seed
 
 
@@ -32,6 +33,8 @@ def build_argparser():
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--use_sdf", type=int, default=0)
     p.add_argument("--with_velocity", type=int, default=0)
+    p.add_argument("--logit_space", type=int, default=1)
+    p.add_argument("--logit_eps", type=float, default=1e-5)
     p.add_argument("--cache_dir", type=str, default=None)
     p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl"])
     p.add_argument("--env_id", type=str, default="maze2d-medium-v1")
@@ -76,11 +79,21 @@ def _build_known_mask_values(idx: torch.Tensor, cond: dict, D: int, T: int) -> T
     return known_mask, known_values
 
 
-def _build_keypoint_batch(x0: torch.Tensor, K: int, cond: dict, generator: torch.Generator):
+def _build_keypoint_batch(
+    x0: torch.Tensor,
+    K: int,
+    cond: dict,
+    generator: torch.Generator,
+    logit_space: bool,
+    logit_eps: float,
+):
     B, T, D = x0.shape
     idx, _ = sample_fixed_k_indices_batch(B, T, K, generator=generator, device=x0.device, ensure_endpoints=True)
     z0 = _gather_keypoints(x0, idx)
     known_mask, known_values = _build_known_mask_values(idx, cond, D, T)
+    if logit_space:
+        z0 = logit_pos(z0, eps=logit_eps)
+        known_values = logit_pos(known_values, eps=logit_eps)
     return z0, idx, known_mask, known_values
 
 
@@ -166,7 +179,9 @@ def main():
         x0 = batch["x"].to(device)
         cond = {k: v.to(device) for k, v in batch["cond"].items()}
 
-        z0, idx, known_mask, known_values = _build_keypoint_batch(x0, args.K, cond, gen)
+        z0, idx, known_mask, known_values = _build_keypoint_batch(
+            x0, args.K, cond, gen, bool(args.logit_space), args.logit_eps
+        )
 
         t = torch.randint(0, args.N_train, (x0.shape[0],), device=device, dtype=torch.long)
         z_t, eps = q_sample(z0, t, schedule)
@@ -211,12 +226,14 @@ def main():
                 "data_dim": data_dim,
                 "N_train": args.N_train,
                 "schedule": args.schedule,
-                "use_sdf": bool(args.use_sdf),
-                "with_velocity": bool(args.with_velocity),
-                "dataset": args.dataset,
-                "env_id": args.env_id,
-                "d4rl_flip_y": bool(args.d4rl_flip_y),
-            }
+            "use_sdf": bool(args.use_sdf),
+            "with_velocity": bool(args.with_velocity),
+            "dataset": args.dataset,
+            "env_id": args.env_id,
+            "d4rl_flip_y": bool(args.d4rl_flip_y),
+            "logit_space": bool(args.logit_space),
+            "logit_eps": float(args.logit_eps),
+        }
             save_checkpoint(ckpt_path, model, optimizer, step, ema, meta=meta)
 
     final_path = os.path.join(args.ckpt_dir, "ckpt_final.pt")
@@ -232,6 +249,8 @@ def main():
         "dataset": args.dataset,
         "env_id": args.env_id,
         "d4rl_flip_y": bool(args.d4rl_flip_y),
+        "logit_space": bool(args.logit_space),
+        "logit_eps": float(args.logit_eps),
     }
     save_checkpoint(final_path, model, optimizer, args.steps, ema, meta=meta)
     writer.flush()

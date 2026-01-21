@@ -18,6 +18,7 @@ from src.models.denoiser_interp_levels import InterpLevelDenoiser
 from src.models.denoiser_keypoints import KeypointDenoiser
 from src.utils.clamp import apply_clamp
 from src.utils.device import get_device
+from src.utils.normalize import logit_pos, sigmoid_pos
 
 
 def build_argparser():
@@ -36,6 +37,8 @@ def build_argparser():
     p.add_argument("--use_sdf", type=int, default=0)
     p.add_argument("--with_velocity", type=int, default=0)
     p.add_argument("--recompute_vel", type=int, default=1)
+    p.add_argument("--logit_space", type=int, default=0)
+    p.add_argument("--logit_eps", type=float, default=1e-5)
     p.add_argument("--use_ema", type=int, default=1)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl"])
@@ -185,10 +188,18 @@ def main():
         args.schedule = meta.get("schedule", args.schedule)
         if args.K_min is None:
             args.K_min = meta.get("K", args.K_min)
+        if meta.get("logit_space") is not None:
+            args.logit_space = int(bool(meta.get("logit_space")))
+        if meta.get("logit_eps") is not None:
+            args.logit_eps = float(meta.get("logit_eps"))
         if meta.get("use_sdf") is not None:
             args.use_sdf = int(bool(meta.get("use_sdf")))
         if meta.get("with_velocity") is not None:
             args.with_velocity = int(bool(meta.get("with_velocity")))
+        if meta.get("logit_space") is not None:
+            args.logit_space = int(bool(meta.get("logit_space")))
+        if meta.get("logit_eps") is not None:
+            args.logit_eps = float(meta.get("logit_eps"))
         if meta.get("dataset") is not None:
             if args.dataset != meta.get("dataset"):
                 raise ValueError(
@@ -337,6 +348,8 @@ def main():
                     z_steps = None
                 else:
                     known_mask, known_values = _build_known_mask_values(idx, cond, data_dim, args.T)
+                    if args.logit_space:
+                        known_values = logit_pos(known_values, eps=args.logit_eps)
                     if args.save_diffusion_frames:
                         z_hat, z_steps = _sample_keypoints_ddim(
                             kp_model,
@@ -354,6 +367,10 @@ def main():
                             kp_model, schedule, idx, known_mask, known_values, cond, args.ddim_steps, args.T
                         )
                         z_steps = None
+                    if args.logit_space:
+                        z_hat = sigmoid_pos(z_hat)
+                        if z_steps is not None:
+                            z_steps = [sigmoid_pos(z_step) for z_step in z_steps]
 
                 x_s = interpolate_from_indices(idx, z_hat, args.T, recompute_velocity=bool(args.recompute_vel))
 

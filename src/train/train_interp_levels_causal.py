@@ -17,6 +17,7 @@ from src.utils.checkpoint import load_checkpoint, save_checkpoint
 from src.utils.device import get_autocast_dtype, get_device
 from src.utils.ema import EMA
 from src.utils.logging import create_writer
+from src.utils.normalize import logit_pos, sigmoid_pos
 from src.utils.seed import get_seed_from_env, set_seed
 
 
@@ -205,6 +206,8 @@ def main():
 
     bootstrap_model = None
     bootstrap_schedule = None
+    bootstrap_logit = False
+    bootstrap_logit_eps = 1e-5
     if args.bootstrap_stage1_ckpt is not None:
         bootstrap_model = KeypointDenoiser(
             data_dim=data_dim,
@@ -232,6 +235,10 @@ def main():
         schedule_name = meta.get("schedule")
         if n_train is None or schedule_name is None:
             raise ValueError("Keypoint checkpoint missing meta for N_train/schedule")
+        if meta.get("logit_space") is not None:
+            bootstrap_logit = bool(meta.get("logit_space"))
+        if meta.get("logit_eps") is not None:
+            bootstrap_logit_eps = float(meta.get("logit_eps"))
         betas_boot = make_beta_schedule(schedule_name, n_train).to(device)
         bootstrap_schedule = make_alpha_bars(betas_boot)
 
@@ -270,6 +277,8 @@ def main():
             if torch.any(use_mask):
                 idx_s = idx_levels[args.levels]
                 known_mask, known_values = _build_known_mask_values(idx_s, cond, data_dim, args.T)
+                if bootstrap_logit:
+                    known_values = logit_pos(known_values, eps=bootstrap_logit_eps)
                 with torch.no_grad():
                     z_hat = _sample_keypoints_ddim(
                         bootstrap_model,
@@ -281,6 +290,8 @@ def main():
                         args.bootstrap_ddim_steps,
                         args.T,
                     )
+                    if bootstrap_logit:
+                        z_hat = sigmoid_pos(z_hat)
                 x0_aug = x0.clone()
                 if use_mask.all():
                     x0_aug[:, :, :2].scatter_(
