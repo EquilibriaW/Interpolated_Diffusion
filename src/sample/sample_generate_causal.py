@@ -13,7 +13,6 @@ from src.diffusion.schedules import make_alpha_bars, make_beta_schedule
 from src.eval.visualize import plot_maze2d_geom_walls, plot_maze2d_trajectories, plot_trajectories
 from src.models.denoiser_interp_levels_causal import InterpLevelCausalDenoiser
 from src.models.denoiser_keypoints import KeypointDenoiser
-from src.utils.checkpoint import load_checkpoint
 from src.utils.clamp import apply_clamp
 from src.utils.device import get_device
 
@@ -152,21 +151,34 @@ def main():
         max_levels=args.levels,
     ).to(device)
 
+    payload_kp = torch.load(args.ckpt_keypoints, map_location="cpu") if os.path.exists(args.ckpt_keypoints) else {}
+    payload_interp = torch.load(args.ckpt_interp, map_location="cpu") if os.path.exists(args.ckpt_interp) else {}
+    if "model" not in payload_kp:
+        raise FileNotFoundError(f"Checkpoint not found or invalid: {args.ckpt_keypoints}")
+    if "model" not in payload_interp:
+        raise FileNotFoundError(f"Checkpoint not found or invalid: {args.ckpt_interp}")
+    kp_model.load_state_dict(payload_kp["model"])
+    interp_model.load_state_dict(payload_interp["model"])
+    ema_warned = False
     if args.use_ema:
         from src.utils.ema import EMA
 
-        ema_kp = EMA(kp_model.parameters())
-        ema_interp = EMA(interp_model.parameters())
-    else:
-        ema_kp = None
-        ema_interp = None
-
-    _, payload_kp = load_checkpoint(args.ckpt_keypoints, kp_model, optimizer=None, ema=ema_kp, map_location=device, return_payload=True)
-    load_checkpoint(args.ckpt_interp, interp_model, optimizer=None, ema=ema_interp, map_location=device)
-    if ema_kp is not None:
-        ema_kp.copy_to(kp_model.parameters())
-    if ema_interp is not None:
-        ema_interp.copy_to(interp_model.parameters())
+        if isinstance(payload_kp, dict) and "ema" in payload_kp:
+            ema_kp = EMA(kp_model.parameters())
+            ema_kp.load_state_dict(payload_kp["ema"])
+            ema_kp.copy_to(kp_model.parameters())
+        else:
+            if not ema_warned:
+                print("Checkpoint has no EMA; using raw model weights.")
+                ema_warned = True
+        if isinstance(payload_interp, dict) and "ema" in payload_interp:
+            ema_interp = EMA(interp_model.parameters())
+            ema_interp.load_state_dict(payload_interp["ema"])
+            ema_interp.copy_to(interp_model.parameters())
+        else:
+            if not ema_warned:
+                print("Checkpoint has no EMA; using raw model weights.")
+                ema_warned = True
     kp_model.eval()
     interp_model.eval()
 

@@ -11,7 +11,6 @@ from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset
 from src.diffusion.ddpm import _timesteps, ddim_step
 from src.diffusion.schedules import make_alpha_bars, make_beta_schedule
 from src.models.denoiser_keypoints import KeypointDenoiser
-from src.utils.checkpoint import load_checkpoint
 from src.utils.device import get_device
 
 
@@ -106,15 +105,21 @@ def main():
     data_dim = 4 if args.with_velocity else 2
 
     model = KeypointDenoiser(data_dim=data_dim, use_sdf=bool(args.use_sdf)).to(device)
+    if not os.path.exists(args.ckpt):
+        raise FileNotFoundError(f"Checkpoint not found: {args.ckpt}")
+    payload = torch.load(args.ckpt, map_location="cpu")
+    if "model" not in payload:
+        raise KeyError(f"Checkpoint missing model weights: {args.ckpt}")
+    model.load_state_dict(payload["model"])
     if args.use_ema:
         from src.utils.ema import EMA
 
-        ema = EMA(model.parameters())
-    else:
-        ema = None
-    step, payload = load_checkpoint(args.ckpt, model, optimizer=None, ema=ema, map_location=device, return_payload=True)
-    if ema is not None:
-        ema.copy_to(model.parameters())
+        if "ema" in payload:
+            ema = EMA(model.parameters())
+            ema.load_state_dict(payload["ema"])
+            ema.copy_to(model.parameters())
+        else:
+            print("Checkpoint has no EMA; using raw model weights.")
     model.eval()
 
     meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
