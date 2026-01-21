@@ -116,6 +116,27 @@ def _unnormalize_pos(x: torch.Tensor, pos_low: torch.Tensor, pos_scale: torch.Te
     return pos * pos_scale[:2] + pos_low[:2]
 
 
+def _bounds_from_walls(walls: list) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    pts = np.concatenate([np.asarray(w) for w in walls], axis=0)
+    xmin, ymin = pts.min(axis=0)
+    xmax, ymax = pts.max(axis=0)
+    return (float(xmin), float(xmax)), (float(ymin), float(ymax))
+
+
+def _unnormalize_pos_with_bounds(
+    x: torch.Tensor,
+    bounds: Tuple[Tuple[float, float], Tuple[float, float]],
+    flip_y: bool,
+) -> torch.Tensor:
+    pos = x[..., :2].clone()
+    if flip_y:
+        pos[..., 1] = 1.0 - pos[..., 1]
+    (xmin, xmax), (ymin, ymax) = bounds
+    scale = torch.tensor([xmax - xmin, ymax - ymin], device=pos.device, dtype=pos.dtype)
+    low = torch.tensor([xmin, ymin], device=pos.device, dtype=pos.dtype)
+    return pos * scale + low
+
+
 def _build_known_mask_values(idx: torch.Tensor, cond: dict, D: int, T: int) -> Tuple[torch.Tensor, torch.Tensor]:
     B, K = idx.shape
     known_mask = torch.zeros((B, K, D), device=idx.device, dtype=torch.bool)
@@ -295,6 +316,7 @@ def main():
     maze_map = None
     maze_scale = None
     mj_walls = None
+    walls_bounds = None
     pos_low = None
     pos_scale = None
     flip_y = False
@@ -305,6 +327,8 @@ def main():
         pos_low = getattr(dataset, "pos_low", None)
         pos_scale = getattr(dataset, "pos_scale", None)
         flip_y = bool(getattr(dataset, "flip_y", False))
+        if mj_walls:
+            walls_bounds = _bounds_from_walls(mj_walls)
         if maze_scale is None and maze_map is not None and pos_scale is not None:
             maze_arr = np.array(maze_map)
             if maze_arr.ndim == 2:
@@ -415,28 +439,18 @@ def main():
                             gt_np = x0_gt[b].detach().cpu().numpy()
                             trajs.append(gt_np[:, :2])
                             labels.append("gt")
-                        if dataset_name == "d4rl" and pos_low is not None and pos_scale is not None:
-                            interp_world = _unnormalize_pos(interp_t, pos_low.to(device), pos_scale.to(device), flip_y)
-                            refined_world = _unnormalize_pos(refined_t, pos_low.to(device), pos_scale.to(device), flip_y)
-                            world_trajs = [interp_world.detach().cpu().numpy(), refined_world.detach().cpu().numpy()]
-                            world_labels = ["interp", "refined"]
-                            if args.plot_gt and x0_gt is not None:
-                                gt_world = _unnormalize_pos(
-                                    x0_gt[b], pos_low.to(device), pos_scale.to(device), flip_y
-                                ).detach().cpu().numpy()
-                                world_trajs.append(gt_world)
-                                world_labels.append("gt")
-                            bounds = (
-                                (float(pos_low[0].item()), float((pos_low[0] + pos_scale[0]).item())),
-                                (float(pos_low[1].item()), float((pos_low[1] + pos_scale[1]).item())),
-                            )
-                            if mj_walls:
+                        if dataset_name == "d4rl":
+                            if mj_walls and walls_bounds is not None:
+                                interp_world = _unnormalize_pos_with_bounds(interp_t, walls_bounds, flip_y)
+                                refined_world = _unnormalize_pos_with_bounds(refined_t, walls_bounds, flip_y)
+                                world_trajs = [interp_world.detach().cpu().numpy(), refined_world.detach().cpu().numpy()]
+                                world_labels = ["interp", "refined"]
+                                if args.plot_gt and x0_gt is not None:
+                                    gt_world = _unnormalize_pos_with_bounds(x0_gt[b], walls_bounds, flip_y)
+                                    world_trajs.append(gt_world.detach().cpu().numpy())
+                                    world_labels.append("gt")
                                 plot_maze2d_geom_walls(
-                                    mj_walls, world_trajs, world_labels, out_path=out_path, bounds=bounds
-                                )
-                            elif maze_map is not None and maze_scale is not None:
-                                plot_maze2d_trajectories(
-                                    maze_map, maze_scale, world_trajs, world_labels, out_path=out_path, bounds=bounds
+                                    mj_walls, world_trajs, world_labels, out_path=out_path, bounds=walls_bounds
                                 )
                             else:
                                 occ = occ_t.detach().cpu().numpy()
@@ -456,66 +470,29 @@ def main():
                             )
                             frame_path = os.path.join(frames_dir, f"step_{si:03d}.png")
                             step_np = x_step[0].detach().cpu().numpy()
-                            if dataset_name == "d4rl" and pos_low is not None and pos_scale is not None:
-                                step_world = _unnormalize_pos(x_step[0], pos_low.to(device), pos_scale.to(device), flip_y)
-                                bounds = (
-                                    (float(pos_low[0].item()), float((pos_low[0] + pos_scale[0]).item())),
-                                    (float(pos_low[1].item()), float((pos_low[1] + pos_scale[1]).item())),
+                            if dataset_name == "d4rl" and mj_walls and walls_bounds is not None:
+                                step_world = _unnormalize_pos_with_bounds(x_step[0], walls_bounds, flip_y)
+                                plot_maze2d_geom_walls(
+                                    mj_walls,
+                                    [step_world.detach().cpu().numpy()],
+                                    [f"step {step_idx}"],
+                                    out_path=frame_path,
+                                    bounds=walls_bounds,
                                 )
-                                if mj_walls:
-                                    plot_maze2d_geom_walls(
-                                        mj_walls,
-                                        [step_world.detach().cpu().numpy()],
-                                        [f"step {step_idx}"],
-                                        out_path=frame_path,
-                                        bounds=bounds,
-                                    )
-                                elif maze_map is not None and maze_scale is not None:
-                                    plot_maze2d_trajectories(
-                                        maze_map,
-                                        maze_scale,
-                                        [step_world.detach().cpu().numpy()],
-                                        [f"step {step_idx}"],
-                                        out_path=frame_path,
-                                        bounds=bounds,
-                                    )
-                                else:
-                                    occ = occ_t.detach().cpu().numpy()
-                                    plot_trajectories(occ, [step_np[:, :2]], [f"step {step_idx}"], out_path=frame_path)
                             else:
                                 occ = occ_t.detach().cpu().numpy()
                                 plot_trajectories(occ, [step_np[:, :2]], [f"step {step_idx}"], out_path=frame_path)
                         if args.frames_include_stage2:
                             final_path = os.path.join(frames_dir, "stage2.png")
-                            if dataset_name == "d4rl" and pos_low is not None and pos_scale is not None:
-                                refined_world = _unnormalize_pos(
-                                    refined_t, pos_low.to(device), pos_scale.to(device), flip_y
+                            if dataset_name == "d4rl" and mj_walls and walls_bounds is not None:
+                                refined_world = _unnormalize_pos_with_bounds(refined_t, walls_bounds, flip_y)
+                                plot_maze2d_geom_walls(
+                                    mj_walls,
+                                    [refined_world.detach().cpu().numpy()],
+                                    ["stage2"],
+                                    out_path=final_path,
+                                    bounds=walls_bounds,
                                 )
-                                bounds = (
-                                    (float(pos_low[0].item()), float((pos_low[0] + pos_scale[0]).item())),
-                                    (float(pos_low[1].item()), float((pos_low[1] + pos_scale[1]).item())),
-                                )
-                                if mj_walls:
-                                    plot_maze2d_geom_walls(
-                                        mj_walls,
-                                        [refined_world.detach().cpu().numpy()],
-                                        ["stage2"],
-                                        out_path=final_path,
-                                        bounds=bounds,
-                                    )
-                                elif maze_map is not None and maze_scale is not None:
-                                    plot_maze2d_trajectories(
-                                        maze_map,
-                                        maze_scale,
-                                        [refined_world.detach().cpu().numpy()],
-                                        ["stage2"],
-                                        out_path=final_path,
-                                        bounds=bounds,
-                                    )
-                                else:
-                                    occ = occ_t.detach().cpu().numpy()
-                                    refined_np = refined_t.detach().cpu().numpy()
-                                    plot_trajectories(occ, [refined_np[:, :2]], ["stage2"], out_path=final_path)
                             else:
                                 occ = occ_t.detach().cpu().numpy()
                                 refined_np = refined_t.detach().cpu().numpy()
