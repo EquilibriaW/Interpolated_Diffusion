@@ -1,14 +1,121 @@
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib.patches import Polygon, Rectangle
 
 
 def _to_numpy(x):
     if torch.is_tensor(x):
         return x.detach().cpu().numpy()
     return x
+
+
+def _maze_map_to_walls(
+    maze_map: Union[np.ndarray, Sequence],
+    scale: float,
+) -> List[Tuple[float, float, float, float]]:
+    if maze_map is None:
+        return []
+    if isinstance(maze_map, np.ndarray):
+        occ = maze_map > 0
+    elif isinstance(maze_map, (list, tuple)) and len(maze_map) > 0:
+        if isinstance(maze_map[0], (list, tuple, np.ndarray)):
+            occ = np.array(maze_map) > 0
+        elif isinstance(maze_map[0], str):
+            h = len(maze_map)
+            w = len(maze_map[0])
+            occ = np.zeros((h, w), dtype=bool)
+            wall_chars = {"#", "1", "X"}
+            for i, row in enumerate(maze_map):
+                for j, ch in enumerate(row):
+                    if ch in wall_chars:
+                        occ[i, j] = True
+        else:
+            return []
+    else:
+        return []
+    h, w = occ.shape
+    walls = []
+    for i in range(h):
+        for j in range(w):
+            if occ[i, j]:
+                walls.append((j * scale, i * scale, scale, scale))
+    return walls
+
+
+def plot_maze2d_trajectories(
+    maze_map: Union[np.ndarray, Sequence],
+    scale: float,
+    trajs: List[np.ndarray],
+    labels: List[str],
+    colors: Optional[List[str]] = None,
+    out_path: Optional[str] = None,
+    bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
+):
+    trajs = [_to_numpy(traj) for traj in trajs]
+    walls = _maze_map_to_walls(maze_map, scale)
+    fig, ax = plt.subplots(figsize=(4, 4))
+    for (x, y, w, h) in walls:
+        ax.add_patch(Rectangle((x, y), w, h, facecolor="black", edgecolor="black", linewidth=0.0))
+    if colors is None:
+        colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
+    for i, traj in enumerate(trajs):
+        xy = traj[:, :2]
+        ax.plot(xy[:, 0], xy[:, 1], color=colors[i % len(colors)], label=labels[i])
+        ax.scatter([xy[0, 0]], [xy[0, 1]], color=colors[i % len(colors)], s=12)
+        ax.scatter([xy[-1, 0]], [xy[-1, 1]], color=colors[i % len(colors)], s=12, marker="x")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect("equal")
+    if bounds is not None:
+        (xmin, xmax), (ymin, ymax) = bounds
+        ax.set_xlim([xmin, xmax])
+        ax.set_ylim([ymin, ymax])
+    ax.legend(loc="lower right", fontsize=6)
+    fig.tight_layout()
+    if out_path is not None:
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+    else:
+        return fig
+
+
+def plot_maze2d_geom_walls(
+    wall_polys: List[np.ndarray],
+    trajs: List[np.ndarray],
+    labels: List[str],
+    colors: Optional[List[str]] = None,
+    out_path: Optional[str] = None,
+    bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
+):
+    trajs = [_to_numpy(traj) for traj in trajs]
+    fig, ax = plt.subplots(figsize=(4, 4))
+    for poly in wall_polys:
+        poly_np = _to_numpy(poly)
+        ax.add_patch(Polygon(poly_np, closed=True, facecolor="black", edgecolor="black", linewidth=0.0))
+    if colors is None:
+        colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
+    for i, traj in enumerate(trajs):
+        xy = traj[:, :2]
+        ax.plot(xy[:, 0], xy[:, 1], color=colors[i % len(colors)], label=labels[i])
+        ax.scatter([xy[0, 0]], [xy[0, 1]], color=colors[i % len(colors)], s=12)
+        ax.scatter([xy[-1, 0]], [xy[-1, 1]], color=colors[i % len(colors)], s=12, marker="x")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect("equal")
+    if bounds is not None:
+        (xmin, xmax), (ymin, ymax) = bounds
+        ax.set_xlim([xmin, xmax])
+        ax.set_ylim([ymin, ymax])
+    ax.legend(loc="lower right", fontsize=6)
+    fig.tight_layout()
+    if out_path is not None:
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+    else:
+        return fig
 
 
 def plot_trajectories(

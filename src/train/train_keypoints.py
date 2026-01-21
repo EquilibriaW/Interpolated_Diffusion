@@ -1,11 +1,12 @@
 import argparse
 import os
+from typing import Tuple
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.corruptions.keyframes import sample_fixed_k_mask
+from src.corruptions.keyframes import sample_fixed_k_indices_batch
 from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset
 from src.diffusion.ddpm import q_sample
 from src.diffusion.schedules import make_alpha_bars, make_beta_schedule
@@ -46,6 +47,9 @@ def build_argparser():
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--use_checkpoint", type=int, default=0)
+    p.add_argument("--deterministic", type=int, default=1)
+    p.add_argument("--allow_tf32", type=int, default=1)
+    p.add_argument("--enable_flash_sdp", type=int, default=1)
     return p
 
 
@@ -55,8 +59,9 @@ def _gather_keypoints(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return torch.gather(x, dim=1, index=idx_exp)
 
 
-def _build_known_values(idx: torch.Tensor, cond: dict, D: int, T: int) -> torch.Tensor:
+def _build_known_mask_values(idx: torch.Tensor, cond: dict, D: int, T: int) -> Tuple[torch.Tensor, torch.Tensor]:
     B, K = idx.shape
+    known_mask = torch.zeros((B, K, D), device=idx.device, dtype=torch.bool)
     known_values = torch.zeros((B, K, D), device=idx.device, dtype=torch.float32)
     if "start_goal" in cond and D >= 2:
         start = cond["start_goal"][:, :2]
@@ -65,30 +70,40 @@ def _build_known_values(idx: torch.Tensor, cond: dict, D: int, T: int) -> torch.
         goal_pos = goal.unsqueeze(1).expand(B, K, 2)
         mask_start = (idx == 0).unsqueeze(-1)
         mask_goal = (idx == T - 1).unsqueeze(-1)
+        known_mask[:, :, :2] = mask_start | mask_goal
         known_values[:, :, :2] = torch.where(mask_start, start_pos, known_values[:, :, :2])
         known_values[:, :, :2] = torch.where(mask_goal, goal_pos, known_values[:, :, :2])
-    return known_values
+    return known_mask, known_values
 
 
 def _build_keypoint_batch(x0: torch.Tensor, K: int, cond: dict, generator: torch.Generator):
     B, T, D = x0.shape
-    device = x0.device
-    idx = torch.zeros((B, K), dtype=torch.long, device=device)
-    for b in range(B):
-        mask = sample_fixed_k_mask(T, K, generator=generator, device=device, ensure_endpoints=True)
-        idx[b] = torch.where(mask)[0]
+    idx, _ = sample_fixed_k_indices_batch(B, T, K, generator=generator, device=x0.device, ensure_endpoints=True)
     z0 = _gather_keypoints(x0, idx)
-    known = (idx == 0) | (idx == T - 1)
-    known_values = _build_known_values(idx, cond, D, T)
-    return z0, idx, known, known_values
+    known_mask, known_values = _build_known_mask_values(idx, cond, D, T)
+    return z0, idx, known_mask, known_values
 
 
 def main():
     args = build_argparser().parse_args()
     seed = args.seed if args.seed is not None else get_seed_from_env()
-    set_seed(seed)
+    set_seed(seed, deterministic=bool(args.deterministic))
 
     device = get_device(args.device)
+    if device.type == "cuda" and not bool(args.deterministic):
+        torch.backends.cudnn.benchmark = True
+        if bool(args.allow_tf32):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+        try:
+            torch.backends.cuda.enable_flash_sdp(bool(args.enable_flash_sdp))
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+        except Exception:
+            pass
     autocast_dtype = get_autocast_dtype()
     use_fp16 = device.type == "cuda" and autocast_dtype == torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
@@ -149,19 +164,18 @@ def main():
         x0 = batch["x"].to(device)
         cond = {k: v.to(device) for k, v in batch["cond"].items()}
 
-        z0, idx, known, known_values = _build_keypoint_batch(x0, args.K, cond, gen)
+        z0, idx, known_mask, known_values = _build_keypoint_batch(x0, args.K, cond, gen)
 
         t = torch.randint(0, args.N_train, (x0.shape[0],), device=device, dtype=torch.long)
         z_t, eps = q_sample(z0, t, schedule)
-        z_t = torch.where(known.unsqueeze(-1), known_values, z_t)
-        eps = eps * (~known).unsqueeze(-1)
+        z_t = torch.where(known_mask, known_values, z_t)
+        eps = eps * (~known_mask)
 
         with torch.cuda.amp.autocast(dtype=autocast_dtype):
-            eps_hat = model(z_t, t, idx, known, cond, args.T)
+            eps_hat = model(z_t, t, idx, known_mask, cond, args.T)
             diff = (eps_hat - eps) ** 2
-            diff = diff.sum(dim=-1)
-            valid = (~known).float()
-            loss = (diff * valid).sum() / (valid.sum() * x0.shape[-1] + 1e-8)
+            valid = (~known_mask).float()
+            loss = (diff * valid).sum() / (valid.sum() + 1e-8)
             loss = loss / args.grad_accum
 
         if scaler.is_enabled():
@@ -188,10 +202,30 @@ def main():
 
         if step > 0 and step % args.save_every == 0:
             ckpt_path = os.path.join(args.ckpt_dir, f"ckpt_{step:07d}.pt")
-            save_checkpoint(ckpt_path, model, optimizer, step, ema)
+            meta = {
+                "stage": "keypoints",
+                "T": args.T,
+                "K": args.K,
+                "data_dim": data_dim,
+                "N_train": args.N_train,
+                "schedule": args.schedule,
+                "use_sdf": bool(args.use_sdf),
+                "with_velocity": bool(args.with_velocity),
+            }
+            save_checkpoint(ckpt_path, model, optimizer, step, ema, meta=meta)
 
     final_path = os.path.join(args.ckpt_dir, "ckpt_final.pt")
-    save_checkpoint(final_path, model, optimizer, args.steps, ema)
+    meta = {
+        "stage": "keypoints",
+        "T": args.T,
+        "K": args.K,
+        "data_dim": data_dim,
+        "N_train": args.N_train,
+        "schedule": args.schedule,
+        "use_sdf": bool(args.use_sdf),
+        "with_velocity": bool(args.with_velocity),
+    }
+    save_checkpoint(final_path, model, optimizer, args.steps, ema, meta=meta)
     writer.flush()
     writer.close()
 

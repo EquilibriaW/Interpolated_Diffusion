@@ -39,6 +39,130 @@ def sample_fixed_k_mask(
     return mask
 
 
+def sample_fixed_k_indices_batch(
+    B: int,
+    T: int,
+    K: int,
+    generator: torch.Generator = None,
+    device: torch.device = None,
+    ensure_endpoints: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = device or torch.device("cpu")
+    if T <= 0:
+        raise ValueError("T must be positive")
+    if K <= 0:
+        raise ValueError("K must be positive")
+    if ensure_endpoints:
+        if T < 2:
+            raise ValueError("T must be >= 2 when ensure_endpoints is True")
+        if K < 2:
+            raise ValueError("K must be >= 2 when ensure_endpoints is True")
+    K = min(K, T)
+    if ensure_endpoints and T > 2 and K > 2:
+        scores = torch.rand((B, T - 2), generator=generator, device=device)
+        perm = torch.argsort(scores, dim=1)
+        chosen = perm[:, : K - 2] + 1
+        idx = torch.cat(
+            [torch.zeros((B, 1), device=device, dtype=torch.long), chosen, torch.full((B, 1), T - 1, device=device, dtype=torch.long)],
+            dim=1,
+        )
+    elif ensure_endpoints:
+        idx = torch.cat(
+            [torch.zeros((B, 1), device=device, dtype=torch.long), torch.full((B, 1), T - 1, device=device, dtype=torch.long)],
+            dim=1,
+        )
+    else:
+        scores = torch.rand((B, T), generator=generator, device=device)
+        perm = torch.argsort(scores, dim=1)
+        idx = perm[:, :K]
+    idx = torch.sort(idx, dim=1).values
+    mask = torch.zeros((B, T), dtype=torch.bool, device=device)
+    mask.scatter_(1, idx, True)
+    return idx, mask
+
+
+def _compute_k_schedule(T: int, K_min: int, levels: int) -> List[int]:
+    K_min = min(K_min, T)
+    K_list = [0 for _ in range(levels + 1)]
+    K_list[levels] = K_min
+    for s in range(levels, 0, -1):
+        K_prev = min(T, max(K_list[s] + 1, 2 * K_list[s]))
+        K_list[s - 1] = K_prev
+    return K_list
+
+
+def build_nested_masks_batch(
+    B: int,
+    T: int,
+    K_min: int,
+    levels: int,
+    generator: torch.Generator = None,
+    device: torch.device = None,
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    if levels < 1:
+        raise ValueError("levels must be >= 1")
+    device = device or torch.device("cpu")
+    K_list = _compute_k_schedule(T, K_min, levels)
+    if T < 2:
+        raise ValueError("T must be >= 2 when using endpoints")
+    scores = torch.rand((B, T - 2), generator=generator, device=device)
+    perm = torch.argsort(scores, dim=1)
+
+    masks_levels = torch.zeros((B, levels + 1, T), dtype=torch.bool, device=device)
+    idx_levels: List[torch.Tensor] = []
+    for s in range(levels + 1):
+        K_s = K_list[s]
+        if K_s <= 2 or T <= 2:
+            idx = torch.cat(
+                [torch.zeros((B, 1), device=device, dtype=torch.long), torch.full((B, 1), T - 1, device=device, dtype=torch.long)],
+                dim=1,
+            )
+        else:
+            interior = perm[:, : K_s - 2] + 1
+            idx = torch.cat(
+                [torch.zeros((B, 1), device=device, dtype=torch.long), interior, torch.full((B, 1), T - 1, device=device, dtype=torch.long)],
+                dim=1,
+            )
+        idx = torch.sort(idx, dim=1).values
+        idx_levels.append(idx)
+        masks_levels[:, s].scatter_(1, idx, True)
+    return masks_levels, idx_levels
+
+
+def interpolate_from_indices(
+    idx: torch.Tensor,
+    vals: torch.Tensor,
+    T: int,
+    recompute_velocity: bool = False,
+) -> torch.Tensor:
+    if idx.dim() != 2:
+        raise ValueError("idx must be [B, K]")
+    if vals.dim() != 3:
+        raise ValueError("vals must be [B, K, D]")
+    B, K = idx.shape
+    _, _, D = vals.shape
+    device = idx.device
+    t_grid = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+    seg = torch.searchsorted(idx, t_grid, right=True) - 1
+    seg = seg.clamp(0, K - 2)
+    left_idx = idx.gather(1, seg)
+    right_idx = idx.gather(1, seg + 1)
+    left_val = vals.gather(1, seg.unsqueeze(-1).expand(B, T, D))
+    right_val = vals.gather(1, (seg + 1).unsqueeze(-1).expand(B, T, D))
+    denom = (right_idx - left_idx).clamp(min=1).unsqueeze(-1)
+    w = (t_grid - left_idx).unsqueeze(-1) / denom
+    y = left_val + w * (right_val - left_val)
+    y.scatter_(1, idx.unsqueeze(-1).expand(B, K, D), vals)
+    if recompute_velocity and D == 4:
+        pos = y[:, :, :2]
+        v = torch.zeros_like(pos)
+        dt = 1.0 / float(T)
+        v[:, :-1] = (pos[:, 1:] - pos[:, :-1]) / dt
+        v[:, -1] = 0.0
+        y = torch.cat([pos, v], dim=-1)
+    return y
+
+
 def build_nested_masks(
     T: int,
     K_min: int,

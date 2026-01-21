@@ -113,6 +113,18 @@ python -m src.sample.sample_keypoints --ckpt <path> --T 64 --K 8 --ddim_steps 20
 python -m src.train.train_interp_levels --dataset particle --T 64 --K_min 8 --levels 3 --steps 20000
 ```
 
+### Optional: Stage-1-anchored bootstrapping (scheduled sampling)
+
+```bash
+python -m src.train.train_interp_levels \
+  --dataset particle --T 64 --K_min 8 --levels 3 --steps 20000 \
+  --bootstrap_stage1_ckpt checkpoints/keypoints/ckpt_final.pt \
+  --bootstrap_prob_start 0.0 --bootstrap_prob_end 0.3 --bootstrap_warmup_steps 5000 \
+  --bootstrap_prob_cap 0.5
+```
+
+`--bootstrap_prob_cap` (default 0.5) limits the fraction of batches/examples that use Stage‑1 anchors during training.
+
 ### Train on D4RL Maze2d
 
 ```bash
@@ -126,11 +138,49 @@ python -m src.sample.sample_generate --dataset particle --T 64 --K_min 8 --level
 python -m src.sample.sample_generate --dataset d4rl --env_id maze2d-medium-v1 --T 64 --K_min 8 --levels 3 --n_samples 16 --out_dir runs/gen
 ```
 
+Clamp policy:
+- `--clamp_policy endpoints` (default): clamp only t=0 and t=T-1 after Stage 2
+- `--clamp_policy all_anchors`: clamp all anchor indices (legacy behavior)
+- `--clamp_policy none`: no clamping
+- `--clamp_dims pos|all` controls whether to clamp only position dims (0:2) or all dims
+
+### D4RL visualization
+
+For D4RL Maze2D, samples are plotted in **continuous world coordinates** with maze walls extracted from MuJoCo geom boxes when available.
+If MuJoCo wall geoms are not available, the sampler falls back to `maze_map` (if exposed), and then to the grid-based occupancy plot.
+
+### Diffusion-step frames (optional)
+
+To save per‑step frames of the keypoint diffusion process (interpolated at each DDIM step) and export video:
+
+```bash
+python -m src.sample.sample_generate \
+  --dataset d4rl --env_id maze2d-medium-v1 \
+  --T 64 --K_min 8 --levels 3 --n_samples 1 \
+  --save_diffusion_frames 1 --frames_stride 1 --frames_include_stage2 1 \
+  --export_video mp4 --video_fps 8 \
+  --out_dir runs/gen
+```
+
+Frames are written under `runs/gen/diffusion_steps/sample_0000/step_*.png`.
+If `imageio` is installed, mp4/gif export is handled in Python; otherwise `ffmpeg` is used for mp4 export (if available).
+
 ## Causal Variant (optional)
 
 ```bash
 python -m src.train.train_interp_levels_causal --dataset particle --T 64 --K_min 8 --levels 3 --steps 20000
 python -m src.sample.sample_generate_causal --dataset particle --T 64 --K_min 8 --levels 3 --n_samples 16 --out_dir runs/gen_causal
+```
+
+To save per‑chunk frames and export a video (causal generation):
+
+```bash
+python -m src.sample.sample_generate_causal \
+  --dataset d4rl --env_id maze2d-medium-v1 \
+  --T 64 --K_min 8 --levels 3 --n_samples 1 \
+  --save_chunk_frames 1 --frames_stride 1 \
+  --export_video mp4 --video_fps 8 \
+  --out_dir runs/gen_causal
 ```
 
 ## Notes

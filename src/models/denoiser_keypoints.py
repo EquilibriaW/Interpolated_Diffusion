@@ -53,7 +53,7 @@ class KeypointDenoiser(nn.Module):
         if pos_dim is None:
             pos_dim = d_model // 2
         self.pos_dim = pos_dim
-        self.in_proj = nn.Linear(data_dim + pos_dim + 1, d_model)
+        self.in_proj = nn.Linear(data_dim + pos_dim + data_dim, d_model)
         self.t_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
         self.cond_enc = MazeConditionEncoder(use_sdf=use_sdf, d_cond=d_cond)
         self.cond_proj = nn.Linear(d_cond, d_model)
@@ -74,14 +74,14 @@ class KeypointDenoiser(nn.Module):
         z_t: torch.Tensor,
         t: torch.Tensor,
         idx: torch.Tensor,
-        known: torch.Tensor,
+        known_mask: torch.Tensor,
         cond: Dict[str, torch.Tensor],
         T: int,
     ) -> torch.Tensor:
         B, K, D = z_t.shape
         pos = idx.float() / max(1.0, float(T - 1))
         pos_emb = continuous_time_embedding(pos, self.pos_dim)
-        x = torch.cat([z_t, pos_emb, known.unsqueeze(-1).float()], dim=-1)
+        x = torch.cat([z_t, pos_emb, known_mask.float()], dim=-1)
         h = self.in_proj(x)
         t_emb = timestep_embedding(t, h.shape[-1])
         t_emb = self.t_embed(t_emb)

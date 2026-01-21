@@ -1,6 +1,6 @@
 import os
 import warnings
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -38,6 +38,97 @@ def _extract_maze_map(env):
                     maze_map = maze_map.maze_map
                 return maze_map
     return None
+
+
+def _quat_to_rotmat(q: np.ndarray) -> np.ndarray:
+    w, x, y, z = q
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _get_geom_name(model, geom_id: int) -> Optional[str]:
+    try:
+        name = model.geom_names[geom_id]
+        if isinstance(name, bytes):
+            name = name.decode("utf-8")
+        return name
+    except Exception:
+        pass
+    try:
+        import mujoco  # type: ignore
+
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+        if isinstance(name, bytes):
+            name = name.decode("utf-8")
+        return name
+    except Exception:
+        return None
+
+
+def _extract_mujoco_walls(env) -> Optional[List[np.ndarray]]:
+    sim = getattr(env, "sim", None)
+    if sim is None and hasattr(env, "unwrapped"):
+        sim = getattr(env.unwrapped, "sim", None)
+    model = None
+    if sim is not None:
+        model = getattr(sim, "model", None)
+    if model is None and hasattr(env, "model"):
+        model = getattr(env, "model", None)
+    if model is None:
+        return None
+
+    geom_type = getattr(model, "geom_type", None)
+    geom_size = getattr(model, "geom_size", None)
+    geom_pos = getattr(model, "geom_pos", None)
+    geom_quat = getattr(model, "geom_quat", None)
+    if geom_type is None or geom_size is None or geom_pos is None or geom_quat is None:
+        return None
+
+    try:
+        import mujoco_py  # type: ignore
+
+        box_type = mujoco_py.generated.const.GEOM_BOX
+    except Exception:
+        box_type = 6
+
+    wall_ids: List[int] = []
+    for i in range(model.ngeom):
+        name = _get_geom_name(model, i) or ""
+        name_l = name.lower()
+        if any(k in name_l for k in ["wall", "block", "maze"]) and not any(k in name_l for k in ["floor", "ground"]):
+            wall_ids.append(i)
+    if len(wall_ids) == 0:
+        for i in range(model.ngeom):
+            name = _get_geom_name(model, i) or ""
+            name_l = name.lower()
+            if any(k in name_l for k in ["floor", "ground"]):
+                continue
+            if int(geom_type[i]) == box_type:
+                wall_ids.append(i)
+
+    walls: List[np.ndarray] = []
+    for i in wall_ids:
+        if int(geom_type[i]) != box_type:
+            continue
+        size = np.array(geom_size[i], dtype=np.float32)
+        pos = np.array(geom_pos[i], dtype=np.float32)
+        quat = np.array(geom_quat[i], dtype=np.float32)
+        sx, sy = float(size[0]), float(size[1])
+        if sx <= 0 or sy <= 0:
+            continue
+        corners = np.array(
+            [[sx, sy, 0.0], [sx, -sy, 0.0], [-sx, -sy, 0.0], [-sx, sy, 0.0]], dtype=np.float32
+        )
+        rot = _quat_to_rotmat(quat)
+        world = corners @ rot.T + pos[None, :]
+        walls.append(world[:, :2])
+    return walls if len(walls) > 0 else None
 
 
 def _maze_map_to_occ(maze_map) -> np.ndarray:
@@ -229,6 +320,11 @@ class D4RLMazeDataset(Dataset):
             raise RuntimeError("No episodes found in D4RL dataset")
 
         maze_map = _extract_maze_map(env)
+        self.maze_map = maze_map
+        self.maze_size_scaling = getattr(getattr(env, "unwrapped", env), "maze_size_scaling", None)
+        if self.maze_size_scaling is None:
+            self.maze_size_scaling = getattr(getattr(env, "unwrapped", env), "maze_size_scale", None)
+        self.mj_walls = _extract_mujoco_walls(env)
         if maze_map is None:
             warnings.warn("Could not extract maze_map from env; using empty occupancy grid.")
             occ = np.zeros((21, 21), dtype=np.float32)
