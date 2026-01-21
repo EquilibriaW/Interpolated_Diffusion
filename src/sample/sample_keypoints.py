@@ -53,6 +53,22 @@ def _build_known_mask_values(idx: torch.Tensor, cond: dict, D: int, T: int) -> T
     return known_mask, known_values
 
 
+def _ensure_mujoco_env():
+    if "MUJOCO_PY_MUJOCO_PATH" not in os.environ:
+        for candidate in ("/workspace/mujoco210", os.path.expanduser("~/.mujoco/mujoco210")):
+            if os.path.isdir(candidate):
+                os.environ["MUJOCO_PY_MUJOCO_PATH"] = candidate
+                break
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    mujoco_path = os.environ.get("MUJOCO_PY_MUJOCO_PATH", "")
+    if mujoco_path:
+        bin_path = os.path.join(mujoco_path, "bin")
+        ld_paths = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
+        if bin_path not in ld_paths:
+            ld_paths.append(bin_path)
+            os.environ["LD_LIBRARY_PATH"] = ":".join(ld_paths)
+
+
 def _sample_ddim(
     model,
     schedule,
@@ -82,6 +98,7 @@ def _sample_ddim(
 def main():
     args = build_argparser().parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
+    _ensure_mujoco_env()
 
     meta = {}
     if os.path.exists(args.ckpt):
