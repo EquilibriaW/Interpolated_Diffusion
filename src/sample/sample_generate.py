@@ -42,7 +42,7 @@ def build_argparser():
     p.add_argument("--use_sdf", type=int, default=0)
     p.add_argument("--with_velocity", type=int, default=0)
     p.add_argument("--recompute_vel", type=int, default=1)
-    p.add_argument("--logit_space", type=int, default=0)
+    p.add_argument("--logit_space", type=int, default=1)
     p.add_argument("--logit_eps", type=float, default=1e-5)
     p.add_argument("--use_ema", type=int, default=1)
     p.add_argument("--device", type=str, default=None)
