@@ -416,13 +416,14 @@ class D4RLMazeDataset(Dataset):
         ep_idx = int(torch.randint(0, len(self.episodes), (1,), generator=gen).item())
         start, end = self.episodes[ep_idx]
         length = end - start
-        base_idx = start
+        # Use windows that end at the episode end to align goal with x[-1].
         if length >= self.T:
-            offset = int(torch.randint(0, length - self.T + 1, (1,), generator=gen).item())
-            base_idx = start + offset
-            obs = self.obs[base_idx : base_idx + self.T]
+            base_idx = end - self.T
+            obs = self.obs[base_idx:end]
         else:
+            base_idx = start
             obs = self.obs[start:end]
+        end_idx = end - 1
         obs_t = torch.from_numpy(obs)
         if obs_t.shape[0] != self.T:
             obs_t = _resample_sequence(obs_t, self.T)
@@ -430,7 +431,7 @@ class D4RLMazeDataset(Dataset):
 
         start_pos = x[0, :2]
         if self.goal_arr is not None:
-            goal_raw = self.goal_arr[base_idx]
+            goal_raw = self.goal_arr[end_idx]
             goal_t = torch.from_numpy(goal_raw)
             goal_t = (goal_t - self.pos_low) / self.pos_scale
             if self.flip_y:
