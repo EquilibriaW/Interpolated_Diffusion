@@ -18,6 +18,7 @@ class InterpLevelCausalDenoiser(nn.Module):
         dropout: float = 0.0,
         d_cond: int = 128,
         use_sdf: bool = False,
+        use_start_goal: bool = True,
         data_dim: int = 2,
         max_levels: int = 8,
         use_checkpoint: bool = False,
@@ -27,7 +28,7 @@ class InterpLevelCausalDenoiser(nn.Module):
         self.in_proj = nn.Linear(data_dim + 1, d_model)
         self.level_emb = nn.Embedding(max_levels + 1, d_model)
         self.level_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
-        self.cond_enc = MazeConditionEncoder(use_sdf=use_sdf, d_cond=d_cond)
+        self.cond_enc = MazeConditionEncoder(use_sdf=use_sdf, d_cond=d_cond, use_start_goal=use_start_goal)
         self.cond_proj = nn.Linear(d_cond, d_model)
         self.transformer = TransformerEncoder(
             d_model=d_model,

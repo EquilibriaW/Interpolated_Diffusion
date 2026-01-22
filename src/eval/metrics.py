@@ -13,8 +13,8 @@ def _to_tensor(x, device: Optional[torch.device] = None) -> torch.Tensor:
 def _pos_to_cell(pos: torch.Tensor, h: int, w: int):
     x = pos[..., 0]
     y = pos[..., 1]
-    j = (x * w).long()
-    i = (y * h).long()
+    j = torch.round(x * w).long()
+    i = torch.round(y * h).long()
     return i, j
 
 

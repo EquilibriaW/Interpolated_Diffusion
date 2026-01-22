@@ -51,7 +51,7 @@ def sdf_from_occupancy(occ: np.ndarray, signed: bool = True) -> np.ndarray:
     grid_i = torch.arange(h, device=occ_t.device)
     grid_j = torch.arange(w, device=occ_t.device)
     coords = torch.stack(torch.meshgrid(grid_i, grid_j, indexing="ij"), dim=-1).reshape(-1, 2).float()
-    wall_mask = occ_t.view(-1) > 0.5
+    wall_mask = occ_t.reshape(-1) > 0.5
     if wall_mask.sum() == 0:
         dist = torch.zeros((h, w), dtype=torch.float32)
     else:

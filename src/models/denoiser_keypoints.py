@@ -44,6 +44,7 @@ class KeypointDenoiser(nn.Module):
         dropout: float = 0.0,
         d_cond: int = 128,
         use_sdf: bool = False,
+        use_start_goal: bool = True,
         data_dim: int = 2,
         pos_dim: Optional[int] = None,
         use_checkpoint: bool = False,
@@ -55,7 +56,7 @@ class KeypointDenoiser(nn.Module):
         self.pos_dim = pos_dim
         self.in_proj = nn.Linear(data_dim + pos_dim + data_dim, d_model)
         self.t_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
-        self.cond_enc = MazeConditionEncoder(use_sdf=use_sdf, d_cond=d_cond)
+        self.cond_enc = MazeConditionEncoder(use_sdf=use_sdf, d_cond=d_cond, use_start_goal=use_start_goal)
         self.cond_proj = nn.Linear(d_cond, d_model)
         self.transformer = TransformerEncoder(
             d_model=d_model,

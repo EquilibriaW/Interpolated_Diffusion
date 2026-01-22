@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.corruptions.keyframes import build_nested_masks_batch, interpolate_from_indices
-from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset
+from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset, PreparedTrajectoryDataset
 from src.diffusion.ddpm import _timesteps, ddim_step
 from src.diffusion.schedules import make_alpha_bars, make_beta_schedule
 from src.models.denoiser_interp_levels_causal import InterpLevelCausalDenoiser
@@ -36,10 +36,21 @@ def build_argparser():
     p.add_argument("--with_velocity", type=int, default=0)
     p.add_argument("--recompute_vel", type=int, default=1)
     p.add_argument("--cache_dir", type=str, default=None)
-    p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl"])
+    p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl", "d4rl_prepared"])
+    p.add_argument("--prepared_path", type=str, default=None)
     p.add_argument("--env_id", type=str, default="maze2d-medium-v1")
     p.add_argument("--num_samples", type=int, default=100000)
-    p.add_argument("--d4rl_flip_y", type=int, default=1)
+    p.add_argument("--d4rl_flip_y", type=int, default=0)
+    p.add_argument("--max_collision_rate", type=float, default=0.0)
+    p.add_argument("--max_resample_tries", type=int, default=50)
+    p.add_argument("--min_goal_dist", type=float, default=None)
+    p.add_argument("--min_path_len", type=float, default=None)
+    p.add_argument("--min_tortuosity", type=float, default=None)
+    p.add_argument("--min_turns", type=int, default=None)
+    p.add_argument("--turn_angle_deg", type=float, default=30.0)
+    p.add_argument("--window_mode", type=str, default="end", choices=["end", "random", "episode"])
+    p.add_argument("--goal_mode", type=str, default="env", choices=["env", "window_end"])
+    p.add_argument("--use_start_goal", type=int, default=1)
     p.add_argument("--log_dir", type=str, default="runs/interp_levels_causal")
     p.add_argument("--ckpt_dir", type=str, default="checkpoints/interp_levels_causal")
     p.add_argument("--save_every", type=int, default=2000)
@@ -66,11 +77,13 @@ def build_argparser():
     return p
 
 
-def _build_known_mask_values(idx: torch.Tensor, cond: dict, D: int, T: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def _build_known_mask_values(
+    idx: torch.Tensor, cond: dict, D: int, T: int, use_start_goal: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
     B, K = idx.shape
     known_mask = torch.zeros((B, K, D), device=idx.device, dtype=torch.bool)
     known_values = torch.zeros((B, K, D), device=idx.device, dtype=torch.float32)
-    if "start_goal" in cond and D >= 2:
+    if use_start_goal and "start_goal" in cond and D >= 2:
         start = cond["start_goal"][:, :2]
         goal = cond["start_goal"][:, 2:]
         start_pos = start.unsqueeze(1).expand(B, K, 2)
@@ -141,8 +154,8 @@ def build_interp_level_batch(
 
 def main():
     args = build_argparser().parse_args()
-    if args.dataset != "d4rl":
-        raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl with Maze2D envs.")
+    if args.dataset not in {"d4rl", "d4rl_prepared"}:
+        raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl or d4rl_prepared.")
     seed = args.seed if args.seed is not None else get_seed_from_env()
     set_seed(seed, deterministic=bool(args.deterministic))
 
@@ -166,7 +179,11 @@ def main():
     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
 
     dataset_name = "synthetic" if args.dataset == "synthetic" else args.dataset
-    if dataset_name == "d4rl":
+    if dataset_name == "d4rl_prepared":
+        if args.prepared_path is None:
+            raise ValueError("--prepared_path is required for dataset d4rl_prepared")
+        dataset = PreparedTrajectoryDataset(args.prepared_path, use_sdf=bool(args.use_sdf))
+    elif dataset_name == "d4rl":
         dataset = D4RLMazeDataset(
             env_id=args.env_id,
             num_samples=args.num_samples,
@@ -175,6 +192,15 @@ def main():
             use_sdf=bool(args.use_sdf),
             seed=seed,
             flip_y=bool(args.d4rl_flip_y),
+            max_collision_rate=args.max_collision_rate,
+            max_resample_tries=args.max_resample_tries,
+            min_goal_dist=args.min_goal_dist,
+            min_path_len=args.min_path_len,
+            min_tortuosity=args.min_tortuosity,
+            min_turns=args.min_turns,
+            turn_angle_deg=args.turn_angle_deg,
+            window_mode=args.window_mode,
+            goal_mode=args.goal_mode,
         )
     else:
         dataset = ParticleMazeDataset(
@@ -193,6 +219,7 @@ def main():
         use_sdf=bool(args.use_sdf),
         max_levels=args.levels,
         use_checkpoint=bool(args.use_checkpoint),
+        use_start_goal=bool(args.use_start_goal),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     ema = EMA(model.parameters(), decay=args.ema_decay) if args.ema else None
@@ -209,9 +236,17 @@ def main():
     bootstrap_logit = False
     bootstrap_logit_eps = 1e-5
     if args.bootstrap_stage1_ckpt is not None:
+        payload_meta = {}
+        try:
+            payload_meta = torch.load(args.bootstrap_stage1_ckpt, map_location="cpu")
+        except Exception:
+            payload_meta = {}
+        meta = payload_meta.get("meta", {}) if isinstance(payload_meta, dict) else {}
+        use_start_goal_kp = bool(meta.get("use_start_goal", args.use_start_goal))
         bootstrap_model = KeypointDenoiser(
             data_dim=data_dim,
             use_sdf=bool(args.use_sdf),
+            use_start_goal=use_start_goal_kp,
         ).to(device)
         if args.bootstrap_use_ema:
             ema_boot = EMA(bootstrap_model.parameters())
@@ -228,7 +263,7 @@ def main():
         if ema_boot is not None:
             ema_boot.copy_to(bootstrap_model.parameters())
         bootstrap_model.eval()
-        meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+        meta = payload.get("meta", {}) if isinstance(payload, dict) else meta
         if meta.get("stage") != "keypoints":
             raise ValueError("bootstrap_stage1_ckpt does not appear to be a keypoints checkpoint")
         n_train = meta.get("N_train")
@@ -276,7 +311,7 @@ def main():
                 use_mask = torch.rand((x0.shape[0],), generator=gen, device=device) < p_boot
             if torch.any(use_mask):
                 idx_s = idx_levels[args.levels]
-                known_mask, known_values = _build_known_mask_values(idx_s, cond, data_dim, args.T)
+                known_mask, known_values = _build_known_mask_values(idx_s, cond, data_dim, args.T, bool(args.use_start_goal))
                 if bootstrap_logit:
                     known_values = logit_pos(known_values, eps=bootstrap_logit_eps)
                 with torch.no_grad():

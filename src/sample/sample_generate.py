@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.corruptions.keyframes import interpolate_from_indices, sample_fixed_k_indices_batch
-from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset
+from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset, PreparedTrajectoryDataset
 from src.diffusion.ddpm import _timesteps, ddim_step
 from src.diffusion.schedules import make_alpha_bars, make_beta_schedule
 from src.eval.metrics import collision_rate, goal_distance, success
@@ -41,9 +41,20 @@ def build_argparser():
     p.add_argument("--logit_eps", type=float, default=1e-5)
     p.add_argument("--use_ema", type=int, default=1)
     p.add_argument("--device", type=str, default=None)
-    p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl"])
+    p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl", "d4rl_prepared"])
+    p.add_argument("--prepared_path", type=str, default=None)
     p.add_argument("--env_id", type=str, default="maze2d-medium-v1")
-    p.add_argument("--d4rl_flip_y", type=int, default=1)
+    p.add_argument("--d4rl_flip_y", type=int, default=0)
+    p.add_argument("--max_collision_rate", type=float, default=0.0)
+    p.add_argument("--max_resample_tries", type=int, default=50)
+    p.add_argument("--min_goal_dist", type=float, default=None)
+    p.add_argument("--min_path_len", type=float, default=None)
+    p.add_argument("--min_tortuosity", type=float, default=None)
+    p.add_argument("--min_turns", type=int, default=None)
+    p.add_argument("--turn_angle_deg", type=float, default=30.0)
+    p.add_argument("--window_mode", type=str, default="end", choices=["end", "random", "episode"])
+    p.add_argument("--goal_mode", type=str, default="env", choices=["env", "window_end"])
+    p.add_argument("--use_start_goal", type=int, default=1)
     p.add_argument("--override_meta", type=int, default=0)
     p.add_argument("--clamp_policy", type=str, default="endpoints", choices=["none", "endpoints", "all_anchors"])
     p.add_argument("--clamp_dims", type=str, default="pos", choices=["pos", "all"])
@@ -55,6 +66,7 @@ def build_argparser():
     p.add_argument("--frames_include_stage2", type=int, default=1)
     p.add_argument("--export_video", type=str, default="none", choices=["none", "mp4", "gif"])
     p.add_argument("--video_fps", type=int, default=8)
+    p.add_argument("--skip_stage2", type=int, default=0)
     return p
 
 
@@ -129,11 +141,13 @@ def _normalize_walls(
     return out
 
 
-def _build_known_mask_values(idx: torch.Tensor, cond: dict, D: int, T: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def _build_known_mask_values(
+    idx: torch.Tensor, cond: dict, D: int, T: int, use_start_goal: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
     B, K = idx.shape
     known_mask = torch.zeros((B, K, D), device=idx.device, dtype=torch.bool)
     known_values = torch.zeros((B, K, D), device=idx.device, dtype=torch.float32)
-    if "start_goal" in cond and D >= 2:
+    if use_start_goal and "start_goal" in cond and D >= 2:
         start = cond["start_goal"][:, :2]
         goal = cond["start_goal"][:, 2:]
         start_pos = start.unsqueeze(1).expand(B, K, 2)
@@ -182,8 +196,8 @@ def main():
     args = build_argparser().parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     _ensure_mujoco_env()
-    if args.dataset != "d4rl":
-        raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl with Maze2D envs.")
+    if args.dataset not in {"d4rl", "d4rl_prepared"}:
+        raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl or d4rl_prepared.")
 
     # Load keypoint payload early to configure model dims before instantiation.
     payload_kp = {}
@@ -195,6 +209,11 @@ def main():
         except Exception:
             payload_kp = {}
     meta = payload_kp.get("meta", {}) if isinstance(payload_kp, dict) else {}
+    def _normalize_dataset_name(name: Optional[str]) -> Optional[str]:
+        if name == "d4rl_prepared":
+            return "d4rl"
+        return name
+
     if meta.get("stage") == "keypoints" and not args.override_meta:
         args.T = meta.get("T", args.T)
         args.N_train = meta.get("N_train", args.N_train)
@@ -213,8 +232,14 @@ def main():
             args.logit_space = int(bool(meta.get("logit_space")))
         if meta.get("logit_eps") is not None:
             args.logit_eps = float(meta.get("logit_eps"))
+        if meta.get("use_start_goal") is not None:
+            args.use_start_goal = int(bool(meta.get("use_start_goal")))
+        if meta.get("window_mode") is not None:
+            args.window_mode = str(meta.get("window_mode"))
+        if meta.get("goal_mode") is not None:
+            args.goal_mode = str(meta.get("goal_mode"))
         if meta.get("dataset") is not None:
-            if args.dataset != meta.get("dataset"):
+            if _normalize_dataset_name(args.dataset) != _normalize_dataset_name(meta.get("dataset")):
                 raise ValueError(
                     f"Keypoint checkpoint dataset mismatch: ckpt={meta.get('dataset')} args={args.dataset}. "
                     "Use --override_meta 1 to force."
@@ -233,21 +258,28 @@ def main():
     device = get_device(args.device)
     data_dim = 4 if args.with_velocity else 2
 
-    kp_model = KeypointDenoiser(data_dim=data_dim, use_sdf=bool(args.use_sdf)).to(device)
-    interp_model = InterpLevelDenoiser(
+    kp_model = KeypointDenoiser(
         data_dim=data_dim,
         use_sdf=bool(args.use_sdf),
-        max_levels=args.levels,
+        use_start_goal=bool(args.use_start_goal),
     ).to(device)
-
-    payload_interp = torch.load(args.ckpt_interp, map_location="cpu") if os.path.exists(args.ckpt_interp) else {}
     if "model" not in payload_kp:
         raise FileNotFoundError(f"Checkpoint not found or invalid: {args.ckpt_keypoints}")
-    if "model" not in payload_interp:
-        raise FileNotFoundError(f"Checkpoint not found or invalid: {args.ckpt_interp}")
 
     kp_model.load_state_dict(payload_kp["model"])
-    interp_model.load_state_dict(payload_interp["model"])
+    interp_model = None
+    payload_interp = {}
+    if not args.skip_stage2:
+        interp_model = InterpLevelDenoiser(
+            data_dim=data_dim,
+            use_sdf=bool(args.use_sdf),
+            max_levels=args.levels,
+            use_start_goal=bool(args.use_start_goal),
+        ).to(device)
+        payload_interp = torch.load(args.ckpt_interp, map_location="cpu") if os.path.exists(args.ckpt_interp) else {}
+        if "model" not in payload_interp:
+            raise FileNotFoundError(f"Checkpoint not found or invalid: {args.ckpt_interp}")
+        interp_model.load_state_dict(payload_interp["model"])
 
     ema_warned = False
     if args.use_ema:
@@ -261,16 +293,18 @@ def main():
             if not ema_warned:
                 print("Checkpoint has no EMA; using raw model weights.")
                 ema_warned = True
-        if isinstance(payload_interp, dict) and "ema" in payload_interp:
-            ema_interp = EMA(interp_model.parameters())
-            ema_interp.load_state_dict(payload_interp["ema"])
-            ema_interp.copy_to(interp_model.parameters())
-        else:
-            if not ema_warned:
-                print("Checkpoint has no EMA; using raw model weights.")
-                ema_warned = True
+        if not args.skip_stage2 and interp_model is not None:
+            if isinstance(payload_interp, dict) and "ema" in payload_interp:
+                ema_interp = EMA(interp_model.parameters())
+                ema_interp.load_state_dict(payload_interp["ema"])
+                ema_interp.copy_to(interp_model.parameters())
+            else:
+                if not ema_warned:
+                    print("Checkpoint has no EMA; using raw model weights.")
+                    ema_warned = True
     kp_model.eval()
-    interp_model.eval()
+    if interp_model is not None:
+        interp_model.eval()
 
     meta = payload_kp.get("meta", {}) if isinstance(payload_kp, dict) else {}
     if meta.get("stage") == "keypoints" and not args.override_meta:
@@ -286,7 +320,11 @@ def main():
     schedule = make_alpha_bars(betas)
 
     dataset_name = "synthetic" if args.dataset == "synthetic" else args.dataset
-    if dataset_name == "d4rl":
+    if dataset_name == "d4rl_prepared":
+        if args.prepared_path is None:
+            raise ValueError("--prepared_path is required for dataset d4rl_prepared")
+        dataset = PreparedTrajectoryDataset(args.prepared_path, use_sdf=bool(args.use_sdf))
+    elif dataset_name == "d4rl":
         dataset = D4RLMazeDataset(
             env_id=args.env_id,
             num_samples=args.n_samples,
@@ -295,6 +333,15 @@ def main():
             use_sdf=bool(args.use_sdf),
             seed=1234,
             flip_y=bool(args.d4rl_flip_y),
+            max_collision_rate=args.max_collision_rate,
+            max_resample_tries=args.max_resample_tries,
+            min_goal_dist=args.min_goal_dist,
+            min_path_len=args.min_path_len,
+            min_tortuosity=args.min_tortuosity,
+            min_turns=args.min_turns,
+            turn_angle_deg=args.turn_angle_deg,
+            window_mode=args.window_mode,
+            goal_mode=args.goal_mode,
         )
     else:
         dataset = ParticleMazeDataset(
@@ -312,7 +359,7 @@ def main():
     pos_low = None
     pos_scale = None
     flip_y = False
-    if dataset_name == "d4rl":
+    if dataset_name in {"d4rl", "d4rl_prepared"}:
         maze_map = getattr(dataset, "maze_map", None)
         maze_scale = getattr(dataset, "maze_size_scaling", None)
         mj_walls = getattr(dataset, "mj_walls", None)
@@ -327,6 +374,23 @@ def main():
                 h, w = maze_arr.shape
                 if w > 0 and h > 0:
                     maze_scale = float(min(pos_scale[0].item() / w, pos_scale[1].item() / h))
+
+    def _denorm_xy(xy: np.ndarray) -> np.ndarray:
+        if pos_low is None or pos_scale is None:
+            return xy
+        out = xy.copy()
+        if flip_y:
+            out[:, 1] = 1.0 - out[:, 1]
+        out = out * pos_scale[:2].cpu().numpy() + pos_low[:2].cpu().numpy()
+        return out
+
+    def _gridify_xy(xy: np.ndarray, h: int, w: int) -> np.ndarray:
+        j = np.rint(xy[:, 0] * w)
+        i = np.rint(xy[:, 1] * h)
+        j = np.clip(j, 0, w - 1)
+        i = np.clip(i, 0, h - 1)
+        out = np.stack([j / float(w), i / float(h)], axis=-1)
+        return out
 
     gen = torch.Generator(device=device)
     gen.manual_seed(1234)
@@ -363,7 +427,7 @@ def main():
                     z_hat = x0_gt.gather(1, idx_exp)
                     z_steps = None
                 else:
-                    known_mask, known_values = _build_known_mask_values(idx, cond, data_dim, args.T)
+                    known_mask, known_values = _build_known_mask_values(idx, cond, data_dim, args.T, bool(args.use_start_goal))
                     if args.logit_space:
                         known_values = logit_pos(known_values, eps=args.logit_eps)
                     if args.save_diffusion_frames:
@@ -390,9 +454,12 @@ def main():
 
                 x_s = interpolate_from_indices(idx, z_hat, args.T, recompute_velocity=bool(args.recompute_vel))
 
-                s_level = torch.full((B,), args.levels, device=device, dtype=torch.long)
-                delta_hat = interp_model(x_s, s_level, masks, cond)
-                x_hat = x_s + delta_hat
+                if args.skip_stage2 or interp_model is None:
+                    x_hat = x_s
+                else:
+                    s_level = torch.full((B,), args.levels, device=device, dtype=torch.long)
+                    delta_hat = interp_model(x_s, s_level, masks, cond)
+                    x_hat = x_s + delta_hat
                 if args.clamp_policy == "all_anchors":
                     clamp_mask = masks
                 elif args.clamp_policy == "endpoints":
@@ -406,18 +473,35 @@ def main():
 
                 for b in range(B):
                     occ_t = cond["occ"][b, 0]
-                    goal_t = cond["start_goal"][b, 2:]
                     interp_t = x_s[b]
                     refined_t = x_hat[b]
+                    if args.use_start_goal:
+                        goal_t = cond["start_goal"][b, 2:]
+                    elif x0_gt is not None:
+                        goal_t = x0_gt[b, -1, :2]
+                    else:
+                        goal_t = None
+
+                    if goal_t is None:
+                        goal_dist_interp = float("nan")
+                        goal_dist_refined = float("nan")
+                        success_interp = float("nan")
+                        success_refined = float("nan")
+                    else:
+                        goal_dist_interp = goal_distance(goal_t, interp_t)
+                        goal_dist_refined = goal_distance(goal_t, refined_t)
+                        success_interp = success(goal_t, interp_t, occ_t.shape[-2], occ_t.shape[-1])
+                        success_refined = success(goal_t, refined_t, occ_t.shape[-2], occ_t.shape[-1])
+
                     writer.writerow(
                         [
                             idx_global,
                             collision_rate(occ_t, interp_t),
                             collision_rate(occ_t, refined_t),
-                            goal_distance(goal_t, interp_t),
-                            goal_distance(goal_t, refined_t),
-                            success(goal_t, interp_t, occ_t.shape[-2], occ_t.shape[-1]),
-                            success(goal_t, refined_t, occ_t.shape[-2], occ_t.shape[-1]),
+                            goal_dist_interp,
+                            goal_dist_refined,
+                            success_interp,
+                            success_refined,
                         ]
                     )
 
@@ -431,7 +515,12 @@ def main():
                             gt_np = x0_gt[b].detach().cpu().numpy()
                             trajs.append(gt_np[:, :2])
                             labels.append("gt")
-                        if dataset_name == "d4rl" and mj_walls_norm is not None:
+                        if dataset_name in {"d4rl", "d4rl_prepared"}:
+                            occ = occ_t.detach().cpu().numpy()
+                            h, w = occ.shape
+                            trajs_grid = [_gridify_xy(t, h, w) for t in trajs]
+                            plot_trajectories(occ, trajs_grid, labels, out_path=out_path)
+                        elif mj_walls_norm is not None:
                             norm_trajs = [interp_np[:, :2], refined_np[:, :2]]
                             norm_labels = ["interp", "refined"]
                             if args.plot_gt and x0_gt is not None:
@@ -444,17 +533,15 @@ def main():
                                 out_path=out_path,
                                 bounds=((0.0, 1.0), (0.0, 1.0)),
                             )
-                        elif dataset_name == "d4rl" and maze_map is not None and maze_scale is not None:
+                        elif maze_map is not None and maze_scale is not None:
+                            plot_trajs = [_denorm_xy(t) for t in trajs]
                             plot_maze2d_trajectories(
                                 maze_map,
                                 maze_scale,
-                                trajs,
+                                plot_trajs,
                                 labels,
                                 out_path=out_path,
                             )
-                        else:
-                            occ = occ_t.detach().cpu().numpy()
-                            plot_trajectories(occ, trajs, labels, out_path=out_path)
                         else:
                             occ = occ_t.detach().cpu().numpy()
                             plot_trajectories(occ, trajs, labels, out_path=out_path)
@@ -470,7 +557,12 @@ def main():
                             )
                             frame_path = os.path.join(frames_dir, f"step_{si:03d}.png")
                             step_np = x_step[0].detach().cpu().numpy()
-                            if dataset_name == "d4rl" and mj_walls_norm is not None:
+                            if dataset_name in {"d4rl", "d4rl_prepared"}:
+                                occ = occ_t.detach().cpu().numpy()
+                                h, w = occ.shape
+                                step_grid = _gridify_xy(step_np[:, :2], h, w)
+                                plot_trajectories(occ, [step_grid], [f"step {step_idx}"], out_path=frame_path)
+                            elif mj_walls_norm is not None:
                                 plot_maze2d_geom_walls(
                                     mj_walls_norm,
                                     [step_np[:, :2]],
@@ -478,20 +570,27 @@ def main():
                                     out_path=frame_path,
                                     bounds=((0.0, 1.0), (0.0, 1.0)),
                                 )
-                            elif dataset_name == "d4rl" and maze_map is not None and maze_scale is not None:
+                            elif maze_map is not None and maze_scale is not None:
+                                step_plot = _denorm_xy(step_np[:, :2])
                                 plot_maze2d_trajectories(
                                     maze_map,
                                     maze_scale,
-                                    [step_np[:, :2]],
+                                    [step_plot],
                                     [f"step {step_idx}"],
                                     out_path=frame_path,
                                 )
                             else:
                                 occ = occ_t.detach().cpu().numpy()
                                 plot_trajectories(occ, [step_np[:, :2]], [f"step {step_idx}"], out_path=frame_path)
-                        if args.frames_include_stage2:
+                        if args.frames_include_stage2 and not args.skip_stage2:
                             final_path = os.path.join(frames_dir, "stage2.png")
-                            if dataset_name == "d4rl" and mj_walls_norm is not None:
+                            if dataset_name in {"d4rl", "d4rl_prepared"}:
+                                occ = occ_t.detach().cpu().numpy()
+                                h, w = occ.shape
+                                refined_np = refined_t.detach().cpu().numpy()
+                                refined_grid = _gridify_xy(refined_np[:, :2], h, w)
+                                plot_trajectories(occ, [refined_grid], ["stage2"], out_path=final_path)
+                            elif mj_walls_norm is not None:
                                 plot_maze2d_geom_walls(
                                     mj_walls_norm,
                                     [refined_np[:, :2]],
@@ -499,11 +598,12 @@ def main():
                                     out_path=final_path,
                                     bounds=((0.0, 1.0), (0.0, 1.0)),
                                 )
-                            elif dataset_name == "d4rl" and maze_map is not None and maze_scale is not None:
+                            elif maze_map is not None and maze_scale is not None:
+                                refined_plot = _denorm_xy(refined_np[:, :2])
                                 plot_maze2d_trajectories(
                                     maze_map,
                                     maze_scale,
-                                    [refined_np[:, :2]],
+                                    [refined_plot],
                                     ["stage2"],
                                     out_path=final_path,
                                 )

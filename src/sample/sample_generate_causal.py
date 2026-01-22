@@ -7,7 +7,7 @@ import numpy as np
 from tqdm import tqdm
 
 from src.corruptions.keyframes import interpolate_from_indices, sample_fixed_k_indices_batch
-from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset
+from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset, PreparedTrajectoryDataset
 from src.diffusion.ddpm import _timesteps, ddim_step
 from src.diffusion.schedules import make_alpha_bars, make_beta_schedule
 from src.eval.visualize import plot_maze2d_geom_walls, plot_maze2d_trajectories, plot_trajectories
@@ -38,9 +38,20 @@ def build_argparser():
     p.add_argument("--logit_eps", type=float, default=1e-5)
     p.add_argument("--use_ema", type=int, default=1)
     p.add_argument("--device", type=str, default=None)
-    p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl"])
+    p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl", "d4rl_prepared"])
+    p.add_argument("--prepared_path", type=str, default=None)
     p.add_argument("--env_id", type=str, default="maze2d-medium-v1")
-    p.add_argument("--d4rl_flip_y", type=int, default=1)
+    p.add_argument("--d4rl_flip_y", type=int, default=0)
+    p.add_argument("--max_collision_rate", type=float, default=0.0)
+    p.add_argument("--max_resample_tries", type=int, default=50)
+    p.add_argument("--min_goal_dist", type=float, default=None)
+    p.add_argument("--min_path_len", type=float, default=None)
+    p.add_argument("--min_tortuosity", type=float, default=None)
+    p.add_argument("--min_turns", type=int, default=None)
+    p.add_argument("--turn_angle_deg", type=float, default=30.0)
+    p.add_argument("--window_mode", type=str, default="end", choices=["end", "random", "episode"])
+    p.add_argument("--goal_mode", type=str, default="env", choices=["env", "window_end"])
+    p.add_argument("--use_start_goal", type=int, default=1)
     p.add_argument("--override_meta", type=int, default=0)
     p.add_argument("--clamp_policy", type=str, default="endpoints", choices=["none", "endpoints", "all_anchors"])
     p.add_argument("--clamp_dims", type=str, default="pos", choices=["pos", "all"])
@@ -141,8 +152,8 @@ def main():
     args = build_argparser().parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     _ensure_mujoco_env()
-    if args.dataset != "d4rl":
-        raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl with Maze2D envs.")
+    if args.dataset not in {"d4rl", "d4rl_prepared"}:
+        raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl or d4rl_prepared.")
 
     meta = {}
     if os.path.exists(args.ckpt_keypoints):
@@ -152,6 +163,9 @@ def main():
                 meta = payload_meta.get("meta", {}) or {}
         except Exception:
             meta = {}
+    def _normalize_dataset_name(name):
+        return "d4rl" if name == "d4rl_prepared" else name
+
     if meta.get("stage") == "keypoints" and not args.override_meta:
         args.T = meta.get("T", args.T)
         args.N_train = meta.get("N_train", args.N_train)
@@ -166,8 +180,14 @@ def main():
             args.logit_space = int(bool(meta.get("logit_space")))
         if meta.get("logit_eps") is not None:
             args.logit_eps = float(meta.get("logit_eps"))
+        if meta.get("use_start_goal") is not None:
+            args.use_start_goal = int(bool(meta.get("use_start_goal")))
+        if meta.get("window_mode") is not None:
+            args.window_mode = str(meta.get("window_mode"))
+        if meta.get("goal_mode") is not None:
+            args.goal_mode = str(meta.get("goal_mode"))
         if meta.get("dataset") is not None:
-            if args.dataset != meta.get("dataset"):
+            if _normalize_dataset_name(args.dataset) != _normalize_dataset_name(meta.get("dataset")):
                 raise ValueError(
                     f"Keypoint checkpoint dataset mismatch: ckpt={meta.get('dataset')} args={args.dataset}. "
                     "Use --override_meta 1 to force."
@@ -186,11 +206,16 @@ def main():
     device = get_device(args.device)
     data_dim = 4 if args.with_velocity else 2
 
-    kp_model = KeypointDenoiser(data_dim=data_dim, use_sdf=bool(args.use_sdf)).to(device)
+    kp_model = KeypointDenoiser(
+        data_dim=data_dim,
+        use_sdf=bool(args.use_sdf),
+        use_start_goal=bool(args.use_start_goal),
+    ).to(device)
     interp_model = InterpLevelCausalDenoiser(
         data_dim=data_dim,
         use_sdf=bool(args.use_sdf),
         max_levels=args.levels,
+        use_start_goal=bool(args.use_start_goal),
     ).to(device)
 
     payload_kp = torch.load(args.ckpt_keypoints, map_location="cpu") if os.path.exists(args.ckpt_keypoints) else {}
@@ -238,7 +263,11 @@ def main():
     schedule = make_alpha_bars(betas)
 
     dataset_name = "synthetic" if args.dataset == "synthetic" else args.dataset
-    if dataset_name == "d4rl":
+    if dataset_name == "d4rl_prepared":
+        if args.prepared_path is None:
+            raise ValueError("--prepared_path is required for dataset d4rl_prepared")
+        dataset = PreparedTrajectoryDataset(args.prepared_path, use_sdf=bool(args.use_sdf))
+    elif dataset_name == "d4rl":
         dataset = D4RLMazeDataset(
             env_id=args.env_id,
             num_samples=args.n_samples,
@@ -247,6 +276,15 @@ def main():
             use_sdf=bool(args.use_sdf),
             seed=1234,
             flip_y=bool(args.d4rl_flip_y),
+            max_collision_rate=args.max_collision_rate,
+            max_resample_tries=args.max_resample_tries,
+            min_goal_dist=args.min_goal_dist,
+            min_path_len=args.min_path_len,
+            min_tortuosity=args.min_tortuosity,
+            min_turns=args.min_turns,
+            turn_angle_deg=args.turn_angle_deg,
+            window_mode=args.window_mode,
+            goal_mode=args.goal_mode,
         )
     else:
         dataset = ParticleMazeDataset(
@@ -262,7 +300,7 @@ def main():
     pos_low = None
     pos_scale = None
     flip_y = False
-    if dataset_name == "d4rl":
+    if dataset_name in {"d4rl", "d4rl_prepared"}:
         maze_map = getattr(dataset, "maze_map", None)
         maze_scale = getattr(dataset, "maze_size_scaling", None)
         mj_walls = getattr(dataset, "mj_walls", None)
@@ -311,13 +349,14 @@ def main():
             mask_local = mask_local[0]
             known_mask = torch.zeros((1, idx_local.shape[1], data_dim), device=device, dtype=torch.bool)
             known_values = torch.zeros((1, idx_local.shape[1], data_dim), device=device)
-            known_mask[:, :, :2] = (idx_local == 0).unsqueeze(-1) | (idx_local == local_T - 1).unsqueeze(-1)
-            known_values[:, :, :2] = torch.where(
-                (idx_local == 0).unsqueeze(-1), left.view(1, 1, 2), known_values[:, :, :2]
-            )
-            known_values[:, :, :2] = torch.where(
-                (idx_local == local_T - 1).unsqueeze(-1), right.view(1, 1, 2), known_values[:, :, :2]
-            )
+            if args.use_start_goal:
+                known_mask[:, :, :2] = (idx_local == 0).unsqueeze(-1) | (idx_local == local_T - 1).unsqueeze(-1)
+                known_values[:, :, :2] = torch.where(
+                    (idx_local == 0).unsqueeze(-1), left.view(1, 1, 2), known_values[:, :, :2]
+                )
+                known_values[:, :, :2] = torch.where(
+                    (idx_local == local_T - 1).unsqueeze(-1), right.view(1, 1, 2), known_values[:, :, :2]
+                )
             if args.logit_space:
                 known_values = logit_pos(known_values, eps=args.logit_eps)
 
@@ -365,7 +404,7 @@ def main():
                 if cur < args.T:
                     traj[cur:, :] = float("nan")
                 frame_path = os.path.join(frames_dir, f"frame_{frame_idx:03d}.png")
-                if dataset_name == "d4rl" and pos_low is not None and pos_scale is not None:
+                if dataset_name in {"d4rl", "d4rl_prepared"} and pos_low is not None and pos_scale is not None:
                     traj_world = _unnormalize_pos(traj, pos_low.to(device), pos_scale.to(device), flip_y)
                     bounds = (
                         (float(pos_low[0].item()), float((pos_low[0] + pos_scale[0]).item())),
@@ -405,7 +444,7 @@ def main():
             x_gen = torch.cat([pos, v], dim=-1)
 
         out_path = os.path.join(args.out_dir, f"sample_{i:04d}.png")
-        if dataset_name == "d4rl" and pos_low is not None and pos_scale is not None:
+        if dataset_name in {"d4rl", "d4rl_prepared"} and pos_low is not None and pos_scale is not None:
             pred_world = _unnormalize_pos(x_gen, pos_low.to(device), pos_scale.to(device), flip_y)
             bounds = (
                 (float(pos_low[0].item()), float((pos_low[0] + pos_scale[0]).item())),

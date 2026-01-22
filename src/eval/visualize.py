@@ -12,29 +12,49 @@ def _to_numpy(x):
     return x
 
 
+def _maze_map_to_occ(maze_map) -> Optional[np.ndarray]:
+    if isinstance(maze_map, np.ndarray):
+        arr = np.asarray(maze_map)
+        if arr.ndim != 2:
+            return None
+        uniq = np.unique(arr)
+        if set(uniq.tolist()).issubset({0, 1}):
+            return (arr > 0).astype(np.float32)
+        if set(uniq.tolist()).issubset({10, 11, 12}):
+            return (arr == 10).astype(np.float32).T
+        return (arr > 0).astype(np.float32)
+    if isinstance(maze_map, (list, tuple)) and len(maze_map) > 0:
+        if isinstance(maze_map[0], (list, tuple, np.ndarray)):
+            arr = np.array(maze_map)
+            if arr.ndim != 2:
+                return None
+            uniq = np.unique(arr)
+            if set(uniq.tolist()).issubset({0, 1}):
+                return (arr > 0).astype(np.float32)
+            if set(uniq.tolist()).issubset({10, 11, 12}):
+                return (arr == 10).astype(np.float32).T
+            return (arr > 0).astype(np.float32)
+        if isinstance(maze_map[0], str):
+            h = len(maze_map)
+            w = len(maze_map[0])
+            occ = np.zeros((h, w), dtype=np.float32)
+            wall_chars = {"#", "1", "X"}
+            for i, row in enumerate(maze_map):
+                for j, ch in enumerate(row):
+                    if ch in wall_chars:
+                        occ[i, j] = 1.0
+            return occ
+    return None
+
+
 def _maze_map_to_walls(
     maze_map: Union[np.ndarray, Sequence],
     scale: float,
 ) -> List[Tuple[float, float, float, float]]:
     if maze_map is None:
         return []
-    if isinstance(maze_map, np.ndarray):
-        occ = maze_map > 0
-    elif isinstance(maze_map, (list, tuple)) and len(maze_map) > 0:
-        if isinstance(maze_map[0], (list, tuple, np.ndarray)):
-            occ = np.array(maze_map) > 0
-        elif isinstance(maze_map[0], str):
-            h = len(maze_map)
-            w = len(maze_map[0])
-            occ = np.zeros((h, w), dtype=bool)
-            wall_chars = {"#", "1", "X"}
-            for i, row in enumerate(maze_map):
-                for j, ch in enumerate(row):
-                    if ch in wall_chars:
-                        occ[i, j] = True
-        else:
-            return []
-    else:
+    occ = _maze_map_to_occ(maze_map)
+    if occ is None:
         return []
     h, w = occ.shape
     walls = []

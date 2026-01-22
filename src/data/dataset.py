@@ -38,6 +38,23 @@ def _maybe_import_d4rl():
     return gym
 
 
+def _parse_maze_spec(maze_str: str) -> np.ndarray:
+    lines = maze_str.strip().split("\\")
+    width, height = len(lines), len(lines[0])
+    arr = np.zeros((width, height), dtype=np.int32)
+    for w in range(width):
+        row = lines[w]
+        for h in range(height):
+            tile = row[h]
+            if tile == "#":
+                arr[w, h] = 10
+            elif tile == "G":
+                arr[w, h] = 12
+            else:
+                arr[w, h] = 11
+    return arr
+
+
 def _extract_maze_map(env):
     candidates = [env, getattr(env, "unwrapped", env)]
     for obj in candidates:
@@ -45,11 +62,13 @@ def _extract_maze_map(env):
             maze_map = obj.get_maze_map()
             if maze_map is not None:
                 return maze_map
-        for attr in ["maze_map", "maze"]:
+        for attr in ["maze_arr", "maze_map", "maze", "str_maze_spec", "maze_spec"]:
             if hasattr(obj, attr):
                 maze_map = getattr(obj, attr)
                 if hasattr(maze_map, "maze_map"):
                     maze_map = maze_map.maze_map
+                if isinstance(maze_map, str):
+                    return _parse_maze_spec(maze_map)
                 return maze_map
     return None
 
@@ -115,44 +134,87 @@ def _extract_mujoco_walls(env) -> Optional[List[np.ndarray]]:
     for i in range(model.ngeom):
         name = _get_geom_name(model, i) or ""
         name_l = name.lower()
-        if any(k in name_l for k in ["wall", "block", "maze"]) and not any(k in name_l for k in ["floor", "ground"]):
+        if any(k in name_l for k in ["wall", "block", "maze", "obstacle"]) and not any(
+            k in name_l for k in ["floor", "ground", "plane", "base"]
+        ):
             wall_ids.append(i)
     if len(wall_ids) == 0:
         for i in range(model.ngeom):
             name = _get_geom_name(model, i) or ""
             name_l = name.lower()
-            if any(k in name_l for k in ["floor", "ground"]):
+            if any(k in name_l for k in ["floor", "ground", "plane", "base"]):
                 continue
             if int(geom_type[i]) == box_type:
                 wall_ids.append(i)
 
-    walls: List[np.ndarray] = []
+    candidates: List[Tuple[np.ndarray, float, float]] = []
+    max_height = 0.0
     for i in wall_ids:
         if int(geom_type[i]) != box_type:
             continue
         size = np.array(geom_size[i], dtype=np.float32)
+        if size.shape[0] < 3:
+            continue
         pos = np.array(geom_pos[i], dtype=np.float32)
         quat = np.array(geom_quat[i], dtype=np.float32)
-        sx, sy = float(size[0]), float(size[1])
+        sx, sy, sz = float(size[0]), float(size[1]), float(size[2])
         if sx <= 0 or sy <= 0:
             continue
+        max_height = max(max_height, sz)
         corners = np.array(
             [[sx, sy, 0.0], [sx, -sy, 0.0], [-sx, -sy, 0.0], [-sx, sy, 0.0]], dtype=np.float32
         )
         rot = _quat_to_rotmat(quat)
         world = corners @ rot.T + pos[None, :]
-        walls.append(world[:, :2])
+        area = 4.0 * sx * sy
+        candidates.append((world[:, :2], area, sz))
+
+    if len(candidates) == 0:
+        return None
+
+    # Drop very thin boxes (likely the floor).
+    if max_height > 0:
+        min_height = 0.05 * max_height
+        filtered = [c for c in candidates if c[2] >= min_height]
+        if len(filtered) > 0:
+            candidates = filtered
+
+    # Drop extremely large boxes compared to the median area (likely floor/ground plane).
+    areas = np.array([c[1] for c in candidates], dtype=np.float32)
+    if areas.size > 0:
+        med = float(np.median(areas))
+        if med > 0:
+            keep = areas <= (6.0 * med)
+            if np.any(keep):
+                candidates = [c for c, k in zip(candidates, keep.tolist()) if k]
+
+    walls = [c[0] for c in candidates]
     return walls if len(walls) > 0 else None
 
 
 def _maze_map_to_occ(maze_map) -> np.ndarray:
     if isinstance(maze_map, np.ndarray):
-        occ = (maze_map > 0).astype(np.float32)
-        return occ
+        arr = np.asarray(maze_map)
+        if arr.ndim != 2:
+            raise ValueError("Unsupported maze_map format")
+        uniq = np.unique(arr)
+        if set(uniq.tolist()).issubset({0, 1}):
+            return (arr > 0).astype(np.float32)
+        if set(uniq.tolist()).issubset({10, 11, 12}):
+            # D4RL pointmaze uses WALL=10, EMPTY=11, GOAL=12 with arr indexed as [x, y].
+            return (arr == 10).astype(np.float32).T
+        return (arr > 0).astype(np.float32)
     if isinstance(maze_map, (list, tuple)) and len(maze_map) > 0:
         if isinstance(maze_map[0], (list, tuple, np.ndarray)):
-            occ = (np.array(maze_map) > 0).astype(np.float32)
-            return occ
+            arr = np.array(maze_map)
+            if arr.ndim != 2:
+                raise ValueError("Unsupported maze_map format")
+            uniq = np.unique(arr)
+            if set(uniq.tolist()).issubset({0, 1}):
+                return (arr > 0).astype(np.float32)
+            if set(uniq.tolist()).issubset({10, 11, 12}):
+                return (arr == 10).astype(np.float32).T
+            return (arr > 0).astype(np.float32)
         if isinstance(maze_map[0], str):
             h = len(maze_map)
             w = len(maze_map[0])
@@ -166,13 +228,17 @@ def _maze_map_to_occ(maze_map) -> np.ndarray:
     raise ValueError("Unsupported maze_map format")
 
 
-def _resample_sequence(seq: torch.Tensor, T: int) -> torch.Tensor:
+def _resample_sequence(seq: torch.Tensor, T: int, mode: str = "linear") -> torch.Tensor:
     L = seq.shape[0]
     if L == T:
         return seq
     if L == 1:
         return seq.repeat(T, 1)
     idx = torch.linspace(0, L - 1, T, device=seq.device)
+    if mode == "nearest":
+        idx_n = torch.round(idx).long()
+        idx_n = torch.clamp(idx_n, 0, L - 1)
+        return seq[idx_n]
     idx0 = torch.floor(idx).long()
     idx1 = torch.clamp(idx0 + 1, max=L - 1)
     w = (idx - idx0.float()).unsqueeze(-1)
@@ -301,6 +367,16 @@ class D4RLMazeDataset(Dataset):
         use_sdf: bool = False,
         seed: int = 123,
         flip_y: bool = True,
+        swap_xy: bool = False,
+        max_collision_rate: Optional[float] = None,
+        max_resample_tries: int = 50,
+        min_goal_dist: Optional[float] = None,
+        min_path_len: Optional[float] = None,
+        window_mode: str = "end",
+        goal_mode: str = "env",
+        min_tortuosity: Optional[float] = None,
+        min_turns: Optional[int] = None,
+        turn_angle_deg: float = 30.0,
     ):
         gym = _maybe_import_d4rl()
         env = gym.make(env_id)
@@ -313,6 +389,16 @@ class D4RLMazeDataset(Dataset):
         self.use_sdf = use_sdf
         self.seed = seed
         self.flip_y = flip_y
+        self.swap_xy = swap_xy
+        self.max_collision_rate = max_collision_rate
+        self.max_resample_tries = max_resample_tries
+        self.min_goal_dist = min_goal_dist
+        self.min_path_len = min_path_len
+        self.window_mode = window_mode
+        self.goal_mode = goal_mode
+        self.min_tortuosity = min_tortuosity
+        self.min_turns = min_turns
+        self.turn_angle_deg = turn_angle_deg
 
         self.obs = dataset["observations"].astype(np.float32)
         terminals = dataset.get("terminals")
@@ -344,8 +430,11 @@ class D4RLMazeDataset(Dataset):
             occ = np.zeros((21, 21), dtype=np.float32)
         else:
             occ = _maze_map_to_occ(maze_map)
+        if self.flip_y and occ is not None:
+            occ = np.flipud(occ).copy()
         self.goal_arr = self._extract_goal_array(dataset)
-        self.pos_low, self.pos_high = self._infer_pos_bounds(env, occ)
+        # Use occupancy-grid bounds for normalization to keep coordinates aligned with occ.
+        self.pos_low, self.pos_high = self._infer_pos_bounds(env, occ, None)
         self.pos_scale = torch.clamp(self.pos_high - self.pos_low, min=1e-6)
         self.occ = torch.from_numpy(occ).unsqueeze(0)
         if self.use_sdf:
@@ -371,30 +460,57 @@ class D4RLMazeDataset(Dataset):
                     return arr[:, :2].astype(np.float32)
         return None
 
-    def _infer_pos_bounds(self, env, occ: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _infer_pos_bounds(
+        self,
+        env,
+        occ: np.ndarray,
+        walls: Optional[List[np.ndarray]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         low = None
         high = None
-        try:
-            obs_space = env.observation_space
-            low = obs_space.low[:2]
-            high = obs_space.high[:2]
-            if not np.all(np.isfinite(low)) or not np.all(np.isfinite(high)):
-                low, high = None, None
-        except Exception:
-            low, high = None, None
+        if walls:
+            mins = []
+            maxs = []
+            for poly in walls:
+                arr = np.asarray(poly, dtype=np.float32)
+                if arr.ndim != 2 or arr.shape[1] < 2:
+                    continue
+                mins.append(arr[:, :2].min(axis=0))
+                maxs.append(arr[:, :2].max(axis=0))
+            if len(mins) > 0:
+                low = np.min(np.stack(mins, axis=0), axis=0)
+                high = np.max(np.stack(maxs, axis=0), axis=0)
+
         if low is None or high is None:
             scale = getattr(getattr(env, "unwrapped", env), "maze_size_scaling", None)
             if scale is None:
                 scale = getattr(getattr(env, "unwrapped", env), "maze_size_scale", None)
-            if scale is not None and occ is not None:
+            if scale is None:
+                scale = 1.0
+            if occ is not None:
                 h, w = occ.shape
-                low = np.array([0.0, 0.0], dtype=np.float32)
-                high = np.array([w * float(scale), h * float(scale)], dtype=np.float32)
-            else:
-                low = self.obs[:, :2].min(axis=0)
-                high = self.obs[:, :2].max(axis=0)
-        low_t = torch.from_numpy(low.astype(np.float32))
-        high_t = torch.from_numpy(high.astype(np.float32))
+                if np.any(occ > 0):
+                    # D4RL pointmaze observations are in grid index coordinates (0..W-1),
+                    # not offset by +0.5 like the wall geom centers.
+                    low = np.array([0.0, 0.0], dtype=np.float32)
+                    high = np.array([w * float(scale), h * float(scale)], dtype=np.float32)
+
+        if low is None or high is None:
+            try:
+                obs_space = env.observation_space
+                low = obs_space.low[:2]
+                high = obs_space.high[:2]
+                if not np.all(np.isfinite(low)) or not np.all(np.isfinite(high)):
+                    low, high = None, None
+            except Exception:
+                low, high = None, None
+
+        if low is None or high is None:
+            low = self.obs[:, :2].min(axis=0)
+            high = self.obs[:, :2].max(axis=0)
+
+        low_t = torch.from_numpy(np.asarray(low, dtype=np.float32))
+        high_t = torch.from_numpy(np.asarray(high, dtype=np.float32))
         return low_t, high_t
 
     def _normalize_obs(self, obs: torch.Tensor) -> torch.Tensor:
@@ -402,51 +518,167 @@ class D4RLMazeDataset(Dataset):
         pos = (pos - self.pos_low) / self.pos_scale
         if self.flip_y:
             pos[:, 1] = 1.0 - pos[:, 1]
+        if self.swap_xy:
+            pos = pos[:, [1, 0]]
         if not self.with_velocity:
             return pos
         vel = obs[:, 2:4] if obs.shape[1] >= 4 else torch.zeros_like(pos)
         vel = vel / self.pos_scale
         if self.flip_y:
             vel[:, 1] = -vel[:, 1]
+        if self.swap_xy:
+            vel = vel[:, [1, 0]]
         return torch.cat([pos, vel], dim=-1)
 
     def __getitem__(self, idx: int):
+        from src.eval.metrics import collision_rate
+
+        def _draw(gen_local: torch.Generator):
+            ep_idx = int(torch.randint(0, len(self.episodes), (1,), generator=gen_local).item())
+            start, end = self.episodes[ep_idx]
+            length = end - start
+            if self.window_mode == "episode":
+                base_idx = start
+                obs = self.obs[start:end]
+            elif length >= self.T:
+                if self.window_mode == "random":
+                    max_start = end - self.T
+                    offset = int(torch.randint(0, max_start - start + 1, (1,), generator=gen_local).item())
+                    base_idx = start + offset
+                    obs = self.obs[base_idx : base_idx + self.T]
+                else:
+                    base_idx = end - self.T
+                    obs = self.obs[base_idx:end]
+            else:
+                base_idx = start
+                obs = self.obs[start:end]
+            end_idx = end - 1
+            obs_t = torch.from_numpy(obs)
+            if obs_t.shape[0] != self.T:
+                obs_t = _resample_sequence(obs_t, self.T, mode="nearest")
+            x = self._normalize_obs(obs_t)
+
+            start_pos = x[0, :2]
+            if self.goal_mode == "window_end":
+                goal_t = x[-1, :2]
+            elif self.goal_arr is not None:
+                goal_raw = self.goal_arr[end_idx]
+                goal_t = torch.from_numpy(goal_raw)
+                goal_t = (goal_t - self.pos_low) / self.pos_scale
+                if self.flip_y:
+                    goal_t[1] = 1.0 - goal_t[1]
+                if self.swap_xy:
+                    goal_t = goal_t[[1, 0]]
+            else:
+                goal_t = x[-1, :2]
+            start_goal = torch.cat([start_pos, goal_t], dim=0)
+
+            sample = {
+                "x": x,
+                "cond": {
+                    "occ": self.occ,
+                    "start_goal": start_goal,
+                },
+            }
+            if self.sdf is not None:
+                sample["cond"]["sdf"] = self.sdf
+            return sample
+
         gen = torch.Generator()
         gen.manual_seed(self.seed + idx)
-        ep_idx = int(torch.randint(0, len(self.episodes), (1,), generator=gen).item())
-        start, end = self.episodes[ep_idx]
-        length = end - start
-        # Use windows that end at the episode end to align goal with x[-1].
-        if length >= self.T:
-            base_idx = end - self.T
-            obs = self.obs[base_idx:end]
-        else:
-            base_idx = start
-            obs = self.obs[start:end]
-        end_idx = end - 1
-        obs_t = torch.from_numpy(obs)
-        if obs_t.shape[0] != self.T:
-            obs_t = _resample_sequence(obs_t, self.T)
-        x = self._normalize_obs(obs_t)
+        sample = _draw(gen)
+        if (
+            self.max_collision_rate is None
+            and self.min_goal_dist is None
+            and self.min_path_len is None
+            and self.min_tortuosity is None
+            and self.min_turns is None
+        ):
+            return sample
 
-        start_pos = x[0, :2]
-        if self.goal_arr is not None:
-            goal_raw = self.goal_arr[end_idx]
-            goal_t = torch.from_numpy(goal_raw)
-            goal_t = (goal_t - self.pos_low) / self.pos_scale
-            if self.flip_y:
-                goal_t[1] = 1.0 - goal_t[1]
-        else:
-            goal_t = x[-1, :2]
-        start_goal = torch.cat([start_pos, goal_t], dim=0)
+        for attempt in range(self.max_resample_tries):
+            accept = True
+            if self.max_collision_rate is not None:
+                coll = collision_rate(sample["cond"]["occ"][0], sample["x"])
+                if coll > float(self.max_collision_rate):
+                    accept = False
+            if accept and self.min_goal_dist is not None:
+                start_goal = sample["cond"]["start_goal"]
+                sg = start_goal.clone()
+                sg[:2] = sg[:2] * self.pos_scale[:2] + self.pos_low[:2]
+                sg[2:] = sg[2:] * self.pos_scale[:2] + self.pos_low[:2]
+                goal_dist = torch.norm(sg[:2] - sg[2:]).item()
+                if goal_dist < float(self.min_goal_dist):
+                    accept = False
+            if accept and self.min_path_len is not None:
+                traj = sample["x"][:, :2] * self.pos_scale[:2] + self.pos_low[:2]
+                path_len = torch.norm(traj[1:] - traj[:-1], dim=-1).sum().item()
+                if path_len < float(self.min_path_len):
+                    accept = False
+            if accept and (self.min_tortuosity is not None or self.min_turns is not None):
+                traj = sample["x"][:, :2] * self.pos_scale[:2] + self.pos_low[:2]
+                diffs = traj[1:] - traj[:-1]
+                seg_lens = torch.norm(diffs, dim=-1)
+                path_len = seg_lens.sum().item()
+                straight = torch.norm(traj[-1] - traj[0]).item()
+                if self.min_tortuosity is not None:
+                    tort = path_len / max(straight, 1e-6)
+                    if tort < float(self.min_tortuosity):
+                        accept = False
+                if accept and self.min_turns is not None:
+                    v1 = diffs[:-1]
+                    v2 = diffs[1:]
+                    n1 = torch.norm(v1, dim=-1)
+                    n2 = torch.norm(v2, dim=-1)
+                    valid = (n1 > 1e-6) & (n2 > 1e-6)
+                    if valid.any():
+                        v1n = v1[valid] / n1[valid].unsqueeze(-1)
+                        v2n = v2[valid] / n2[valid].unsqueeze(-1)
+                        dots = (v1n * v2n).sum(dim=-1).clamp(-1.0, 1.0)
+                        angles = torch.acos(dots)
+                        thresh = float(self.turn_angle_deg) * np.pi / 180.0
+                        turns = int((angles >= thresh).sum().item())
+                    else:
+                        turns = 0
+                    if turns < int(self.min_turns):
+                        accept = False
+            if accept:
+                return sample
+            gen.manual_seed(self.seed + idx + (attempt + 1) * 1000003)
+            sample = _draw(gen)
+        return sample
 
+
+class PreparedTrajectoryDataset(Dataset):
+    def __init__(self, path: str, use_sdf: bool = False):
+        data = np.load(path)
+        self.x = data["x"].astype(np.float32)
+        self.start_goal = data["start_goal"].astype(np.float32)
+        occ = data["occ"].astype(np.float32)
+        self.difficulty = data.get("difficulty")
+        if occ.ndim == 2:
+            occ = occ[None, ...]
+        self.occ = occ
+        self.sdf = None
+        if use_sdf and "sdf" in data:
+            sdf = data["sdf"].astype(np.float32)
+            if sdf.ndim == 2:
+                sdf = sdf[None, ...]
+            self.sdf = sdf
+
+    def __len__(self):
+        return self.x.shape[0]
+
+    def __getitem__(self, idx: int):
         sample = {
-            "x": x,
+            "x": torch.from_numpy(self.x[idx]),
             "cond": {
-                "occ": self.occ,
-                "start_goal": start_goal,
+                "occ": torch.from_numpy(self.occ),
+                "start_goal": torch.from_numpy(self.start_goal[idx]),
             },
         }
+        if self.difficulty is not None:
+            sample["difficulty"] = torch.tensor(int(self.difficulty[idx]), dtype=torch.int64)
         if self.sdf is not None:
-            sample["cond"]["sdf"] = self.sdf
+            sample["cond"]["sdf"] = torch.from_numpy(self.sdf)
         return sample

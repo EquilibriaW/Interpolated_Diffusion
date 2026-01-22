@@ -33,12 +33,13 @@ class StartGoalEncoder(nn.Module):
 
 
 class MazeConditionEncoder(nn.Module):
-    def __init__(self, use_sdf: bool = False, d_cond: int = 128):
+    def __init__(self, use_sdf: bool = False, d_cond: int = 128, use_start_goal: bool = True):
         super().__init__()
         in_channels = 2 if use_sdf else 1
         self.use_sdf = use_sdf
+        self.use_start_goal = use_start_goal
         self.maze = MazeEncoder(in_channels, d_cond)
-        self.sg = StartGoalEncoder(d_cond)
+        self.sg = StartGoalEncoder(d_cond) if use_start_goal else None
 
     def forward(self, cond: Dict[str, torch.Tensor]) -> torch.Tensor:
         occ = cond["occ"]
@@ -50,5 +51,9 @@ class MazeConditionEncoder(nn.Module):
         else:
             x = occ
         maze_emb = self.maze(x)
-        sg_emb = self.sg(cond["start_goal"])
-        return maze_emb + sg_emb
+        if self.use_start_goal:
+            if "start_goal" not in cond:
+                raise ValueError("use_start_goal is True but start_goal missing from cond")
+            sg_emb = self.sg(cond["start_goal"])
+            return maze_emb + sg_emb
+        return maze_emb
