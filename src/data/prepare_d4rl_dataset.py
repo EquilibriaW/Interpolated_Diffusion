@@ -28,6 +28,8 @@ def main() -> None:
     p.add_argument("--d4rl_flip_y", type=int, default=0)
     p.add_argument("--window_mode", type=str, default="episode", choices=["end", "random", "episode"])
     p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
+    p.add_argument("--episode_split_mod", type=int, default=None)
+    p.add_argument("--episode_split_val", type=int, default=0)
     p.add_argument("--max_collision_rate", type=float, default=0.0)
     p.add_argument("--max_resample_tries", type=int, default=200)
     p.add_argument("--min_goal_dist", type=float, default=6.0)
@@ -67,6 +69,8 @@ def main() -> None:
         turn_angle_deg=args.turn_angle_deg,
         window_mode=args.window_mode,
         goal_mode=args.goal_mode,
+        episode_split_mod=args.episode_split_mod,
+        episode_split_val=args.episode_split_val,
     )
 
     easy_ds = D4RLMazeDataset(
@@ -87,6 +91,8 @@ def main() -> None:
         turn_angle_deg=args.easy_turn_angle_deg,
         window_mode=args.window_mode,
         goal_mode=args.goal_mode,
+        episode_split_mod=args.episode_split_mod,
+        episode_split_val=args.episode_split_val,
     )
 
     first = hard_ds[0] if n_hard > 0 else easy_ds[0]
@@ -150,6 +156,8 @@ def main() -> None:
         "min_tortuosity": args.min_tortuosity,
         "min_turns": args.min_turns,
         "turn_angle_deg": args.turn_angle_deg,
+        "episode_split_mod": args.episode_split_mod,
+        "episode_split_val": args.episode_split_val,
         "easy_min_goal_dist": args.easy_min_goal_dist,
         "easy_min_path_len": args.easy_min_path_len,
         "easy_min_tortuosity": args.easy_min_tortuosity,

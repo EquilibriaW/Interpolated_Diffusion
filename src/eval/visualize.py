@@ -73,6 +73,10 @@ def plot_maze2d_trajectories(
     colors: Optional[List[str]] = None,
     out_path: Optional[str] = None,
     bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
+    title: Optional[str] = None,
+    footer: Optional[str] = None,
+    plot_points: bool = False,
+    keypoints: Optional[List[np.ndarray]] = None,
 ):
     trajs = [_to_numpy(traj) for traj in trajs]
     walls = _maze_map_to_walls(maze_map, scale)
@@ -83,9 +87,17 @@ def plot_maze2d_trajectories(
         colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
     for i, traj in enumerate(trajs):
         xy = traj[:, :2]
-        ax.plot(xy[:, 0], xy[:, 1], color=colors[i % len(colors)], label=labels[i])
-        ax.scatter([xy[0, 0]], [xy[0, 1]], color=colors[i % len(colors)], s=12)
-        ax.scatter([xy[-1, 0]], [xy[-1, 1]], color=colors[i % len(colors)], s=12, marker="x")
+        if plot_points:
+            base_color = "0.6" if keypoints is not None and i < len(keypoints) and keypoints[i] is not None else colors[i % len(colors)]
+            ax.scatter(xy[:, 0], xy[:, 1], color=base_color, s=6, label=labels[i])
+        else:
+            ax.plot(xy[:, 0], xy[:, 1], color=colors[i % len(colors)], label=labels[i])
+        ax.scatter([xy[0, 0]], [xy[0, 1]], color=colors[i % len(colors)], s=20)
+        ax.scatter([xy[-1, 0]], [xy[-1, 1]], color=colors[i % len(colors)], s=24, marker="x")
+        if keypoints is not None and i < len(keypoints) and keypoints[i] is not None:
+            kp = _to_numpy(keypoints[i])
+            if kp.size > 0:
+                ax.scatter(kp[:, 0], kp[:, 1], color="tab:orange", s=20, edgecolors="black", linewidths=0.3)
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_aspect("equal")
@@ -94,6 +106,10 @@ def plot_maze2d_trajectories(
         ax.set_xlim([xmin, xmax])
         ax.set_ylim([ymin, ymax])
     ax.legend(loc="lower right", fontsize=6)
+    if title is not None:
+        ax.set_title(title, fontsize=8)
+    if footer is not None:
+        fig.text(0.5, 0.02, footer, ha="center", fontsize=8)
     fig.tight_layout()
     if out_path is not None:
         fig.savefig(out_path, dpi=150)
@@ -109,6 +125,10 @@ def plot_maze2d_geom_walls(
     colors: Optional[List[str]] = None,
     out_path: Optional[str] = None,
     bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
+    title: Optional[str] = None,
+    footer: Optional[str] = None,
+    plot_points: bool = False,
+    keypoints: Optional[List[np.ndarray]] = None,
 ):
     trajs = [_to_numpy(traj) for traj in trajs]
     fig, ax = plt.subplots(figsize=(4, 4))
@@ -119,9 +139,17 @@ def plot_maze2d_geom_walls(
         colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
     for i, traj in enumerate(trajs):
         xy = traj[:, :2]
-        ax.plot(xy[:, 0], xy[:, 1], color=colors[i % len(colors)], label=labels[i])
-        ax.scatter([xy[0, 0]], [xy[0, 1]], color=colors[i % len(colors)], s=12)
-        ax.scatter([xy[-1, 0]], [xy[-1, 1]], color=colors[i % len(colors)], s=12, marker="x")
+        if plot_points:
+            base_color = "0.6" if keypoints is not None and i < len(keypoints) and keypoints[i] is not None else colors[i % len(colors)]
+            ax.scatter(xy[:, 0], xy[:, 1], color=base_color, s=6, label=labels[i])
+        else:
+            ax.plot(xy[:, 0], xy[:, 1], color=colors[i % len(colors)], label=labels[i])
+        ax.scatter([xy[0, 0]], [xy[0, 1]], color=colors[i % len(colors)], s=20)
+        ax.scatter([xy[-1, 0]], [xy[-1, 1]], color=colors[i % len(colors)], s=24, marker="x")
+        if keypoints is not None and i < len(keypoints) and keypoints[i] is not None:
+            kp = _to_numpy(keypoints[i])
+            if kp.size > 0:
+                ax.scatter(kp[:, 0], kp[:, 1], color="tab:orange", s=20, edgecolors="black", linewidths=0.3)
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_aspect("equal")
@@ -130,6 +158,10 @@ def plot_maze2d_geom_walls(
         ax.set_xlim([xmin, xmax])
         ax.set_ylim([ymin, ymax])
     ax.legend(loc="lower right", fontsize=6)
+    if title is not None:
+        ax.set_title(title, fontsize=8)
+    if footer is not None:
+        fig.text(0.5, 0.02, footer, ha="center", fontsize=8)
     fig.tight_layout()
     if out_path is not None:
         fig.savefig(out_path, dpi=150)
@@ -144,6 +176,10 @@ def plot_trajectories(
     labels: List[str],
     colors: Optional[List[str]] = None,
     out_path: Optional[str] = None,
+    title: Optional[str] = None,
+    footer: Optional[str] = None,
+    plot_points: bool = False,
+    keypoints: Optional[List[np.ndarray]] = None,
 ):
     occ = _to_numpy(occ)
     trajs = [_to_numpy(traj) for traj in trajs]
@@ -156,14 +192,26 @@ def plot_trajectories(
         xy = traj[:, :2]
         x = xy[:, 0] * w
         y = xy[:, 1] * h
-        ax.plot(x, y, color=colors[i % len(colors)], label=labels[i])
-        ax.scatter([x[0]], [y[0]], color=colors[i % len(colors)], s=12)
-        ax.scatter([x[-1]], [y[-1]], color=colors[i % len(colors)], s=12, marker="x")
+        if plot_points:
+            base_color = "0.6" if keypoints is not None and i < len(keypoints) and keypoints[i] is not None else colors[i % len(colors)]
+            ax.scatter(x, y, color=base_color, s=6, label=labels[i])
+        else:
+            ax.plot(x, y, color=colors[i % len(colors)], label=labels[i])
+        ax.scatter([x[0]], [y[0]], color=colors[i % len(colors)], s=20)
+        ax.scatter([x[-1]], [y[-1]], color=colors[i % len(colors)], s=24, marker="x")
+        if keypoints is not None and i < len(keypoints) and keypoints[i] is not None:
+            kp = _to_numpy(keypoints[i])
+            if kp.size > 0:
+                ax.scatter(kp[:, 0] * w, kp[:, 1] * h, color="tab:orange", s=20, edgecolors="black", linewidths=0.3)
     ax.set_xticks([])
     ax.set_yticks([])
     ax.legend(loc="lower right", fontsize=6)
     ax.set_xlim([0, w])
     ax.set_ylim([h, 0])
+    if title is not None:
+        ax.set_title(title, fontsize=8)
+    if footer is not None:
+        fig.text(0.5, 0.02, footer, ha="center", fontsize=8)
     fig.tight_layout()
     if out_path is not None:
         fig.savefig(out_path, dpi=150)

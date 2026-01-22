@@ -50,6 +50,8 @@ def build_argparser():
     p.add_argument("--turn_angle_deg", type=float, default=30.0)
     p.add_argument("--window_mode", type=str, default="end", choices=["end", "random", "episode"])
     p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
+    p.add_argument("--episode_split_mod", type=int, default=None)
+    p.add_argument("--episode_split_val", type=int, default=0)
     p.add_argument("--use_start_goal", type=int, default=1)
     p.add_argument("--log_dir", type=str, default="runs/keypoints")
     p.add_argument("--ckpt_dir", type=str, default="checkpoints/keypoints")
@@ -156,11 +158,13 @@ def main():
             min_goal_dist=args.min_goal_dist,
             min_path_len=args.min_path_len,
             min_tortuosity=args.min_tortuosity,
-            min_turns=args.min_turns,
-            turn_angle_deg=args.turn_angle_deg,
-            window_mode=args.window_mode,
-            goal_mode=args.goal_mode,
-        )
+        min_turns=args.min_turns,
+        turn_angle_deg=args.turn_angle_deg,
+        window_mode=args.window_mode,
+        goal_mode=args.goal_mode,
+        episode_split_mod=args.episode_split_mod,
+        episode_split_val=args.episode_split_val,
+    )
     else:
         dataset = ParticleMazeDataset(
             num_samples=args.num_samples,

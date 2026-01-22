@@ -59,6 +59,8 @@ def build_argparser():
     p.add_argument("--turn_angle_deg", type=float, default=30.0)
     p.add_argument("--window_mode", type=str, default="end", choices=["end", "random", "episode"])
     p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
+    p.add_argument("--episode_split_mod", type=int, default=None)
+    p.add_argument("--episode_split_val", type=int, default=0)
     p.add_argument("--use_start_goal", type=int, default=1)
     p.add_argument("--override_meta", type=int, default=0)
     p.add_argument("--clamp_policy", type=str, default="endpoints", choices=["none", "endpoints", "all_anchors"])
@@ -76,9 +78,13 @@ def build_argparser():
     p.add_argument("--skip_stage2", type=int, default=0)
     p.add_argument("--compare_oracle", type=int, default=0)
     p.add_argument("--plot_keypoints", type=int, default=1)
+    p.add_argument("--plot_points", type=int, default=0)
     p.add_argument("--force_single", type=int, default=0)
     p.add_argument("--kp_index_mode", type=str, default="uniform", choices=["random", "uniform", "uniform_jitter"])
     p.add_argument("--kp_jitter", type=float, default=0.0)
+    p.add_argument("--sample_random", type=int, default=1)
+    p.add_argument("--sample_seed", type=int, default=1234)
+    p.add_argument("--sample_unique", type=int, default=1)
     return p
 
 
@@ -356,6 +362,8 @@ def main():
             turn_angle_deg=args.turn_angle_deg,
             window_mode=args.window_mode,
             goal_mode=args.goal_mode,
+            episode_split_mod=args.episode_split_mod,
+            episode_split_val=args.episode_split_val,
         )
     else:
         dataset = ParticleMazeDataset(
@@ -364,7 +372,15 @@ def main():
             with_velocity=bool(args.with_velocity),
             use_sdf=bool(args.use_sdf),
         )
-    loader = DataLoader(dataset, batch_size=args.batch, shuffle=False)
+    sampler = None
+    if bool(args.sample_random):
+        from torch.utils.data import RandomSampler
+
+        gen_cpu = torch.Generator()
+        gen_cpu.manual_seed(int(args.sample_seed))
+        replacement = not bool(args.sample_unique)
+        sampler = RandomSampler(dataset, replacement=replacement, num_samples=args.n_samples, generator=gen_cpu)
+    loader = DataLoader(dataset, batch_size=args.batch, shuffle=(sampler is None), sampler=sampler)
 
     maze_map = None
     maze_scale = None
@@ -398,41 +414,32 @@ def main():
         out = out * pos_scale[:2].cpu().numpy() + pos_low[:2].cpu().numpy()
         return out
 
-    def _gridify_xy(xy: np.ndarray, h: int, w: int) -> np.ndarray:
-        x = xy[:, 0]
-        y = xy[:, 1]
-        j = np.floor(x * w).astype(np.int64)
-        i = np.floor(y * h).astype(np.int64)
-        j = np.clip(j, 0, w - 1)
-        i = np.clip(i, 0, h - 1)
-        out = np.stack([j / float(w), i / float(h)], axis=-1)
-        return out
-
-    def _plot_side_by_side(
+    def _plot_compare_panels(
         occ: np.ndarray,
-        left_traj: np.ndarray,
-        right_traj: np.ndarray,
-        left_label: str,
-        right_label: str,
-        left_collision: float,
-        right_collision: float,
-        left_kp: Optional[np.ndarray],
-        right_kp: Optional[np.ndarray],
-        left_sg: Optional[np.ndarray],
-        right_sg: Optional[np.ndarray],
+        panels: list,
         out_path: str,
     ):
         import matplotlib.pyplot as plt
 
-        fig, axes = plt.subplots(1, 2, figsize=(8, 4), dpi=150)
+        n = len(panels)
+        fig, axes = plt.subplots(1, n, figsize=(4 * n, 4), dpi=150)
+        if n == 1:
+            axes = [axes]
         h, w = occ.shape
-        for ax, traj, label, coll, kp, sg in [
-            (axes[0], left_traj, left_label, left_collision, left_kp, left_sg),
-            (axes[1], right_traj, right_label, right_collision, right_kp, right_sg),
-        ]:
+        for ax, panel in zip(axes, panels):
+            traj = panel["traj"]
+            label = panel["label"]
+            coll = panel.get("coll", float("nan"))
+            kp = panel.get("kp", None)
+            sg = panel.get("sg", None)
+            footer = panel.get("footer", None)
             ax.imshow(occ, cmap="gray_r", origin="upper")
             xy = traj[:, :2]
-            ax.plot(xy[:, 0] * w, xy[:, 1] * h, color="tab:blue", linewidth=2.0)
+            if bool(args.plot_points):
+                base_color = "0.6" if (kp is not None and kp.size > 0) else "tab:blue"
+                ax.scatter(xy[:, 0] * w, xy[:, 1] * h, color=base_color, s=6)
+            else:
+                ax.plot(xy[:, 0] * w, xy[:, 1] * h, color="tab:blue", linewidth=2.0)
             if sg is not None and sg.shape[0] >= 4:
                 ax.scatter([sg[0] * w], [sg[1] * h], s=25, color="tab:green")
                 ax.scatter([sg[2] * w], [sg[3] * h], s=40, color="tab:red", marker="x")
@@ -443,7 +450,10 @@ def main():
             ax.set_ylim([h, 0])
             ax.set_xticks([])
             ax.set_yticks([])
+            if footer:
+                ax.text(0.5, -0.08, footer, transform=ax.transAxes, ha="center", fontsize=8)
         fig.tight_layout()
+        fig.subplots_adjust(bottom=0.2)
         fig.savefig(out_path)
         plt.close(fig)
 
@@ -619,36 +629,42 @@ def main():
                         refined_np = refined_t.detach().cpu().numpy()
                         if args.compare_oracle and x_oracle is not None:
                             occ = occ_t.detach().cpu().numpy()
-                            h, w = occ.shape
-                            left_traj = _gridify_xy(x_oracle[b].detach().cpu().numpy()[:, :2], h, w)
-                            right_traj = _gridify_xy(interp_np[:, :2], h, w)
-                            left_kp = (
-                                z_oracle[b].detach().cpu().numpy()[:, :2]
-                                if (args.plot_keypoints and z_oracle is not None)
-                                else None
-                            )
-                            right_kp = z_pred[b].detach().cpu().numpy()[:, :2] if args.plot_keypoints else None
-                            left_kp = _gridify_xy(left_kp, h, w) if left_kp is not None else None
-                            right_kp = _gridify_xy(right_kp, h, w) if right_kp is not None else None
                             sg = cond["start_goal"][b].detach().cpu().numpy() if "start_goal" in cond else None
-                            if sg is not None:
-                                sg_xy = sg.reshape(2, 2)
-                                sg_xy = _gridify_xy(sg_xy, h, w)
-                                sg = sg_xy.reshape(4,)
-                            _plot_side_by_side(
-                                occ,
-                                left_traj,
-                                right_traj,
-                                "oracle",
-                                "pred",
-                                coll_oracle,
-                                coll_pred,
-                                left_kp,
-                                right_kp,
-                                sg,
-                                sg,
-                                out_path,
+                            panels = []
+                            panels.append(
+                                {
+                                    "traj": x_oracle[b].detach().cpu().numpy()[:, :2],
+                                    "label": "oracle interp",
+                                    "coll": coll_oracle,
+                                    "kp": z_oracle[b].detach().cpu().numpy()[:, :2]
+                                    if (args.plot_keypoints and z_oracle is not None)
+                                    else None,
+                                    "sg": sg,
+                                    "footer": "phase1 (oracle)",
+                                }
                             )
+                            panels.append(
+                                {
+                                    "traj": interp_np[:, :2],
+                                    "label": "pred interp",
+                                    "coll": coll_pred,
+                                    "kp": z_pred[b].detach().cpu().numpy()[:, :2] if args.plot_keypoints else None,
+                                    "sg": sg,
+                                    "footer": "phase1 (pred)",
+                                }
+                            )
+                            if not args.skip_stage2:
+                                panels.append(
+                                    {
+                                        "traj": refined_np[:, :2],
+                                        "label": "stage2",
+                                        "coll": collision_rate(occ_t, refined_t),
+                                        "kp": None,
+                                        "sg": sg,
+                                        "footer": "phase2 (refined)",
+                                    }
+                                )
+                            _plot_compare_panels(occ, panels, out_path)
                         else:
                             trajs = [interp_np[:, :2], refined_np[:, :2]]
                             labels = ["interp", "refined"]
@@ -661,9 +677,17 @@ def main():
                                 labels.append("gt")
                             if dataset_name in {"d4rl", "d4rl_prepared"}:
                                 occ = occ_t.detach().cpu().numpy()
-                                h, w = occ.shape
-                                trajs_grid = [_gridify_xy(t, h, w) for t in trajs]
-                                plot_trajectories(occ, trajs_grid, labels, out_path=out_path)
+                                kps = None
+                                if args.plot_keypoints:
+                                    kps = [z_pred[b].detach().cpu().numpy()[:, :2]] + [None] * (len(trajs) - 1)
+                                plot_trajectories(
+                                    occ,
+                                    trajs,
+                                    labels,
+                                    out_path=out_path,
+                                    plot_points=bool(args.plot_points),
+                                    keypoints=kps,
+                                )
                             elif mj_walls_norm is not None:
                                 norm_trajs = [interp_np[:, :2], refined_np[:, :2]]
                                 norm_labels = ["interp", "refined"]
@@ -679,6 +703,7 @@ def main():
                                     norm_labels,
                                     out_path=out_path,
                                     bounds=((0.0, 1.0), (0.0, 1.0)),
+                                    plot_points=bool(args.plot_points),
                                 )
                             elif maze_map is not None and maze_scale is not None:
                                 plot_trajs = [_denorm_xy(t) for t in trajs]
@@ -688,10 +713,11 @@ def main():
                                     plot_trajs,
                                     labels,
                                     out_path=out_path,
+                                    plot_points=bool(args.plot_points),
                                 )
                             else:
                                 occ = occ_t.detach().cpu().numpy()
-                                plot_trajectories(occ, trajs, labels, out_path=out_path)
+                                plot_trajectories(occ, trajs, labels, out_path=out_path, plot_points=bool(args.plot_points))
 
                     if args.save_debug and args.save_diffusion_frames and z_steps is not None:
                         frames_dir = os.path.join(args.out_dir, "diffusion_steps", f"sample_{idx_global:04d}")
@@ -706,9 +732,16 @@ def main():
                             step_np = x_step[0].detach().cpu().numpy()
                             if dataset_name in {"d4rl", "d4rl_prepared"}:
                                 occ = occ_t.detach().cpu().numpy()
-                                h, w = occ.shape
-                                step_grid = _gridify_xy(step_np[:, :2], h, w)
-                                plot_trajectories(occ, [step_grid], [f"step {step_idx}"], out_path=frame_path)
+                                footer = f"phase1 step {si}/{len(step_indices)-1}"
+                                plot_trajectories(
+                                    occ,
+                                    [step_np[:, :2]],
+                                    [f"phase1"],
+                                    out_path=frame_path,
+                                    footer=footer,
+                                    plot_points=bool(args.plot_points),
+                                    keypoints=[z_step[0].detach().cpu().numpy()[:, :2]] if args.plot_keypoints else None,
+                                )
                             elif mj_walls_norm is not None:
                                 plot_maze2d_geom_walls(
                                     mj_walls_norm,
@@ -716,6 +749,8 @@ def main():
                                     [f"step {step_idx}"],
                                     out_path=frame_path,
                                     bounds=((0.0, 1.0), (0.0, 1.0)),
+                                    plot_points=bool(args.plot_points),
+                                    keypoints=[z_step[0].detach().cpu().numpy()[:, :2]] if args.plot_keypoints else None,
                                 )
                             elif maze_map is not None and maze_scale is not None:
                                 step_plot = _denorm_xy(step_np[:, :2])
@@ -725,26 +760,65 @@ def main():
                                     [step_plot],
                                     [f"step {step_idx}"],
                                     out_path=frame_path,
+                                    plot_points=bool(args.plot_points),
+                                    keypoints=[_denorm_xy(z_step[0].detach().cpu().numpy()[:, :2])]
+                                    if args.plot_keypoints
+                                    else None,
                                 )
                             else:
                                 occ = occ_t.detach().cpu().numpy()
-                                plot_trajectories(occ, [step_np[:, :2]], [f"step {step_idx}"], out_path=frame_path)
+                                plot_trajectories(
+                                    occ,
+                                    [step_np[:, :2]],
+                                    [f"step {step_idx}"],
+                                    out_path=frame_path,
+                                    plot_points=bool(args.plot_points),
+                                    keypoints=[z_step[0].detach().cpu().numpy()[:, :2]] if args.plot_keypoints else None,
+                                )
                         if args.frames_include_stage2 and not args.skip_stage2:
+                            stage2_step = len(step_indices)
+                            final_step_path = os.path.join(frames_dir, f"step_{stage2_step:03d}.png")
                             final_path = os.path.join(frames_dir, "stage2.png")
                             if dataset_name in {"d4rl", "d4rl_prepared"}:
                                 occ = occ_t.detach().cpu().numpy()
-                                h, w = occ.shape
                                 refined_np = refined_t.detach().cpu().numpy()
-                                refined_grid = _gridify_xy(refined_np[:, :2], h, w)
-                                plot_trajectories(occ, [refined_grid], ["stage2"], out_path=final_path)
+                                plot_trajectories(
+                                    occ,
+                                    [refined_np[:, :2]],
+                                    ["phase2"],
+                                    out_path=final_step_path,
+                                    footer="phase2 step 1/1",
+                                    plot_points=bool(args.plot_points),
+                                )
+                                if final_path != final_step_path:
+                                    plot_trajectories(
+                                        occ,
+                                        [refined_np[:, :2]],
+                                        ["phase2"],
+                                        out_path=final_path,
+                                        footer="phase2 step 1/1",
+                                        plot_points=bool(args.plot_points),
+                                    )
                             elif mj_walls_norm is not None:
                                 plot_maze2d_geom_walls(
                                     mj_walls_norm,
                                     [refined_np[:, :2]],
                                     ["stage2"],
-                                    out_path=final_path,
+                                    out_path=final_step_path,
                                     bounds=((0.0, 1.0), (0.0, 1.0)),
+                                    footer="phase2 step 1/1",
+                                    plot_points=bool(args.plot_points),
                                 )
+                                if final_path != final_step_path:
+                                    plot_maze2d_geom_walls(
+                                        mj_walls_norm,
+                                        [refined_np[:, :2]],
+                                        ["stage2"],
+                                        out_path=final_path,
+                                        bounds=((0.0, 1.0), (0.0, 1.0)),
+                                        footer="phase2 step 1/1",
+                                        plot_points=bool(args.plot_points),
+                                    )
                             elif maze_map is not None and maze_scale is not None:
                                 refined_plot = _denorm_xy(refined_np[:, :2])
                                 plot_maze2d_trajectories(
@@ -752,12 +826,40 @@ def main():
                                     maze_scale,
                                     [refined_plot],
                                     ["stage2"],
-                                    out_path=final_path,
+                                    out_path=final_step_path,
+                                    footer="phase2 step 1/1",
+                                    plot_points=bool(args.plot_points),
                                 )
+                                if final_path != final_step_path:
+                                    plot_maze2d_trajectories(
+                                        maze_map,
+                                        maze_scale,
+                                        [refined_plot],
+                                        ["stage2"],
+                                        out_path=final_path,
+                                        footer="phase2 step 1/1",
+                                        plot_points=bool(args.plot_points),
+                                    )
                             else:
                                 occ = occ_t.detach().cpu().numpy()
                                 refined_np = refined_t.detach().cpu().numpy()
-                                plot_trajectories(occ, [refined_np[:, :2]], ["stage2"], out_path=final_path)
+                                plot_trajectories(
+                                    occ,
+                                    [refined_np[:, :2]],
+                                    ["stage2"],
+                                    out_path=final_step_path,
+                                    footer="phase2 step 1/1",
+                                    plot_points=bool(args.plot_points),
+                                )
+                                if final_path != final_step_path:
+                                    plot_trajectories(
+                                        occ,
+                                        [refined_np[:, :2]],
+                                        ["stage2"],
+                                        out_path=final_path,
+                                        footer="phase2 step 1/1",
+                                        plot_points=bool(args.plot_points),
+                                    )
                         _export_video(frames_dir, args.export_video, args.video_fps)
                     idx_global += 1
 

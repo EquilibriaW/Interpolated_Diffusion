@@ -377,6 +377,8 @@ class D4RLMazeDataset(Dataset):
         min_tortuosity: Optional[float] = None,
         min_turns: Optional[int] = None,
         turn_angle_deg: float = 30.0,
+        episode_split_mod: Optional[int] = None,
+        episode_split_val: int = 0,
     ):
         gym = _maybe_import_d4rl()
         env = gym.make(env_id)
@@ -399,6 +401,8 @@ class D4RLMazeDataset(Dataset):
         self.min_tortuosity = min_tortuosity
         self.min_turns = min_turns
         self.turn_angle_deg = turn_angle_deg
+        self.episode_split_mod = episode_split_mod
+        self.episode_split_val = episode_split_val
 
         self.obs = dataset["observations"].astype(np.float32)
         terminals = dataset.get("terminals")
@@ -418,6 +422,14 @@ class D4RLMazeDataset(Dataset):
             self.episodes.append((start, len(done)))
         if len(self.episodes) == 0:
             raise RuntimeError("No episodes found in D4RL dataset")
+        if self.episode_split_mod is not None:
+            mod = int(self.episode_split_mod)
+            val = int(self.episode_split_val)
+            if mod <= 0:
+                raise ValueError("episode_split_mod must be > 0")
+            self.episodes = [ep for i, ep in enumerate(self.episodes) if (i % mod) == val]
+            if len(self.episodes) == 0:
+                raise RuntimeError("No episodes left after split filter")
 
         maze_map = _extract_maze_map(env)
         self.maze_map = maze_map

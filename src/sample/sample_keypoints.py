@@ -46,6 +46,8 @@ def build_argparser():
     p.add_argument("--turn_angle_deg", type=float, default=30.0)
     p.add_argument("--window_mode", type=str, default="end", choices=["end", "random", "episode"])
     p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
+    p.add_argument("--episode_split_mod", type=int, default=None)
+    p.add_argument("--episode_split_val", type=int, default=0)
     p.add_argument("--use_start_goal", type=int, default=1)
     p.add_argument("--kp_index_mode", type=str, default="uniform", choices=["random", "uniform", "uniform_jitter"])
     p.add_argument("--kp_jitter", type=float, default=0.0)
@@ -233,6 +235,8 @@ def main():
             turn_angle_deg=args.turn_angle_deg,
             window_mode=args.window_mode,
             goal_mode=args.goal_mode,
+            episode_split_mod=args.episode_split_mod,
+            episode_split_val=args.episode_split_val,
         )
     else:
         dataset = ParticleMazeDataset(

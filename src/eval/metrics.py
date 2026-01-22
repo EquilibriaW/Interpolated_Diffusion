@@ -14,8 +14,8 @@ def _pos_to_cell(pos: torch.Tensor, h: int, w: int):
     x = pos[..., 0]
     y = pos[..., 1]
     oob = (x < 0) | (x > 1) | (y < 0) | (y > 1)
-    j = torch.floor(x * w).long()
-    i = torch.floor(y * h).long()
+    j = torch.round(x * w).long()
+    i = torch.round(y * h).long()
     i = torch.clamp(i, 0, h - 1)
     j = torch.clamp(j, 0, w - 1)
     return i, j, oob
