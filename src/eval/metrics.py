@@ -13,19 +13,19 @@ def _to_tensor(x, device: Optional[torch.device] = None) -> torch.Tensor:
 def _pos_to_cell(pos: torch.Tensor, h: int, w: int):
     x = pos[..., 0]
     y = pos[..., 1]
-    j = torch.round(x * w).long()
-    i = torch.round(y * h).long()
-    return i, j
+    oob = (x < 0) | (x > 1) | (y < 0) | (y > 1)
+    j = torch.floor(x * w).long()
+    i = torch.floor(y * h).long()
+    i = torch.clamp(i, 0, h - 1)
+    j = torch.clamp(j, 0, w - 1)
+    return i, j, oob
 
 
 def collision_rate(occ, traj) -> float:
     traj_t = _to_tensor(traj)
     occ_t = _to_tensor(occ, traj_t.device)
     h, w = occ_t.shape
-    i, j = _pos_to_cell(traj_t, h, w)
-    oob = (i < 0) | (j < 0) | (i >= h) | (j >= w)
-    i = torch.clamp(i, 0, h - 1)
-    j = torch.clamp(j, 0, w - 1)
+    i, j, oob = _pos_to_cell(traj_t, h, w)
     coll = occ_t[i, j] > 0.5
     coll = coll | oob
     return float(coll.float().mean().item())
@@ -99,10 +99,7 @@ def compute_metrics_batch(occ, traj, goal, gt: Optional[object] = None) -> Dict[
                 raise ValueError("gt batch size does not match traj batch size")
 
     h, w = occ_t.shape[-2:]
-    i, j = _pos_to_cell(traj_t, h, w)
-    oob = (i < 0) | (j < 0) | (i >= h) | (j >= w)
-    i = torch.clamp(i, 0, h - 1)
-    j = torch.clamp(j, 0, w - 1)
+    i, j, oob = _pos_to_cell(traj_t, h, w)
     b_idx = torch.arange(traj_t.shape[0], device=device).view(-1, 1).expand_as(i)
     coll = occ_t[b_idx, i, j] > 0.5
     coll = coll | oob

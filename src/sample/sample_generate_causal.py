@@ -50,7 +50,7 @@ def build_argparser():
     p.add_argument("--min_turns", type=int, default=None)
     p.add_argument("--turn_angle_deg", type=float, default=30.0)
     p.add_argument("--window_mode", type=str, default="end", choices=["end", "random", "episode"])
-    p.add_argument("--goal_mode", type=str, default="env", choices=["env", "window_end"])
+    p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
     p.add_argument("--use_start_goal", type=int, default=1)
     p.add_argument("--override_meta", type=int, default=0)
     p.add_argument("--clamp_policy", type=str, default="endpoints", choices=["none", "endpoints", "all_anchors"])

@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.corruptions.keyframes import sample_fixed_k_indices_batch
+from src.corruptions.keyframes import sample_fixed_k_indices_batch, sample_fixed_k_indices_uniform_batch
 from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset, PreparedTrajectoryDataset
 from src.diffusion.ddpm import _timesteps, ddim_step
 from src.diffusion.schedules import make_alpha_bars, make_beta_schedule
@@ -45,8 +45,10 @@ def build_argparser():
     p.add_argument("--min_turns", type=int, default=None)
     p.add_argument("--turn_angle_deg", type=float, default=30.0)
     p.add_argument("--window_mode", type=str, default="end", choices=["end", "random", "episode"])
-    p.add_argument("--goal_mode", type=str, default="env", choices=["env", "window_end"])
+    p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
     p.add_argument("--use_start_goal", type=int, default=1)
+    p.add_argument("--kp_index_mode", type=str, default="uniform", choices=["random", "uniform", "uniform_jitter"])
+    p.add_argument("--kp_jitter", type=float, default=0.0)
     return p
 
 
@@ -246,7 +248,13 @@ def main():
         for batch in tqdm(loader, dynamic_ncols=True):
             cond = {k: v.to(device) for k, v in batch["cond"].items()}
             B = cond["start_goal"].shape[0]
-            idx, _ = sample_fixed_k_indices_batch(B, args.T, args.K, device=device, ensure_endpoints=True)
+            if args.kp_index_mode == "random":
+                idx, _ = sample_fixed_k_indices_batch(B, args.T, args.K, device=device, ensure_endpoints=True)
+            else:
+                jitter = args.kp_jitter if args.kp_index_mode == "uniform_jitter" else 0.0
+                idx, _ = sample_fixed_k_indices_uniform_batch(
+                    B, args.T, args.K, device=device, ensure_endpoints=True, jitter=jitter
+                )
             known_mask, known_values = _build_known_mask_values(idx, cond, data_dim, args.T, bool(args.use_start_goal))
             if args.logit_space:
                 known_values = logit_pos(known_values, eps=args.logit_eps)

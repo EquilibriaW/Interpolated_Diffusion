@@ -81,6 +81,57 @@ def sample_fixed_k_indices_batch(
     return idx, mask
 
 
+def sample_fixed_k_indices_uniform_batch(
+    B: int,
+    T: int,
+    K: int,
+    generator: torch.Generator = None,
+    device: torch.device = None,
+    ensure_endpoints: bool = True,
+    jitter: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = device or torch.device("cpu")
+    if T <= 0:
+        raise ValueError("T must be positive")
+    if K <= 0:
+        raise ValueError("K must be positive")
+    if ensure_endpoints:
+        if T < 2:
+            raise ValueError("T must be >= 2 when ensure_endpoints is True")
+        if K < 2:
+            raise ValueError("K must be >= 2 when ensure_endpoints is True")
+    K = min(K, T)
+    if K > T:
+        raise ValueError("K must be <= T for uniform spacing")
+    base = torch.linspace(0, T - 1, K, device=device)
+    if jitter and K > 2 and T > 2:
+        spacing = float(T - 1) / float(K - 1)
+        max_jitter = spacing * float(jitter) * 0.5
+        noise = (torch.rand((B, K), generator=generator, device=device) - 0.5) * 2.0 * max_jitter
+        noise[:, 0] = 0.0
+        noise[:, -1] = 0.0
+        pos = base.unsqueeze(0) + noise
+    else:
+        pos = base.unsqueeze(0).expand(B, -1)
+    idx = torch.round(pos).long()
+    idx = idx.clamp(0, T - 1)
+    if ensure_endpoints and K >= 2:
+        idx[:, 0] = 0
+        idx[:, -1] = T - 1
+    # Enforce strictly increasing indices.
+    for k in range(1, K):
+        idx[:, k] = torch.maximum(idx[:, k], idx[:, k - 1] + 1)
+    for k in range(K - 2, -1, -1):
+        idx[:, k] = torch.minimum(idx[:, k], idx[:, k + 1] - 1)
+    idx = idx.clamp(0, T - 1)
+    if ensure_endpoints and K >= 2:
+        idx[:, 0] = 0
+        idx[:, -1] = T - 1
+    mask = torch.zeros((B, T), dtype=torch.bool, device=device)
+    mask.scatter_(1, idx, True)
+    return idx, mask
+
+
 def _compute_k_schedule(T: int, K_min: int, levels: int) -> List[int]:
     K_min = min(K_min, T)
     K_list = [0 for _ in range(levels + 1)]

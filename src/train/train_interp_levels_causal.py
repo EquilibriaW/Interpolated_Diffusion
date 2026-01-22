@@ -26,6 +26,8 @@ def build_argparser():
     p.add_argument("--T", type=int, default=64)
     p.add_argument("--K_min", type=int, default=8)
     p.add_argument("--levels", type=int, default=3)
+    p.add_argument("--level_sampling", type=str, default="high", choices=["uniform", "high"])
+    p.add_argument("--level_high_prob", type=float, default=0.5)
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--steps", type=int, default=20000)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -49,7 +51,7 @@ def build_argparser():
     p.add_argument("--min_turns", type=int, default=None)
     p.add_argument("--turn_angle_deg", type=float, default=30.0)
     p.add_argument("--window_mode", type=str, default="end", choices=["end", "random", "episode"])
-    p.add_argument("--goal_mode", type=str, default="env", choices=["env", "window_end"])
+    p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
     p.add_argument("--use_start_goal", type=int, default=1)
     p.add_argument("--log_dir", type=str, default="runs/interp_levels_causal")
     p.add_argument("--ckpt_dir", type=str, default="checkpoints/interp_levels_causal")
@@ -131,6 +133,7 @@ def build_interp_level_batch(
     x0_override: Optional[torch.Tensor] = None,
     masks_levels: Optional[torch.Tensor] = None,
     idx_levels: Optional[List[torch.Tensor]] = None,
+    s_idx: Optional[torch.Tensor] = None,
 ):
     B, T, D = x0.shape
     device = x0.device
@@ -138,7 +141,8 @@ def build_interp_level_batch(
         masks_levels, idx_levels = build_nested_masks_batch(B, T, K_min, levels, generator=generator, device=device)
     x_s = torch.zeros_like(x0)
     mask_s = torch.zeros((B, T), dtype=torch.bool, device=device)
-    s_idx = torch.randint(1, levels + 1, (B,), generator=generator, device=device, dtype=torch.long)
+    if s_idx is None:
+        s_idx = torch.randint(1, levels + 1, (B,), generator=generator, device=device, dtype=torch.long)
     source = x0_override if x0_override is not None else x0
     for s in range(1, levels + 1):
         sel = s_idx == s
@@ -150,6 +154,27 @@ def build_interp_level_batch(
         x_s[sel] = xs
         mask_s[sel] = masks_levels[sel, s]
     return x_s, mask_s, s_idx, masks_levels, idx_levels
+
+
+def _sample_level_indices(
+    B: int,
+    levels: int,
+    generator: torch.Generator,
+    device: torch.device,
+    mode: str,
+    high_prob: float,
+) -> torch.Tensor:
+    if mode == "uniform" or levels <= 1:
+        return torch.randint(1, levels + 1, (B,), generator=generator, device=device, dtype=torch.long)
+    high_prob = float(max(0.0, min(1.0, high_prob)))
+    draw = torch.rand((B,), generator=generator, device=device)
+    s_idx = torch.empty((B,), device=device, dtype=torch.long)
+    high = draw < high_prob
+    if torch.any(high):
+        s_idx[high] = levels
+    if torch.any(~high):
+        s_idx[~high] = torch.randint(1, levels + 1, (int((~high).sum().item()),), generator=generator, device=device, dtype=torch.long)
+    return s_idx
 
 
 def main():
@@ -344,9 +369,24 @@ def main():
                         x0_aug[use_mask] = x0_sel
                         x0_used = torch.where(use_mask.view(-1, 1, 1), x0_aug, x0)
 
+        s_idx = _sample_level_indices(
+            x0.shape[0],
+            args.levels,
+            gen,
+            device,
+            args.level_sampling,
+            args.level_high_prob,
+        )
         x_s, mask_s, s_idx, _, _ = build_interp_level_batch(
-            x0, args.K_min, args.levels, gen, recompute_velocity=bool(args.recompute_vel),
-            x0_override=x0_used, masks_levels=masks_levels, idx_levels=idx_levels
+            x0,
+            args.K_min,
+            args.levels,
+            gen,
+            recompute_velocity=bool(args.recompute_vel),
+            x0_override=x0_used,
+            masks_levels=masks_levels,
+            idx_levels=idx_levels,
+            s_idx=s_idx,
         )
         target = x0 - x_s
 

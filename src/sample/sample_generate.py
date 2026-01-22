@@ -9,7 +9,11 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.corruptions.keyframes import interpolate_from_indices, sample_fixed_k_indices_batch
+from src.corruptions.keyframes import (
+    interpolate_from_indices,
+    sample_fixed_k_indices_batch,
+    sample_fixed_k_indices_uniform_batch,
+)
 from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset, PreparedTrajectoryDataset
 from src.diffusion.ddpm import _timesteps, ddim_step
 from src.diffusion.schedules import make_alpha_bars, make_beta_schedule
@@ -54,7 +58,7 @@ def build_argparser():
     p.add_argument("--min_turns", type=int, default=None)
     p.add_argument("--turn_angle_deg", type=float, default=30.0)
     p.add_argument("--window_mode", type=str, default="end", choices=["end", "random", "episode"])
-    p.add_argument("--goal_mode", type=str, default="env", choices=["env", "window_end"])
+    p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
     p.add_argument("--use_start_goal", type=int, default=1)
     p.add_argument("--override_meta", type=int, default=0)
     p.add_argument("--clamp_policy", type=str, default="endpoints", choices=["none", "endpoints", "all_anchors"])
@@ -70,6 +74,11 @@ def build_argparser():
     p.add_argument("--save_npz", type=int, default=1)
     p.add_argument("--save_steps_npz", type=int, default=0)
     p.add_argument("--skip_stage2", type=int, default=0)
+    p.add_argument("--compare_oracle", type=int, default=0)
+    p.add_argument("--plot_keypoints", type=int, default=1)
+    p.add_argument("--force_single", type=int, default=0)
+    p.add_argument("--kp_index_mode", type=str, default="uniform", choices=["random", "uniform", "uniform_jitter"])
+    p.add_argument("--kp_jitter", type=float, default=0.0)
     return p
 
 
@@ -201,6 +210,8 @@ def main():
     _ensure_mujoco_env()
     if args.dataset not in {"d4rl", "d4rl_prepared"}:
         raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl or d4rl_prepared.")
+    if args.ckpt_interp == "":
+        args.skip_stage2 = 1
 
     # Load keypoint payload early to configure model dims before instantiation.
     payload_kp = {}
@@ -388,12 +399,53 @@ def main():
         return out
 
     def _gridify_xy(xy: np.ndarray, h: int, w: int) -> np.ndarray:
-        j = np.rint(xy[:, 0] * w)
-        i = np.rint(xy[:, 1] * h)
+        x = xy[:, 0]
+        y = xy[:, 1]
+        j = np.floor(x * w).astype(np.int64)
+        i = np.floor(y * h).astype(np.int64)
         j = np.clip(j, 0, w - 1)
         i = np.clip(i, 0, h - 1)
         out = np.stack([j / float(w), i / float(h)], axis=-1)
         return out
+
+    def _plot_side_by_side(
+        occ: np.ndarray,
+        left_traj: np.ndarray,
+        right_traj: np.ndarray,
+        left_label: str,
+        right_label: str,
+        left_collision: float,
+        right_collision: float,
+        left_kp: Optional[np.ndarray],
+        right_kp: Optional[np.ndarray],
+        left_sg: Optional[np.ndarray],
+        right_sg: Optional[np.ndarray],
+        out_path: str,
+    ):
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(1, 2, figsize=(8, 4), dpi=150)
+        h, w = occ.shape
+        for ax, traj, label, coll, kp, sg in [
+            (axes[0], left_traj, left_label, left_collision, left_kp, left_sg),
+            (axes[1], right_traj, right_label, right_collision, right_kp, right_sg),
+        ]:
+            ax.imshow(occ, cmap="gray_r", origin="upper")
+            xy = traj[:, :2]
+            ax.plot(xy[:, 0] * w, xy[:, 1] * h, color="tab:blue", linewidth=2.0)
+            if sg is not None and sg.shape[0] >= 4:
+                ax.scatter([sg[0] * w], [sg[1] * h], s=25, color="tab:green")
+                ax.scatter([sg[2] * w], [sg[3] * h], s=40, color="tab:red", marker="x")
+            if kp is not None and kp.size > 0:
+                ax.scatter(kp[:, 0] * w, kp[:, 1] * h, s=20, color="tab:orange")
+            ax.set_title(f"{label} | coll={coll:.3f}", fontsize=9)
+            ax.set_xlim([0, w])
+            ax.set_ylim([h, 0])
+            ax.set_xticks([])
+            ax.set_yticks([])
+        fig.tight_layout()
+        fig.savefig(out_path)
+        plt.close(fig)
 
     gen = torch.Generator(device=device)
     gen.manual_seed(1234)
@@ -427,6 +479,8 @@ def main():
                 "goal_dist_refined",
                 "success_interp",
                 "success_refined",
+                "collision_oracle_interp",
+                "collision_pred_interp",
             ]
         )
         with torch.no_grad():
@@ -436,49 +490,60 @@ def main():
                 if x0_gt is not None:
                     x0_gt = x0_gt.to(device)
                 B = cond["start_goal"].shape[0]
-                idx, masks = sample_fixed_k_indices_batch(
-                    B, args.T, args.K_min, generator=gen, device=device, ensure_endpoints=True
-                )
-                if args.oracle_keypoints:
-                    if x0_gt is None:
-                        raise ValueError("oracle_keypoints requires batch['x'] to be present.")
-                    idx_exp = idx.unsqueeze(-1).expand(-1, -1, x0_gt.shape[-1])
-                    z_hat = x0_gt.gather(1, idx_exp)
-                    z_steps = None
+                if args.kp_index_mode == "random":
+                    idx, masks = sample_fixed_k_indices_batch(
+                        B, args.T, args.K_min, generator=gen, device=device, ensure_endpoints=True
+                    )
                 else:
-                    known_mask, known_values = _build_known_mask_values(idx, cond, data_dim, args.T, bool(args.use_start_goal))
-                    if args.logit_space:
-                        known_values = logit_pos(known_values, eps=args.logit_eps)
-                    if args.save_diffusion_frames:
-                        z_hat, z_steps = _sample_keypoints_ddim(
-                            kp_model,
-                            schedule,
-                            idx,
-                            known_mask,
-                            known_values,
-                            cond,
-                            args.ddim_steps,
-                            args.T,
-                            return_intermediates=True,
-                        )
-                    else:
-                        z_hat = _sample_keypoints_ddim(
-                            kp_model, schedule, idx, known_mask, known_values, cond, args.ddim_steps, args.T
-                        )
-                        z_steps = None
-                    if args.logit_space:
-                        z_hat = sigmoid_pos(z_hat)
-                        if z_steps is not None:
-                            z_steps = [sigmoid_pos(z_step) for z_step in z_steps]
+                    jitter = args.kp_jitter if args.kp_index_mode == "uniform_jitter" else 0.0
+                    idx, masks = sample_fixed_k_indices_uniform_batch(
+                        B, args.T, args.K_min, generator=gen, device=device, ensure_endpoints=True, jitter=jitter
+                    )
 
-                x_s = interpolate_from_indices(idx, z_hat, args.T, recompute_velocity=bool(args.recompute_vel))
+                # Predicted keypoints (Stage 1).
+                known_mask, known_values = _build_known_mask_values(idx, cond, data_dim, args.T, bool(args.use_start_goal))
+                if args.logit_space:
+                    known_values = logit_pos(known_values, eps=args.logit_eps)
+                if args.save_diffusion_frames:
+                    z_pred, z_steps = _sample_keypoints_ddim(
+                        kp_model,
+                        schedule,
+                        idx,
+                        known_mask,
+                        known_values,
+                        cond,
+                        args.ddim_steps,
+                        args.T,
+                        return_intermediates=True,
+                    )
+                else:
+                    z_pred = _sample_keypoints_ddim(
+                        kp_model, schedule, idx, known_mask, known_values, cond, args.ddim_steps, args.T
+                    )
+                    z_steps = None
+                if args.logit_space:
+                    z_pred = sigmoid_pos(z_pred)
+                    if z_steps is not None:
+                        z_steps = [sigmoid_pos(z_step) for z_step in z_steps]
+
+                x_pred = interpolate_from_indices(idx, z_pred, args.T, recompute_velocity=bool(args.recompute_vel))
+
+                # Oracle keypoints interpolation.
+                z_oracle = None
+                x_oracle = None
+                if args.oracle_keypoints or args.compare_oracle:
+                    if x0_gt is None:
+                        raise ValueError("oracle_keypoints/compare_oracle requires batch['x'] to be present.")
+                    idx_exp = idx.unsqueeze(-1).expand(-1, -1, x0_gt.shape[-1])
+                    z_oracle = x0_gt.gather(1, idx_exp)
+                    x_oracle = interpolate_from_indices(idx, z_oracle, args.T, recompute_velocity=bool(args.recompute_vel))
 
                 if args.skip_stage2 or interp_model is None:
-                    x_hat = x_s
+                    x_hat = x_pred
                 else:
                     s_level = torch.full((B,), args.levels, device=device, dtype=torch.long)
-                    delta_hat = interp_model(x_s, s_level, masks, cond)
-                    x_hat = x_s + delta_hat
+                    delta_hat = interp_model(x_pred, s_level, masks, cond)
+                    x_hat = x_pred + delta_hat
                 if args.clamp_policy == "all_anchors":
                     clamp_mask = masks
                 elif args.clamp_policy == "endpoints":
@@ -488,11 +553,11 @@ def main():
                 else:
                     clamp_mask = None
                 if clamp_mask is not None:
-                    x_hat = apply_clamp(x_hat, x_s, clamp_mask, args.clamp_dims)
+                    x_hat = apply_clamp(x_hat, x_pred, clamp_mask, args.clamp_dims)
 
                 for b in range(B):
                     occ_t = cond["occ"][b, 0]
-                    interp_t = x_s[b]
+                    interp_t = x_pred[b]
                     refined_t = x_hat[b]
                     if args.use_start_goal:
                         goal_t = cond["start_goal"][b, 2:]
@@ -512,6 +577,11 @@ def main():
                         success_interp = success(goal_t, interp_t, occ_t.shape[-2], occ_t.shape[-1])
                         success_refined = success(goal_t, refined_t, occ_t.shape[-2], occ_t.shape[-1])
 
+                    coll_oracle = float("nan")
+                    coll_pred = collision_rate(occ_t, interp_t)
+                    if x_oracle is not None:
+                        coll_oracle = collision_rate(occ_t, x_oracle[b])
+
                     writer.writerow(
                         [
                             idx_global,
@@ -521,6 +591,8 @@ def main():
                             goal_dist_refined,
                             success_interp,
                             success_refined,
+                            coll_oracle,
+                            coll_pred,
                         ]
                     )
 
@@ -533,7 +605,7 @@ def main():
                         refined_list.append(refined_t.detach().cpu().numpy())
                         if x0_gt is not None:
                             gt_list.append(x0_gt[b].detach().cpu().numpy())
-                        keypoints_list.append(z_hat[b].detach().cpu().numpy())
+                        keypoints_list.append(z_pred[b].detach().cpu().numpy())
                         idx_list.append(idx[b].detach().cpu().numpy())
                         mask_list.append(masks[b].detach().cpu().numpy())
                         if "start_goal" in cond:
@@ -545,42 +617,81 @@ def main():
                         out_path = os.path.join(args.out_dir, f"sample_{idx_global:04d}.png")
                         interp_np = interp_t.detach().cpu().numpy()
                         refined_np = refined_t.detach().cpu().numpy()
-                        trajs = [interp_np[:, :2], refined_np[:, :2]]
-                        labels = ["interp", "refined"]
-                        if args.plot_gt and x0_gt is not None:
-                            gt_np = x0_gt[b].detach().cpu().numpy()
-                            trajs.append(gt_np[:, :2])
-                            labels.append("gt")
-                        if dataset_name in {"d4rl", "d4rl_prepared"}:
+                        if args.compare_oracle and x_oracle is not None:
                             occ = occ_t.detach().cpu().numpy()
                             h, w = occ.shape
-                            trajs_grid = [_gridify_xy(t, h, w) for t in trajs]
-                            plot_trajectories(occ, trajs_grid, labels, out_path=out_path)
-                        elif mj_walls_norm is not None:
-                            norm_trajs = [interp_np[:, :2], refined_np[:, :2]]
-                            norm_labels = ["interp", "refined"]
-                            if args.plot_gt and x0_gt is not None:
-                                norm_trajs.append(gt_np[:, :2])
-                                norm_labels.append("gt")
-                            plot_maze2d_geom_walls(
-                                mj_walls_norm,
-                                norm_trajs,
-                                norm_labels,
-                                out_path=out_path,
-                                bounds=((0.0, 1.0), (0.0, 1.0)),
+                            left_traj = _gridify_xy(x_oracle[b].detach().cpu().numpy()[:, :2], h, w)
+                            right_traj = _gridify_xy(interp_np[:, :2], h, w)
+                            left_kp = (
+                                z_oracle[b].detach().cpu().numpy()[:, :2]
+                                if (args.plot_keypoints and z_oracle is not None)
+                                else None
                             )
-                        elif maze_map is not None and maze_scale is not None:
-                            plot_trajs = [_denorm_xy(t) for t in trajs]
-                            plot_maze2d_trajectories(
-                                maze_map,
-                                maze_scale,
-                                plot_trajs,
-                                labels,
-                                out_path=out_path,
+                            right_kp = z_pred[b].detach().cpu().numpy()[:, :2] if args.plot_keypoints else None
+                            left_kp = _gridify_xy(left_kp, h, w) if left_kp is not None else None
+                            right_kp = _gridify_xy(right_kp, h, w) if right_kp is not None else None
+                            sg = cond["start_goal"][b].detach().cpu().numpy() if "start_goal" in cond else None
+                            if sg is not None:
+                                sg_xy = sg.reshape(2, 2)
+                                sg_xy = _gridify_xy(sg_xy, h, w)
+                                sg = sg_xy.reshape(4,)
+                            _plot_side_by_side(
+                                occ,
+                                left_traj,
+                                right_traj,
+                                "oracle",
+                                "pred",
+                                coll_oracle,
+                                coll_pred,
+                                left_kp,
+                                right_kp,
+                                sg,
+                                sg,
+                                out_path,
                             )
                         else:
-                            occ = occ_t.detach().cpu().numpy()
-                            plot_trajectories(occ, trajs, labels, out_path=out_path)
+                            trajs = [interp_np[:, :2], refined_np[:, :2]]
+                            labels = ["interp", "refined"]
+                            if args.force_single:
+                                trajs = [interp_np[:, :2]]
+                                labels = ["interp"]
+                            if args.plot_gt and x0_gt is not None:
+                                gt_np = x0_gt[b].detach().cpu().numpy()
+                                trajs.append(gt_np[:, :2])
+                                labels.append("gt")
+                            if dataset_name in {"d4rl", "d4rl_prepared"}:
+                                occ = occ_t.detach().cpu().numpy()
+                                h, w = occ.shape
+                                trajs_grid = [_gridify_xy(t, h, w) for t in trajs]
+                                plot_trajectories(occ, trajs_grid, labels, out_path=out_path)
+                            elif mj_walls_norm is not None:
+                                norm_trajs = [interp_np[:, :2], refined_np[:, :2]]
+                                norm_labels = ["interp", "refined"]
+                                if args.force_single:
+                                    norm_trajs = [interp_np[:, :2]]
+                                    norm_labels = ["interp"]
+                                if args.plot_gt and x0_gt is not None:
+                                    norm_trajs.append(gt_np[:, :2])
+                                    norm_labels.append("gt")
+                                plot_maze2d_geom_walls(
+                                    mj_walls_norm,
+                                    norm_trajs,
+                                    norm_labels,
+                                    out_path=out_path,
+                                    bounds=((0.0, 1.0), (0.0, 1.0)),
+                                )
+                            elif maze_map is not None and maze_scale is not None:
+                                plot_trajs = [_denorm_xy(t) for t in trajs]
+                                plot_maze2d_trajectories(
+                                    maze_map,
+                                    maze_scale,
+                                    plot_trajs,
+                                    labels,
+                                    out_path=out_path,
+                                )
+                            else:
+                                occ = occ_t.detach().cpu().numpy()
+                                plot_trajectories(occ, trajs, labels, out_path=out_path)
 
                     if args.save_debug and args.save_diffusion_frames and z_steps is not None:
                         frames_dir = os.path.join(args.out_dir, "diffusion_steps", f"sample_{idx_global:04d}")
