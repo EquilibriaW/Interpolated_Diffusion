@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import os
 from typing import Optional, Tuple
 
@@ -66,6 +67,8 @@ def build_argparser():
     p.add_argument("--frames_include_stage2", type=int, default=1)
     p.add_argument("--export_video", type=str, default="none", choices=["none", "mp4", "gif"])
     p.add_argument("--video_fps", type=int, default=8)
+    p.add_argument("--save_npz", type=int, default=1)
+    p.add_argument("--save_steps_npz", type=int, default=0)
     p.add_argument("--skip_stage2", type=int, default=0)
     return p
 
@@ -397,6 +400,22 @@ def main():
     idx_global = 0
 
     metrics_path = os.path.join(args.out_dir, "metrics.csv")
+    interp_list = []
+    refined_list = []
+    gt_list = []
+    keypoints_list = []
+    idx_list = []
+    mask_list = []
+    start_goal_list = []
+    difficulty_list = []
+    steps_list = []
+    occ_np = None
+    sdf_np = None
+    run_config = {
+        "args": vars(args),
+        "kp_meta": payload_kp.get("meta", {}) if isinstance(payload_kp, dict) else {},
+        "interp_meta": payload_interp.get("meta", {}) if isinstance(payload_interp, dict) else {},
+    }
     with open(metrics_path, "w", newline="") as metrics_file:
         writer = csv.writer(metrics_file)
         writer.writerow(
@@ -504,6 +523,23 @@ def main():
                             success_refined,
                         ]
                     )
+
+                    if args.save_npz:
+                        if occ_np is None:
+                            occ_np = occ_t.detach().cpu().numpy()
+                        if sdf_np is None and "sdf" in cond:
+                            sdf_np = cond["sdf"][b, 0].detach().cpu().numpy()
+                        interp_list.append(interp_t.detach().cpu().numpy())
+                        refined_list.append(refined_t.detach().cpu().numpy())
+                        if x0_gt is not None:
+                            gt_list.append(x0_gt[b].detach().cpu().numpy())
+                        keypoints_list.append(z_hat[b].detach().cpu().numpy())
+                        idx_list.append(idx[b].detach().cpu().numpy())
+                        mask_list.append(masks[b].detach().cpu().numpy())
+                        if "start_goal" in cond:
+                            start_goal_list.append(cond["start_goal"][b].detach().cpu().numpy())
+                        if "difficulty" in batch:
+                            difficulty_list.append(int(batch["difficulty"][b].item()))
 
                     if args.save_debug:
                         out_path = os.path.join(args.out_dir, f"sample_{idx_global:04d}.png")
@@ -613,6 +649,43 @@ def main():
                                 plot_trajectories(occ, [refined_np[:, :2]], ["stage2"], out_path=final_path)
                         _export_video(frames_dir, args.export_video, args.video_fps)
                     idx_global += 1
+
+                if args.save_steps_npz and z_steps is not None:
+                    # Store interpolated trajectories for each diffusion step.
+                    for b in range(B):
+                        step_trajs = []
+                        for z_step in z_steps:
+                            x_step = interpolate_from_indices(
+                                idx[b : b + 1], z_step[b : b + 1], args.T, recompute_velocity=bool(args.recompute_vel)
+                            )
+                            step_trajs.append(x_step[0].detach().cpu().numpy())
+                        steps_list.append(np.stack(step_trajs, axis=0))
+
+    if args.save_npz:
+        out_npz = os.path.join(args.out_dir, "samples.npz")
+        save_kwargs = {
+            "interp": np.stack(interp_list, axis=0) if interp_list else np.zeros((0,)),
+            "refined": np.stack(refined_list, axis=0) if refined_list else np.zeros((0,)),
+            "keypoints": np.stack(keypoints_list, axis=0) if keypoints_list else np.zeros((0,)),
+            "idx": np.stack(idx_list, axis=0) if idx_list else np.zeros((0,), dtype=np.int64),
+            "mask": np.stack(mask_list, axis=0) if mask_list else np.zeros((0,)),
+            "start_goal": np.stack(start_goal_list, axis=0) if start_goal_list else np.zeros((0,)),
+        }
+        if gt_list:
+            save_kwargs["gt"] = np.stack(gt_list, axis=0)
+        if difficulty_list:
+            save_kwargs["difficulty"] = np.asarray(difficulty_list, dtype=np.int64)
+        if occ_np is not None:
+            save_kwargs["occ"] = occ_np
+        if sdf_np is not None:
+            save_kwargs["sdf"] = sdf_np
+        if args.save_steps_npz and steps_list:
+            save_kwargs["interp_steps"] = np.stack(steps_list, axis=0)
+        np.savez_compressed(out_npz, **save_kwargs)
+
+        cfg_path = os.path.join(args.out_dir, "run_config.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(run_config, f, indent=2)
 
 
 if __name__ == "__main__":
