@@ -190,8 +190,8 @@ def plot_trajectories(
         colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
     for i, traj in enumerate(trajs):
         xy = traj[:, :2]
-        x = xy[:, 0] * w
-        y = xy[:, 1] * h
+        x = xy[:, 0] * max(w - 1, 1)
+        y = xy[:, 1] * max(h - 1, 1)
         if plot_points:
             base_color = "0.6" if keypoints is not None and i < len(keypoints) and keypoints[i] is not None else colors[i % len(colors)]
             ax.scatter(x, y, color=base_color, s=6, label=labels[i])
@@ -202,12 +202,19 @@ def plot_trajectories(
         if keypoints is not None and i < len(keypoints) and keypoints[i] is not None:
             kp = _to_numpy(keypoints[i])
             if kp.size > 0:
-                ax.scatter(kp[:, 0] * w, kp[:, 1] * h, color="tab:orange", s=20, edgecolors="black", linewidths=0.3)
+                ax.scatter(
+                    kp[:, 0] * max(w - 1, 1),
+                    kp[:, 1] * max(h - 1, 1),
+                    color="tab:orange",
+                    s=20,
+                    edgecolors="black",
+                    linewidths=0.3,
+                )
     ax.set_xticks([])
     ax.set_yticks([])
     ax.legend(loc="lower right", fontsize=6)
-    ax.set_xlim([0, w])
-    ax.set_ylim([h, 0])
+    ax.set_xlim([0, max(w - 1, 1)])
+    ax.set_ylim([max(h - 1, 1), 0])
     if title is not None:
         ax.set_title(title, fontsize=8)
     if footer is not None:

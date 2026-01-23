@@ -1,4 +1,5 @@
 import argparse
+import sys
 import os
 from typing import List, Optional, Tuple
 
@@ -26,6 +27,7 @@ def build_argparser():
     p.add_argument("--T", type=int, default=64)
     p.add_argument("--K_min", type=int, default=8)
     p.add_argument("--levels", type=int, default=3)
+    p.add_argument("--stage2_mode", type=str, default="adj", choices=["x0", "adj"])
     p.add_argument("--level_sampling", type=str, default="high", choices=["uniform", "high"])
     p.add_argument("--level_high_prob", type=float, default=0.5)
     p.add_argument("--batch", type=int, default=256)
@@ -54,7 +56,9 @@ def build_argparser():
     p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
     p.add_argument("--episode_split_mod", type=int, default=None)
     p.add_argument("--episode_split_val", type=int, default=0)
-    p.add_argument("--use_start_goal", type=int, default=1)
+    p.add_argument("--use_start_goal", type=int, default=1, help="Deprecated. Use --clamp_endpoints/--cond_start_goal.")
+    p.add_argument("--clamp_endpoints", type=int, default=1)
+    p.add_argument("--cond_start_goal", type=int, default=1)
     p.add_argument("--log_dir", type=str, default="runs/interp_levels_causal")
     p.add_argument("--ckpt_dir", type=str, default="checkpoints/interp_levels_causal")
     p.add_argument("--save_every", type=int, default=2000)
@@ -73,21 +77,28 @@ def build_argparser():
     p.add_argument("--bootstrap_stage1_ckpt", type=str, default=None)
     p.add_argument("--bootstrap_use_ema", type=int, default=1)
     p.add_argument("--bootstrap_ddim_steps", type=int, default=5)
+    p.add_argument("--bootstrap_ddim_schedule", type=str, default="quadratic", choices=["linear", "quadratic", "sqrt"])
     p.add_argument("--bootstrap_prob_start", type=float, default=0.0)
     p.add_argument("--bootstrap_prob_end", type=float, default=0.3)
     p.add_argument("--bootstrap_warmup_steps", type=int, default=5000)
     p.add_argument("--bootstrap_prob_cap", type=float, default=0.5)
     p.add_argument("--bootstrap_mode", type=str, default="batch", choices=["batch", "per_example"])
+    p.add_argument("--k_schedule", type=str, default="doubling", choices=["doubling", "linear", "geom"])
+    p.add_argument("--k_geom_gamma", type=float, default=None)
     return p
 
 
 def _build_known_mask_values(
-    idx: torch.Tensor, cond: dict, D: int, T: int, use_start_goal: bool
+    idx: torch.Tensor, cond: dict, D: int, T: int, clamp_endpoints: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, K = idx.shape
     known_mask = torch.zeros((B, K, D), device=idx.device, dtype=torch.bool)
     known_values = torch.zeros((B, K, D), device=idx.device, dtype=torch.float32)
-    if use_start_goal and "start_goal" in cond and D >= 2:
+    if clamp_endpoints:
+        if "start_goal" not in cond:
+            raise ValueError("clamp_endpoints=True but start_goal missing from cond")
+        if D < 2:
+            return known_mask, known_values
         start = cond["start_goal"][:, :2]
         goal = cond["start_goal"][:, 2:]
         start_pos = start.unsqueeze(1).expand(B, K, 2)
@@ -109,12 +120,13 @@ def _sample_keypoints_ddim(
     cond: dict,
     steps: int,
     T: int,
+    schedule_name: str = "linear",
 ):
     device = idx.device
     B, K = idx.shape
     D = known_values.shape[-1]
     n_train = schedule["alpha_bar"].shape[0]
-    times = _timesteps(n_train, steps)
+    times = _timesteps(n_train, steps, schedule=schedule_name)
     z = torch.randn((B, K, D), device=device)
     z = torch.where(known_mask, known_values, z)
     for i in range(len(times) - 1):
@@ -158,6 +170,43 @@ def build_interp_level_batch(
     return x_s, mask_s, s_idx, masks_levels, idx_levels
 
 
+def build_interp_adjacent_batch(
+    x0: torch.Tensor,
+    K_min: int,
+    levels: int,
+    generator: torch.Generator,
+    recompute_velocity: bool = False,
+    x0_override: Optional[torch.Tensor] = None,
+    masks_levels: Optional[torch.Tensor] = None,
+    idx_levels: Optional[List[torch.Tensor]] = None,
+    s_idx: Optional[torch.Tensor] = None,
+):
+    B, T, D = x0.shape
+    device = x0.device
+    if masks_levels is None or idx_levels is None:
+        masks_levels, idx_levels = build_nested_masks_batch(B, T, K_min, levels, generator=generator, device=device)
+    x_s = torch.zeros_like(x0)
+    x_prev = torch.zeros_like(x0)
+    mask_s = torch.zeros((B, T), dtype=torch.bool, device=device)
+    mask_prev = torch.zeros((B, T), dtype=torch.bool, device=device)
+    if s_idx is None:
+        s_idx = torch.randint(1, levels + 1, (B,), generator=generator, device=device, dtype=torch.long)
+    source = x0_override if x0_override is not None else x0
+    for s in range(1, levels + 1):
+        sel = s_idx == s
+        if not torch.any(sel):
+            continue
+        idx = idx_levels[s][sel]
+        idx_prev = idx_levels[s - 1][sel]
+        vals = source[sel].gather(1, idx.unsqueeze(-1).expand(-1, idx.shape[1], D))
+        vals_prev = source[sel].gather(1, idx_prev.unsqueeze(-1).expand(-1, idx_prev.shape[1], D))
+        x_s[sel] = interpolate_from_indices(idx, vals, T, recompute_velocity=recompute_velocity)
+        x_prev[sel] = interpolate_from_indices(idx_prev, vals_prev, T, recompute_velocity=recompute_velocity)
+        mask_s[sel] = masks_levels[sel, s]
+        mask_prev[sel] = masks_levels[sel, s - 1]
+    return x_s, x_prev, mask_s, mask_prev, s_idx, masks_levels, idx_levels
+
+
 def _sample_level_indices(
     B: int,
     levels: int,
@@ -181,6 +230,15 @@ def _sample_level_indices(
 
 def main():
     args = build_argparser().parse_args()
+    if "--clamp_endpoints" not in sys.argv and "--cond_start_goal" not in sys.argv:
+        args.clamp_endpoints = int(bool(args.use_start_goal))
+        args.cond_start_goal = int(bool(args.use_start_goal))
+    else:
+        if "--clamp_endpoints" not in sys.argv:
+            args.clamp_endpoints = int(bool(args.use_start_goal))
+        if "--cond_start_goal" not in sys.argv:
+            args.cond_start_goal = int(bool(args.use_start_goal))
+    args.use_start_goal = int(bool(args.cond_start_goal))
     if args.dataset not in {"d4rl", "d4rl_prepared"}:
         raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl or d4rl_prepared.")
     seed = args.seed if args.seed is not None else get_seed_from_env()
@@ -243,12 +301,14 @@ def main():
     it = iter(loader)
 
     data_dim = 4 if args.with_velocity else 2
+    mask_channels = 2 if args.stage2_mode == "adj" else 1
     model = InterpLevelCausalDenoiser(
         data_dim=data_dim,
         use_sdf=bool(args.use_sdf),
         max_levels=args.levels,
         use_checkpoint=bool(args.use_checkpoint),
-        use_start_goal=bool(args.use_start_goal),
+        use_start_goal=bool(args.cond_start_goal),
+        mask_channels=mask_channels,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     ema = EMA(model.parameters(), decay=args.ema_decay) if args.ema else None
@@ -271,7 +331,14 @@ def main():
         except Exception:
             payload_meta = {}
         meta = payload_meta.get("meta", {}) if isinstance(payload_meta, dict) else {}
-        use_start_goal_kp = bool(meta.get("use_start_goal", args.use_start_goal))
+        if meta.get("cond_start_goal") is not None:
+            use_start_goal_kp = bool(meta.get("cond_start_goal"))
+        else:
+            use_start_goal_kp = bool(meta.get("use_start_goal", args.use_start_goal))
+        if meta.get("clamp_endpoints") is not None:
+            clamp_endpoints_kp = bool(meta.get("clamp_endpoints"))
+        else:
+            clamp_endpoints_kp = bool(args.clamp_endpoints)
         bootstrap_model = KeypointDenoiser(
             data_dim=data_dim,
             use_sdf=bool(args.use_sdf),
@@ -322,7 +389,14 @@ def main():
         cond = {k: v.to(device) for k, v in batch["cond"].items()}
 
         masks_levels, idx_levels = build_nested_masks_batch(
-            x0.shape[0], args.T, args.K_min, args.levels, generator=gen, device=device
+            x0.shape[0],
+            args.T,
+            args.K_min,
+            args.levels,
+            generator=gen,
+            device=device,
+            k_schedule=args.k_schedule,
+            k_geom_gamma=args.k_geom_gamma,
         )
 
         x0_used = x0
@@ -340,7 +414,9 @@ def main():
                 use_mask = torch.rand((x0.shape[0],), generator=gen, device=device) < p_boot
             if torch.any(use_mask):
                 idx_s = idx_levels[args.levels]
-                known_mask, known_values = _build_known_mask_values(idx_s, cond, data_dim, args.T, bool(args.use_start_goal))
+                known_mask, known_values = _build_known_mask_values(
+                    idx_s, cond, data_dim, args.T, bool(clamp_endpoints_kp)
+                )
                 if bootstrap_logit:
                     known_values = logit_pos(known_values, eps=bootstrap_logit_eps)
                 with torch.no_grad():
@@ -353,6 +429,7 @@ def main():
                         cond,
                         args.bootstrap_ddim_steps,
                         args.T,
+                        schedule_name=args.bootstrap_ddim_schedule,
                     )
                     if bootstrap_logit:
                         z_hat = sigmoid_pos(z_hat)
@@ -381,24 +458,42 @@ def main():
             args.level_sampling,
             args.level_high_prob,
         )
-        x_s, mask_s, s_idx, _, _ = build_interp_level_batch(
-            x0,
-            args.K_min,
-            args.levels,
-            gen,
-            recompute_velocity=bool(args.recompute_vel),
-            x0_override=x0_used,
-            masks_levels=masks_levels,
-            idx_levels=idx_levels,
-            s_idx=s_idx,
-        )
-        target = x0 - x_s
+        if args.stage2_mode == "adj":
+            x_s, x_prev, mask_s, mask_prev, s_idx, _, _ = build_interp_adjacent_batch(
+                x0,
+                args.K_min,
+                args.levels,
+                gen,
+                recompute_velocity=bool(args.recompute_vel),
+                x0_override=x0_used,
+                masks_levels=masks_levels,
+                idx_levels=idx_levels,
+                s_idx=s_idx,
+            )
+            mask_in = torch.stack([mask_s, mask_prev], dim=-1)
+            target = x_prev - x_s
+            weight_mask = mask_prev
+        else:
+            x_s, mask_s, s_idx, _, _ = build_interp_level_batch(
+                x0,
+                args.K_min,
+                args.levels,
+                gen,
+                recompute_velocity=bool(args.recompute_vel),
+                x0_override=x0_used,
+                masks_levels=masks_levels,
+                idx_levels=idx_levels,
+                s_idx=s_idx,
+            )
+            mask_in = mask_s
+            target = x0 - x_s
+            weight_mask = mask_s
 
         with torch.cuda.amp.autocast(dtype=autocast_dtype):
-            delta_hat = model(x_s, s_idx, mask_s, cond)
+            delta_hat = model(x_s, s_idx, mask_in, cond)
             diff = (delta_hat - target) ** 2
             diff = diff.sum(dim=-1)
-            w = torch.where(mask_s, torch.tensor(args.w_anchor, device=device), torch.tensor(args.w_missing, device=device))
+            w = torch.where(weight_mask, torch.tensor(args.w_anchor, device=device), torch.tensor(args.w_missing, device=device))
             loss = (diff * w).sum() / (w.sum() * x0.shape[-1] + 1e-8)
             loss = loss / args.grad_accum
 
@@ -426,10 +521,48 @@ def main():
 
         if step > 0 and step % args.save_every == 0:
             ckpt_path = os.path.join(args.ckpt_dir, f"ckpt_{step:07d}.pt")
-            save_checkpoint(ckpt_path, model, optimizer, step, ema)
+            meta = {
+                "stage": "interp_levels_causal",
+                "T": args.T,
+                "K_min": args.K_min,
+                "levels": args.levels,
+                "data_dim": data_dim,
+                "use_sdf": bool(args.use_sdf),
+                "with_velocity": bool(args.with_velocity),
+                "dataset": args.dataset,
+                "env_id": args.env_id,
+                "d4rl_flip_y": bool(args.d4rl_flip_y),
+                "stage2_mode": args.stage2_mode,
+                "mask_channels": mask_channels,
+                "k_schedule": args.k_schedule,
+                "k_geom_gamma": args.k_geom_gamma,
+                "use_start_goal": bool(args.cond_start_goal),
+                "clamp_endpoints": bool(args.clamp_endpoints),
+                "cond_start_goal": bool(args.cond_start_goal),
+            }
+            save_checkpoint(ckpt_path, model, optimizer, step, ema, meta=meta)
 
     final_path = os.path.join(args.ckpt_dir, "ckpt_final.pt")
-    save_checkpoint(final_path, model, optimizer, args.steps, ema)
+    meta = {
+        "stage": "interp_levels_causal",
+        "T": args.T,
+        "K_min": args.K_min,
+        "levels": args.levels,
+        "data_dim": data_dim,
+        "use_sdf": bool(args.use_sdf),
+        "with_velocity": bool(args.with_velocity),
+        "dataset": args.dataset,
+        "env_id": args.env_id,
+        "d4rl_flip_y": bool(args.d4rl_flip_y),
+        "stage2_mode": args.stage2_mode,
+        "mask_channels": mask_channels,
+        "k_schedule": args.k_schedule,
+        "k_geom_gamma": args.k_geom_gamma,
+        "use_start_goal": bool(args.cond_start_goal),
+        "clamp_endpoints": bool(args.clamp_endpoints),
+        "cond_start_goal": bool(args.cond_start_goal),
+    }
+    save_checkpoint(final_path, model, optimizer, args.steps, ema, meta=meta)
     writer.flush()
     writer.close()
 

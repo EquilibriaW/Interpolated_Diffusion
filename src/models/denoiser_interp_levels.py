@@ -22,10 +22,12 @@ class InterpLevelDenoiser(nn.Module):
         data_dim: int = 2,
         max_levels: int = 8,
         use_checkpoint: bool = False,
+        mask_channels: int = 1,
     ):
         super().__init__()
         self.data_dim = data_dim
-        self.in_proj = nn.Linear(data_dim + 1, d_model)
+        self.mask_channels = mask_channels
+        self.in_proj = nn.Linear(data_dim + mask_channels, d_model)
         self.level_emb = nn.Embedding(max_levels + 1, d_model)
         self.level_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
         self.cond_enc = MazeConditionEncoder(use_sdf=use_sdf, d_cond=d_cond, use_start_goal=use_start_goal)
@@ -54,7 +56,13 @@ class InterpLevelDenoiser(nn.Module):
 
     def forward(self, x_s: torch.Tensor, s: torch.Tensor, mask: torch.Tensor, cond: Dict[str, torch.Tensor]):
         B, T, D = x_s.shape
-        x = torch.cat([x_s, mask.unsqueeze(-1).float()], dim=-1)
+        if mask.dim() == 2:
+            mask_in = mask.unsqueeze(-1).float()
+        else:
+            mask_in = mask.float()
+        if mask_in.shape[-1] != self.mask_channels:
+            raise ValueError(f"mask has {mask_in.shape[-1]} channels, expected {self.mask_channels}")
+        x = torch.cat([x_s, mask_in], dim=-1)
         h = self.in_proj(x)
         pos = self._positional_embedding(T, x_s.device, h.shape[-1])
         h = h + pos.unsqueeze(0)

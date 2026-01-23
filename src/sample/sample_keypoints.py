@@ -1,4 +1,5 @@
 import argparse
+import sys
 import os
 from typing import Tuple
 
@@ -26,6 +27,7 @@ def build_argparser():
     p.add_argument("--N_train", type=int, default=None)
     p.add_argument("--schedule", type=str, default=None, choices=["cosine", "linear"])
     p.add_argument("--ddim_steps", type=int, default=20)
+    p.add_argument("--ddim_schedule", type=str, default="quadratic", choices=["linear", "quadratic", "sqrt"])
     p.add_argument("--use_sdf", type=int, default=0)
     p.add_argument("--with_velocity", type=int, default=0)
     p.add_argument("--logit_space", type=int, default=1)
@@ -48,19 +50,25 @@ def build_argparser():
     p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
     p.add_argument("--episode_split_mod", type=int, default=None)
     p.add_argument("--episode_split_val", type=int, default=0)
-    p.add_argument("--use_start_goal", type=int, default=1)
+    p.add_argument("--use_start_goal", type=int, default=1, help="Deprecated. Use --clamp_endpoints/--cond_start_goal.")
+    p.add_argument("--clamp_endpoints", type=int, default=1)
+    p.add_argument("--cond_start_goal", type=int, default=1)
     p.add_argument("--kp_index_mode", type=str, default="uniform", choices=["random", "uniform", "uniform_jitter"])
     p.add_argument("--kp_jitter", type=float, default=0.0)
     return p
 
 
 def _build_known_mask_values(
-    idx: torch.Tensor, cond: dict, D: int, T: int, use_start_goal: bool
+    idx: torch.Tensor, cond: dict, D: int, T: int, clamp_endpoints: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, K = idx.shape
     known_mask = torch.zeros((B, K, D), device=idx.device, dtype=torch.bool)
     known_values = torch.zeros((B, K, D), device=idx.device, dtype=torch.float32)
-    if use_start_goal and "start_goal" in cond and D >= 2:
+    if clamp_endpoints:
+        if "start_goal" not in cond:
+            raise ValueError("clamp_endpoints=True but start_goal missing from cond")
+        if D < 2:
+            return known_mask, known_values
         start = cond["start_goal"][:, :2]
         goal = cond["start_goal"][:, 2:]
         start_pos = start.unsqueeze(1).expand(B, K, 2)
@@ -98,12 +106,13 @@ def _sample_ddim(
     cond: dict,
     steps: int,
     T: int,
+    schedule_name: str = "linear",
 ):
     device = idx.device
     B, K = idx.shape
     D = known_values.shape[-1]
     n_train = schedule["alpha_bar"].shape[0]
-    times = _timesteps(n_train, steps)
+    times = _timesteps(n_train, steps, schedule=schedule_name)
     z = torch.randn((B, K, D), device=device)
     z = torch.where(known_mask, known_values, z)
     for i in range(len(times) - 1):
@@ -117,6 +126,15 @@ def _sample_ddim(
 
 def main():
     args = build_argparser().parse_args()
+    if "--clamp_endpoints" not in sys.argv and "--cond_start_goal" not in sys.argv:
+        args.clamp_endpoints = int(bool(args.use_start_goal))
+        args.cond_start_goal = int(bool(args.use_start_goal))
+    else:
+        if "--clamp_endpoints" not in sys.argv:
+            args.clamp_endpoints = int(bool(args.use_start_goal))
+        if "--cond_start_goal" not in sys.argv:
+            args.cond_start_goal = int(bool(args.use_start_goal))
+    args.use_start_goal = int(bool(args.cond_start_goal))
     os.makedirs(args.out_dir, exist_ok=True)
     _ensure_mujoco_env()
     if args.dataset not in {"d4rl", "d4rl_prepared"}:
@@ -146,14 +164,15 @@ def main():
             args.logit_space = int(bool(meta.get("logit_space")))
         if meta.get("logit_eps") is not None:
             args.logit_eps = float(meta.get("logit_eps"))
-        if meta.get("use_start_goal") is not None:
-            args.use_start_goal = int(bool(meta.get("use_start_goal")))
-        if meta.get("window_mode") is not None:
-            args.window_mode = str(meta.get("window_mode"))
-        if meta.get("goal_mode") is not None:
-            args.goal_mode = str(meta.get("goal_mode"))
-        if meta.get("use_start_goal") is not None:
-            args.use_start_goal = int(bool(meta.get("use_start_goal")))
+        if meta.get("clamp_endpoints") is not None:
+            args.clamp_endpoints = int(bool(meta.get("clamp_endpoints")))
+        elif meta.get("use_start_goal") is not None:
+            args.clamp_endpoints = int(bool(meta.get("use_start_goal")))
+        if meta.get("cond_start_goal") is not None:
+            args.cond_start_goal = int(bool(meta.get("cond_start_goal")))
+        elif meta.get("use_start_goal") is not None:
+            args.cond_start_goal = int(bool(meta.get("use_start_goal")))
+        args.use_start_goal = int(bool(args.cond_start_goal))
         if meta.get("window_mode") is not None:
             args.window_mode = str(meta.get("window_mode"))
         if meta.get("goal_mode") is not None:
@@ -181,7 +200,7 @@ def main():
     model = KeypointDenoiser(
         data_dim=data_dim,
         use_sdf=bool(args.use_sdf),
-        use_start_goal=bool(args.use_start_goal),
+        use_start_goal=bool(args.cond_start_goal),
     ).to(device)
     if not os.path.exists(args.ckpt):
         raise FileNotFoundError(f"Checkpoint not found: {args.ckpt}")
@@ -259,10 +278,22 @@ def main():
                 idx, _ = sample_fixed_k_indices_uniform_batch(
                     B, args.T, args.K, device=device, ensure_endpoints=True, jitter=jitter
                 )
-            known_mask, known_values = _build_known_mask_values(idx, cond, data_dim, args.T, bool(args.use_start_goal))
+            known_mask, known_values = _build_known_mask_values(
+                idx, cond, data_dim, args.T, bool(args.clamp_endpoints)
+            )
             if args.logit_space:
                 known_values = logit_pos(known_values, eps=args.logit_eps)
-            z_hat = _sample_ddim(model, schedule, idx, known_mask, known_values, cond, args.ddim_steps, args.T)
+            z_hat = _sample_ddim(
+                model,
+                schedule,
+                idx,
+                known_mask,
+                known_values,
+                cond,
+                args.ddim_steps,
+                args.T,
+                schedule_name=args.ddim_schedule,
+            )
             if args.logit_space:
                 z_hat = sigmoid_pos(z_hat)
             all_samples.append({"idx": idx.detach().cpu(), "z": z_hat.detach().cpu()})

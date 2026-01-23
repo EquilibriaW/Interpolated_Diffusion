@@ -1,4 +1,5 @@
 import argparse
+import sys
 import csv
 import json
 import os
@@ -13,6 +14,7 @@ from src.corruptions.keyframes import (
     interpolate_from_indices,
     sample_fixed_k_indices_batch,
     sample_fixed_k_indices_uniform_batch,
+    build_nested_masks_from_base,
 )
 from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset, PreparedTrajectoryDataset
 from src.diffusion.ddpm import _timesteps, ddim_step
@@ -36,9 +38,13 @@ def build_argparser():
     p.add_argument("--T", type=int, default=None)
     p.add_argument("--K_min", type=int, default=None)
     p.add_argument("--levels", type=int, default=3)
+    p.add_argument("--stage2_mode", type=str, default="adj", choices=["x0", "adj"])
     p.add_argument("--N_train", type=int, default=None)
     p.add_argument("--schedule", type=str, default=None, choices=["cosine", "linear"])
     p.add_argument("--ddim_steps", type=int, default=20)
+    p.add_argument("--ddim_schedule", type=str, default="quadratic", choices=["linear", "quadratic", "sqrt"])
+    p.add_argument("--k_schedule", type=str, default="doubling", choices=["doubling", "linear", "geom"])
+    p.add_argument("--k_geom_gamma", type=float, default=None)
     p.add_argument("--use_sdf", type=int, default=0)
     p.add_argument("--with_velocity", type=int, default=0)
     p.add_argument("--recompute_vel", type=int, default=1)
@@ -61,7 +67,9 @@ def build_argparser():
     p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
     p.add_argument("--episode_split_mod", type=int, default=None)
     p.add_argument("--episode_split_val", type=int, default=0)
-    p.add_argument("--use_start_goal", type=int, default=1)
+    p.add_argument("--use_start_goal", type=int, default=1, help="Deprecated. Use --clamp_endpoints/--cond_start_goal.")
+    p.add_argument("--clamp_endpoints", type=int, default=1)
+    p.add_argument("--cond_start_goal", type=int, default=1)
     p.add_argument("--override_meta", type=int, default=0)
     p.add_argument("--clamp_policy", type=str, default="endpoints", choices=["none", "endpoints", "all_anchors"])
     p.add_argument("--clamp_dims", type=str, default="pos", choices=["pos", "all"])
@@ -160,12 +168,16 @@ def _normalize_walls(
 
 
 def _build_known_mask_values(
-    idx: torch.Tensor, cond: dict, D: int, T: int, use_start_goal: bool
+    idx: torch.Tensor, cond: dict, D: int, T: int, clamp_endpoints: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, K = idx.shape
     known_mask = torch.zeros((B, K, D), device=idx.device, dtype=torch.bool)
     known_values = torch.zeros((B, K, D), device=idx.device, dtype=torch.float32)
-    if use_start_goal and "start_goal" in cond and D >= 2:
+    if clamp_endpoints:
+        if "start_goal" not in cond:
+            raise ValueError("clamp_endpoints=True but start_goal missing from cond")
+        if D < 2:
+            return known_mask, known_values
         start = cond["start_goal"][:, :2]
         goal = cond["start_goal"][:, 2:]
         start_pos = start.unsqueeze(1).expand(B, K, 2)
@@ -187,13 +199,14 @@ def _sample_keypoints_ddim(
     cond: dict,
     steps: int,
     T: int,
+    schedule_name: str = "linear",
     return_intermediates: bool = False,
 ):
     device = idx.device
     B, K = idx.shape
     D = known_values.shape[-1]
     n_train = schedule["alpha_bar"].shape[0]
-    times = _timesteps(n_train, steps)
+    times = _timesteps(n_train, steps, schedule=schedule_name)
     z = torch.randn((B, K, D), device=device)
     z = torch.where(known_mask, known_values, z)
     intermediates = [z.detach().clone()] if return_intermediates else None
@@ -212,6 +225,15 @@ def _sample_keypoints_ddim(
 
 def main():
     args = build_argparser().parse_args()
+    if "--clamp_endpoints" not in sys.argv and "--cond_start_goal" not in sys.argv:
+        args.clamp_endpoints = int(bool(args.use_start_goal))
+        args.cond_start_goal = int(bool(args.use_start_goal))
+    else:
+        if "--clamp_endpoints" not in sys.argv:
+            args.clamp_endpoints = int(bool(args.use_start_goal))
+        if "--cond_start_goal" not in sys.argv:
+            args.cond_start_goal = int(bool(args.use_start_goal))
+    args.use_start_goal = int(bool(args.cond_start_goal))
     os.makedirs(args.out_dir, exist_ok=True)
     _ensure_mujoco_env()
     if args.dataset not in {"d4rl", "d4rl_prepared"}:
@@ -252,8 +274,15 @@ def main():
             args.logit_space = int(bool(meta.get("logit_space")))
         if meta.get("logit_eps") is not None:
             args.logit_eps = float(meta.get("logit_eps"))
-        if meta.get("use_start_goal") is not None:
-            args.use_start_goal = int(bool(meta.get("use_start_goal")))
+        if meta.get("clamp_endpoints") is not None:
+            args.clamp_endpoints = int(bool(meta.get("clamp_endpoints")))
+        elif meta.get("use_start_goal") is not None:
+            args.clamp_endpoints = int(bool(meta.get("use_start_goal")))
+        if meta.get("cond_start_goal") is not None:
+            args.cond_start_goal = int(bool(meta.get("cond_start_goal")))
+        elif meta.get("use_start_goal") is not None:
+            args.cond_start_goal = int(bool(meta.get("use_start_goal")))
+        args.use_start_goal = int(bool(args.cond_start_goal))
         if meta.get("window_mode") is not None:
             args.window_mode = str(meta.get("window_mode"))
         if meta.get("goal_mode") is not None:
@@ -281,7 +310,7 @@ def main():
     kp_model = KeypointDenoiser(
         data_dim=data_dim,
         use_sdf=bool(args.use_sdf),
-        use_start_goal=bool(args.use_start_goal),
+        use_start_goal=bool(args.cond_start_goal),
     ).to(device)
     if "model" not in payload_kp:
         raise FileNotFoundError(f"Checkpoint not found or invalid: {args.ckpt_keypoints}")
@@ -290,15 +319,41 @@ def main():
     interp_model = None
     payload_interp = {}
     if not args.skip_stage2:
+        mask_channels = 2 if args.stage2_mode == "adj" else 1
         interp_model = InterpLevelDenoiser(
             data_dim=data_dim,
             use_sdf=bool(args.use_sdf),
             max_levels=args.levels,
-            use_start_goal=bool(args.use_start_goal),
+            use_start_goal=bool(args.cond_start_goal),
+            mask_channels=mask_channels,
         ).to(device)
         payload_interp = torch.load(args.ckpt_interp, map_location="cpu") if os.path.exists(args.ckpt_interp) else {}
         if "model" not in payload_interp:
             raise FileNotFoundError(f"Checkpoint not found or invalid: {args.ckpt_interp}")
+        interp_meta = payload_interp.get("meta", {}) if isinstance(payload_interp, dict) else {}
+        if interp_meta and not args.override_meta:
+            if interp_meta.get("cond_start_goal") is not None:
+                interp_cond = bool(interp_meta.get("cond_start_goal"))
+            elif interp_meta.get("use_start_goal") is not None:
+                interp_cond = bool(interp_meta.get("use_start_goal"))
+            else:
+                interp_cond = None
+            if interp_meta.get("clamp_endpoints") is not None:
+                interp_clamp = bool(interp_meta.get("clamp_endpoints"))
+            elif interp_meta.get("use_start_goal") is not None:
+                interp_clamp = bool(interp_meta.get("use_start_goal"))
+            else:
+                interp_clamp = None
+            if interp_cond is not None and interp_cond != bool(args.cond_start_goal):
+                raise ValueError(
+                    f"Stage2 checkpoint cond_start_goal mismatch: ckpt={interp_cond} args={bool(args.cond_start_goal)}. "
+                    "Use --override_meta 1 to force."
+                )
+            if interp_clamp is not None and interp_clamp != bool(args.clamp_endpoints):
+                raise ValueError(
+                    f"Stage2 checkpoint clamp_endpoints mismatch: ckpt={interp_clamp} args={bool(args.clamp_endpoints)}. "
+                    "Use --override_meta 1 to force."
+                )
         interp_model.load_state_dict(payload_interp["model"])
 
     ema_warned = False
@@ -491,6 +546,9 @@ def main():
                 "success_refined",
                 "collision_oracle_interp",
                 "collision_pred_interp",
+                "collision_oracle_refined",
+                "goal_dist_oracle_refined",
+                "success_oracle_refined",
             ]
         )
         with torch.no_grad():
@@ -511,7 +569,9 @@ def main():
                     )
 
                 # Predicted keypoints (Stage 1).
-                known_mask, known_values = _build_known_mask_values(idx, cond, data_dim, args.T, bool(args.use_start_goal))
+                known_mask, known_values = _build_known_mask_values(
+                    idx, cond, data_dim, args.T, bool(args.clamp_endpoints)
+                )
                 if args.logit_space:
                     known_values = logit_pos(known_values, eps=args.logit_eps)
                 if args.save_diffusion_frames:
@@ -524,11 +584,20 @@ def main():
                         cond,
                         args.ddim_steps,
                         args.T,
+                        schedule_name=args.ddim_schedule,
                         return_intermediates=True,
                     )
                 else:
                     z_pred = _sample_keypoints_ddim(
-                        kp_model, schedule, idx, known_mask, known_values, cond, args.ddim_steps, args.T
+                        kp_model,
+                        schedule,
+                        idx,
+                        known_mask,
+                        known_values,
+                        cond,
+                        args.ddim_steps,
+                        args.T,
+                        schedule_name=args.ddim_schedule,
                     )
                     z_steps = None
                 if args.logit_space:
@@ -548,28 +617,88 @@ def main():
                     z_oracle = x0_gt.gather(1, idx_exp)
                     x_oracle = interpolate_from_indices(idx, z_oracle, args.T, recompute_velocity=bool(args.recompute_vel))
 
+                stage2_steps = None
+                x_hat_oracle = None
                 if args.skip_stage2 or interp_model is None:
                     x_hat = x_pred
+                elif args.stage2_mode == "adj":
+                    masks_levels, _ = build_nested_masks_from_base(
+                        idx,
+                        args.T,
+                        args.levels,
+                        generator=gen,
+                        device=device,
+                        k_schedule=args.k_schedule,
+                        k_geom_gamma=args.k_geom_gamma,
+                    )
+                    x_curr = x_pred
+                    if args.save_diffusion_frames:
+                        stage2_steps = []
+                    for s in range(args.levels, 0, -1):
+                        mask_s = masks_levels[:, s]
+                        mask_prev = masks_levels[:, s - 1]
+                        mask_in = torch.stack([mask_s, mask_prev], dim=-1)
+                        s_level = torch.full((B,), s, device=device, dtype=torch.long)
+                        delta_hat = interp_model(x_curr, s_level, mask_in, cond)
+                        x_curr = x_curr + delta_hat
+                        if args.clamp_policy == "all_anchors":
+                            clamp_mask = masks
+                        elif args.clamp_policy == "endpoints":
+                            clamp_mask = torch.zeros_like(mask_s)
+                            clamp_mask[:, 0] = True
+                            clamp_mask[:, -1] = True
+                        else:
+                            clamp_mask = None
+                        if clamp_mask is not None:
+                            x_curr = apply_clamp(x_curr, x_pred, clamp_mask, args.clamp_dims)
+                        if stage2_steps is not None:
+                            stage2_steps.append(x_curr.detach().clone())
+                    x_hat = x_curr
+                    if x_oracle is not None:
+                        x_curr = x_oracle
+                        for s in range(args.levels, 0, -1):
+                            mask_s = masks_levels[:, s]
+                            mask_prev = masks_levels[:, s - 1]
+                            mask_in = torch.stack([mask_s, mask_prev], dim=-1)
+                            s_level = torch.full((B,), s, device=device, dtype=torch.long)
+                            delta_hat = interp_model(x_curr, s_level, mask_in, cond)
+                            x_curr = x_curr + delta_hat
+                            if args.clamp_policy == "all_anchors":
+                                clamp_mask = masks
+                            elif args.clamp_policy == "endpoints":
+                                clamp_mask = torch.zeros_like(mask_s)
+                                clamp_mask[:, 0] = True
+                                clamp_mask[:, -1] = True
+                            else:
+                                clamp_mask = None
+                            if clamp_mask is not None:
+                                x_curr = apply_clamp(x_curr, x_oracle, clamp_mask, args.clamp_dims)
+                        x_hat_oracle = x_curr
                 else:
                     s_level = torch.full((B,), args.levels, device=device, dtype=torch.long)
                     delta_hat = interp_model(x_pred, s_level, masks, cond)
                     x_hat = x_pred + delta_hat
-                if args.clamp_policy == "all_anchors":
-                    clamp_mask = masks
-                elif args.clamp_policy == "endpoints":
-                    clamp_mask = torch.zeros_like(masks)
-                    clamp_mask[:, 0] = True
-                    clamp_mask[:, -1] = True
-                else:
-                    clamp_mask = None
-                if clamp_mask is not None:
-                    x_hat = apply_clamp(x_hat, x_pred, clamp_mask, args.clamp_dims)
+                    if args.clamp_policy == "all_anchors":
+                        clamp_mask = masks
+                    elif args.clamp_policy == "endpoints":
+                        clamp_mask = torch.zeros_like(masks)
+                        clamp_mask[:, 0] = True
+                        clamp_mask[:, -1] = True
+                    else:
+                        clamp_mask = None
+                    if clamp_mask is not None:
+                        x_hat = apply_clamp(x_hat, x_pred, clamp_mask, args.clamp_dims)
+                    if x_oracle is not None:
+                        delta_hat = interp_model(x_oracle, s_level, masks, cond)
+                        x_hat_oracle = x_oracle + delta_hat
+                        if clamp_mask is not None:
+                            x_hat_oracle = apply_clamp(x_hat_oracle, x_oracle, clamp_mask, args.clamp_dims)
 
                 for b in range(B):
                     occ_t = cond["occ"][b, 0]
                     interp_t = x_pred[b]
                     refined_t = x_hat[b]
-                    if args.use_start_goal:
+                    if args.clamp_endpoints and "start_goal" in cond:
                         goal_t = cond["start_goal"][b, 2:]
                     elif x0_gt is not None:
                         goal_t = x0_gt[b, -1, :2]
@@ -591,6 +720,16 @@ def main():
                     coll_pred = collision_rate(occ_t, interp_t)
                     if x_oracle is not None:
                         coll_oracle = collision_rate(occ_t, x_oracle[b])
+                    coll_oracle_refined = float("nan")
+                    goal_dist_oracle_refined = float("nan")
+                    success_oracle_refined = float("nan")
+                    if x_hat_oracle is not None:
+                        coll_oracle_refined = collision_rate(occ_t, x_hat_oracle[b])
+                        if goal_t is not None:
+                            goal_dist_oracle_refined = goal_distance(goal_t, x_hat_oracle[b])
+                            success_oracle_refined = success(
+                                goal_t, x_hat_oracle[b], occ_t.shape[-2], occ_t.shape[-1]
+                            )
 
                     writer.writerow(
                         [
@@ -603,6 +742,9 @@ def main():
                             success_refined,
                             coll_oracle,
                             coll_pred,
+                            coll_oracle_refined,
+                            goal_dist_oracle_refined,
+                            success_oracle_refined,
                         ]
                     )
 
@@ -657,13 +799,24 @@ def main():
                                 panels.append(
                                     {
                                         "traj": refined_np[:, :2],
-                                        "label": "stage2",
+                                        "label": "stage2 (pred)",
                                         "coll": collision_rate(occ_t, refined_t),
                                         "kp": None,
                                         "sg": sg,
-                                        "footer": "phase2 (refined)",
+                                        "footer": "phase2 (pred)",
                                     }
                                 )
+                                if x_hat_oracle is not None:
+                                    panels.append(
+                                        {
+                                            "traj": x_hat_oracle[b].detach().cpu().numpy()[:, :2],
+                                            "label": "stage2 (oracle)",
+                                            "coll": coll_oracle_refined,
+                                            "kp": None,
+                                            "sg": sg,
+                                            "footer": "phase2 (oracle)",
+                                        }
+                                    )
                             _plot_compare_panels(occ, panels, out_path)
                         else:
                             trajs = [interp_np[:, :2], refined_np[:, :2]]
@@ -776,90 +929,72 @@ def main():
                                     keypoints=[z_step[0].detach().cpu().numpy()[:, :2]] if args.plot_keypoints else None,
                                 )
                         if args.frames_include_stage2 and not args.skip_stage2:
-                            stage2_step = len(step_indices)
-                            final_step_path = os.path.join(frames_dir, f"step_{stage2_step:03d}.png")
-                            final_path = os.path.join(frames_dir, "stage2.png")
-                            if dataset_name in {"d4rl", "d4rl_prepared"}:
-                                occ = occ_t.detach().cpu().numpy()
-                                refined_np = refined_t.detach().cpu().numpy()
-                                plot_trajectories(
-                                    occ,
-                                    [refined_np[:, :2]],
-                                    ["phase2"],
-                                    out_path=final_step_path,
-                                    footer="phase2 step 1/1",
-                                    plot_points=bool(args.plot_points),
-                                )
-                                if final_path != final_step_path:
+                            base = len(step_indices)
+
+                            def _render_phase2(traj_np: np.ndarray, frame_path: str, footer: str):
+                                if dataset_name in {"d4rl", "d4rl_prepared"}:
+                                    occ = occ_t.detach().cpu().numpy()
                                     plot_trajectories(
                                         occ,
-                                        [refined_np[:, :2]],
+                                        [traj_np[:, :2]],
                                         ["phase2"],
-                                        out_path=final_path,
-                                        footer="phase2 step 1/1",
+                                        out_path=frame_path,
+                                        footer=footer,
                                         plot_points=bool(args.plot_points),
                                     )
-                            elif mj_walls_norm is not None:
-                                plot_maze2d_geom_walls(
-                                    mj_walls_norm,
-                                    [refined_np[:, :2]],
-                                    ["stage2"],
-                                    out_path=final_step_path,
-                                    bounds=((0.0, 1.0), (0.0, 1.0)),
-                                    footer="phase2 step 1/1",
-                                    plot_points=bool(args.plot_points),
-                                )
-                                if final_path != final_step_path:
+                                elif mj_walls_norm is not None:
                                     plot_maze2d_geom_walls(
                                         mj_walls_norm,
-                                        [refined_np[:, :2]],
-                                        ["stage2"],
-                                        out_path=final_path,
+                                        [traj_np[:, :2]],
+                                        ["phase2"],
+                                        out_path=frame_path,
                                         bounds=((0.0, 1.0), (0.0, 1.0)),
-                                        footer="phase2 step 1/1",
+                                        footer=footer,
                                         plot_points=bool(args.plot_points),
                                     )
-                            elif maze_map is not None and maze_scale is not None:
-                                refined_plot = _denorm_xy(refined_np[:, :2])
-                                plot_maze2d_trajectories(
-                                    maze_map,
-                                    maze_scale,
-                                    [refined_plot],
-                                    ["stage2"],
-                                    out_path=final_step_path,
-                                    footer="phase2 step 1/1",
-                                    plot_points=bool(args.plot_points),
-                                )
-                                if final_path != final_step_path:
+                                elif maze_map is not None and maze_scale is not None:
+                                    traj_plot = _denorm_xy(traj_np[:, :2])
                                     plot_maze2d_trajectories(
                                         maze_map,
                                         maze_scale,
-                                        [refined_plot],
-                                        ["stage2"],
-                                        out_path=final_path,
-                                        footer="phase2 step 1/1",
+                                        [traj_plot],
+                                        ["phase2"],
+                                        out_path=frame_path,
+                                        footer=footer,
                                         plot_points=bool(args.plot_points),
                                     )
-                            else:
-                                occ = occ_t.detach().cpu().numpy()
-                                refined_np = refined_t.detach().cpu().numpy()
-                                plot_trajectories(
-                                    occ,
-                                    [refined_np[:, :2]],
-                                    ["stage2"],
-                                    out_path=final_step_path,
-                                    footer="phase2 step 1/1",
-                                    plot_points=bool(args.plot_points),
-                                )
-                                if final_path != final_step_path:
+                                else:
+                                    occ = occ_t.detach().cpu().numpy()
                                     plot_trajectories(
                                         occ,
-                                        [refined_np[:, :2]],
-                                        ["stage2"],
-                                        out_path=final_path,
-                                        footer="phase2 step 1/1",
+                                        [traj_np[:, :2]],
+                                        ["phase2"],
+                                        out_path=frame_path,
+                                        footer=footer,
                                         plot_points=bool(args.plot_points),
                                     )
+
+                            if stage2_steps is not None and len(stage2_steps) > 0:
+                                for si2, x_step2 in enumerate(stage2_steps):
+                                    frame_path = os.path.join(frames_dir, f"step_{base + si2:03d}.png")
+                                    step_np2 = x_step2[b].detach().cpu().numpy()
+                                    footer = f"phase2 step {si2+1}/{len(stage2_steps)}"
+                                    _render_phase2(step_np2, frame_path, footer)
+                                final_path = os.path.join(frames_dir, "stage2.png")
+                                final_np = stage2_steps[-1][b].detach().cpu().numpy()
+                                _render_phase2(
+                                    final_np,
+                                    final_path,
+                                    f"phase2 step {len(stage2_steps)}/{len(stage2_steps)}",
+                                )
+                            else:
+                                stage2_step = base
+                                final_step_path = os.path.join(frames_dir, f"step_{stage2_step:03d}.png")
+                                final_path = os.path.join(frames_dir, "stage2.png")
+                                refined_np = refined_t.detach().cpu().numpy()
+                                _render_phase2(refined_np, final_step_path, "phase2 step 1/1")
+                                if final_path != final_step_path:
+                                    _render_phase2(refined_np, final_path, "phase2 step 1/1")
                         _export_video(frames_dir, args.export_video, args.video_fps)
                     idx_global += 1
 

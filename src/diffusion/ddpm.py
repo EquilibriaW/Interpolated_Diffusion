@@ -58,13 +58,20 @@ def ddpm_step(rt: torch.Tensor, eps: torch.Tensor, t: torch.Tensor, schedule: Di
     return mean + torch.sqrt(var) * noise
 
 
-def _timesteps(n_train: int, steps: int) -> torch.Tensor:
+def _timesteps(n_train: int, steps: int, schedule: str = "linear") -> torch.Tensor:
     device = torch.device("cpu")
     if steps <= 1:
         return torch.tensor([n_train - 1, 0], dtype=torch.long, device=device)
     if steps >= n_train:
         return torch.arange(n_train - 1, -1, -1, dtype=torch.long, device=device)
-    times = torch.linspace(0, n_train - 1, steps, device=device).long()
+    if schedule == "quadratic":
+        t = torch.linspace(0.0, 1.0, steps, device=device)
+        times = (t * t * (n_train - 1)).long()
+    elif schedule == "sqrt":
+        t = torch.linspace(0.0, 1.0, steps, device=device)
+        times = (torch.sqrt(t) * (n_train - 1)).long()
+    else:
+        times = torch.linspace(0, n_train - 1, steps, device=device).long()
     times = torch.unique(times)
     if times[0].item() != 0:
         times = torch.cat([torch.tensor([0], dtype=torch.long, device=device), times], dim=0)

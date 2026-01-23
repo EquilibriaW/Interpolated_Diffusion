@@ -1,4 +1,5 @@
 import argparse
+import sys
 import os
 from typing import Tuple
 
@@ -51,7 +52,9 @@ def build_argparser():
     p.add_argument("--turn_angle_deg", type=float, default=30.0)
     p.add_argument("--window_mode", type=str, default="end", choices=["end", "random", "episode"])
     p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
-    p.add_argument("--use_start_goal", type=int, default=1)
+    p.add_argument("--use_start_goal", type=int, default=1, help="Deprecated. Use --clamp_endpoints/--cond_start_goal.")
+    p.add_argument("--clamp_endpoints", type=int, default=1)
+    p.add_argument("--cond_start_goal", type=int, default=1)
     p.add_argument("--override_meta", type=int, default=0)
     p.add_argument("--clamp_policy", type=str, default="endpoints", choices=["none", "endpoints", "all_anchors"])
     p.add_argument("--clamp_dims", type=str, default="pos", choices=["pos", "all"])
@@ -150,6 +153,15 @@ def _sample_keypoints_ddim(
 
 def main():
     args = build_argparser().parse_args()
+    if "--clamp_endpoints" not in sys.argv and "--cond_start_goal" not in sys.argv:
+        args.clamp_endpoints = int(bool(args.use_start_goal))
+        args.cond_start_goal = int(bool(args.use_start_goal))
+    else:
+        if "--clamp_endpoints" not in sys.argv:
+            args.clamp_endpoints = int(bool(args.use_start_goal))
+        if "--cond_start_goal" not in sys.argv:
+            args.cond_start_goal = int(bool(args.use_start_goal))
+    args.use_start_goal = int(bool(args.cond_start_goal))
     os.makedirs(args.out_dir, exist_ok=True)
     _ensure_mujoco_env()
     if args.dataset not in {"d4rl", "d4rl_prepared"}:
@@ -180,8 +192,15 @@ def main():
             args.logit_space = int(bool(meta.get("logit_space")))
         if meta.get("logit_eps") is not None:
             args.logit_eps = float(meta.get("logit_eps"))
-        if meta.get("use_start_goal") is not None:
-            args.use_start_goal = int(bool(meta.get("use_start_goal")))
+        if meta.get("clamp_endpoints") is not None:
+            args.clamp_endpoints = int(bool(meta.get("clamp_endpoints")))
+        elif meta.get("use_start_goal") is not None:
+            args.clamp_endpoints = int(bool(meta.get("use_start_goal")))
+        if meta.get("cond_start_goal") is not None:
+            args.cond_start_goal = int(bool(meta.get("cond_start_goal")))
+        elif meta.get("use_start_goal") is not None:
+            args.cond_start_goal = int(bool(meta.get("use_start_goal")))
+        args.use_start_goal = int(bool(args.cond_start_goal))
         if meta.get("window_mode") is not None:
             args.window_mode = str(meta.get("window_mode"))
         if meta.get("goal_mode") is not None:
@@ -209,13 +228,13 @@ def main():
     kp_model = KeypointDenoiser(
         data_dim=data_dim,
         use_sdf=bool(args.use_sdf),
-        use_start_goal=bool(args.use_start_goal),
+        use_start_goal=bool(args.cond_start_goal),
     ).to(device)
     interp_model = InterpLevelCausalDenoiser(
         data_dim=data_dim,
         use_sdf=bool(args.use_sdf),
         max_levels=args.levels,
-        use_start_goal=bool(args.use_start_goal),
+        use_start_goal=bool(args.cond_start_goal),
     ).to(device)
 
     payload_kp = torch.load(args.ckpt_keypoints, map_location="cpu") if os.path.exists(args.ckpt_keypoints) else {}
@@ -349,7 +368,7 @@ def main():
             mask_local = mask_local[0]
             known_mask = torch.zeros((1, idx_local.shape[1], data_dim), device=device, dtype=torch.bool)
             known_values = torch.zeros((1, idx_local.shape[1], data_dim), device=device)
-            if args.use_start_goal:
+            if args.clamp_endpoints:
                 known_mask[:, :, :2] = (idx_local == 0).unsqueeze(-1) | (idx_local == local_T - 1).unsqueeze(-1)
                 known_values[:, :, :2] = torch.where(
                     (idx_local == 0).unsqueeze(-1), left.view(1, 1, 2), known_values[:, :, :2]

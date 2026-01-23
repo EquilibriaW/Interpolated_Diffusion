@@ -132,13 +132,40 @@ def sample_fixed_k_indices_uniform_batch(
     return idx, mask
 
 
-def _compute_k_schedule(T: int, K_min: int, levels: int) -> List[int]:
+def _compute_k_schedule(
+    T: int,
+    K_min: int,
+    levels: int,
+    schedule: str = "doubling",
+    geom_gamma: float = None,
+) -> List[int]:
     K_min = min(K_min, T)
     K_list = [0 for _ in range(levels + 1)]
     K_list[levels] = K_min
-    for s in range(levels, 0, -1):
-        K_prev = min(T, max(K_list[s] + 1, 2 * K_list[s]))
-        K_list[s - 1] = K_prev
+    if levels <= 0:
+        return K_list
+    if schedule == "doubling":
+        for s in range(levels, 0, -1):
+            K_prev = min(T, max(K_list[s] + 1, 2 * K_list[s]))
+            K_list[s - 1] = K_prev
+        return K_list
+    if schedule == "linear":
+        for s in range(levels - 1, -1, -1):
+            frac = float(levels - s) / float(levels)
+            target = int(round(K_min + frac * (T - K_min)))
+            K_prev = min(T, max(K_list[s + 1] + 1, target))
+            K_list[s] = K_prev
+        return K_list
+    if schedule == "geom":
+        if geom_gamma is None:
+            geom_gamma = (float(T) / float(K_min)) ** (1.0 / float(levels)) if K_min > 0 else 1.0
+        for s in range(levels - 1, -1, -1):
+            exp = float(levels - s)
+            target = int(round(K_min * (geom_gamma ** exp)))
+            K_prev = min(T, max(K_list[s + 1] + 1, target))
+            K_list[s] = K_prev
+        return K_list
+    raise ValueError(f"Unknown k schedule: {schedule}")
     return K_list
 
 
@@ -149,11 +176,13 @@ def build_nested_masks_batch(
     levels: int,
     generator: torch.Generator = None,
     device: torch.device = None,
+    k_schedule: str = "doubling",
+    k_geom_gamma: float = None,
 ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
     if levels < 1:
         raise ValueError("levels must be >= 1")
     device = device or torch.device("cpu")
-    K_list = _compute_k_schedule(T, K_min, levels)
+    K_list = _compute_k_schedule(T, K_min, levels, schedule=k_schedule, geom_gamma=k_geom_gamma)
     if T < 2:
         raise ValueError("T must be >= 2 when using endpoints")
     scores = torch.rand((B, T - 2), generator=generator, device=device)
@@ -177,6 +206,54 @@ def build_nested_masks_batch(
         idx = torch.sort(idx, dim=1).values
         idx_levels.append(idx)
         masks_levels[:, s].scatter_(1, idx, True)
+    return masks_levels, idx_levels
+
+
+def build_nested_masks_from_base(
+    idx_base: torch.Tensor,
+    T: int,
+    levels: int,
+    generator: torch.Generator = None,
+    device: torch.device = None,
+    k_schedule: str = "doubling",
+    k_geom_gamma: float = None,
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    if levels < 1:
+        raise ValueError("levels must be >= 1")
+    if idx_base.dim() != 2:
+        raise ValueError("idx_base must be [B, K]")
+    device = device or idx_base.device
+    B, K_base = idx_base.shape
+    K_list = _compute_k_schedule(T, K_base, levels, schedule=k_schedule, geom_gamma=k_geom_gamma)
+    masks_levels = torch.zeros((B, levels + 1, T), dtype=torch.bool, device=device)
+    idx_levels: List[torch.Tensor] = [None for _ in range(levels + 1)]
+    # Level S (coarsest) fixed by idx_base.
+    idx_s = torch.sort(idx_base, dim=1).values
+    idx_levels[levels] = idx_s
+    masks_levels[:, levels].scatter_(1, idx_s, True)
+    # Add anchors as we move to finer levels.
+    for s in range(levels - 1, -1, -1):
+        K_s = K_list[s]
+        prev_mask = masks_levels[:, s + 1]
+        need = K_s - prev_mask.sum(dim=1)
+        idx_list = []
+        for b in range(B):
+            k_need = int(need[b].item())
+            if k_need <= 0:
+                idx_list.append(idx_levels[s + 1][b])
+                continue
+            available = torch.where(~prev_mask[b])[0]
+            if available.numel() == 0:
+                idx_list.append(idx_levels[s + 1][b])
+                continue
+            perm = torch.randperm(available.numel(), generator=generator, device=device)
+            chosen = available[perm[:k_need]]
+            idx_new = torch.cat([idx_levels[s + 1][b], chosen], dim=0)
+            idx_new = torch.sort(idx_new).values
+            idx_list.append(idx_new)
+        idx_tensor = torch.stack(idx_list, dim=0)
+        idx_levels[s] = idx_tensor
+        masks_levels[:, s].scatter_(1, idx_tensor, True)
     return masks_levels, idx_levels
 
 
