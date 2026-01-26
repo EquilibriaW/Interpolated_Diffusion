@@ -3,6 +3,7 @@ import sys
 import csv
 import json
 import os
+import math
 from typing import Optional, Tuple
 
 import numpy as np
@@ -23,7 +24,7 @@ from src.eval.metrics import collision_rate, goal_distance, success
 from src.eval.visualize import plot_maze2d_geom_walls, plot_maze2d_trajectories, plot_trajectories
 from src.models.denoiser_interp_levels import InterpLevelDenoiser
 from src.models.denoiser_keypoints import KeypointDenoiser
-from src.utils.clamp import apply_clamp
+from src.utils.clamp import apply_clamp, apply_soft_clamp
 from src.utils.device import get_device
 from src.utils.normalize import logit_pos, sigmoid_pos
 
@@ -45,6 +46,16 @@ def build_argparser():
     p.add_argument("--ddim_schedule", type=str, default="quadratic", choices=["linear", "quadratic", "sqrt"])
     p.add_argument("--k_schedule", type=str, default="doubling", choices=["doubling", "linear", "geom"])
     p.add_argument("--k_geom_gamma", type=float, default=None)
+    p.add_argument("--anchor_conf", type=int, default=1)
+    p.add_argument("--anchor_conf_teacher", type=float, default=0.95)
+    p.add_argument("--anchor_conf_student", type=float, default=0.5)
+    p.add_argument("--anchor_conf_endpoints", type=float, default=1.0)
+    p.add_argument("--anchor_conf_missing", type=float, default=0.0)
+    p.add_argument("--anchor_conf_anneal", type=int, default=1)
+    p.add_argument("--anchor_conf_anneal_mode", type=str, default="linear", choices=["linear", "cosine", "none"])
+    p.add_argument("--soft_anchor_clamp", type=int, default=1)
+    p.add_argument("--soft_clamp_schedule", type=str, default="linear", choices=["linear", "cosine", "none"])
+    p.add_argument("--soft_clamp_max", type=float, default=1.0)
     p.add_argument("--use_sdf", type=int, default=0)
     p.add_argument("--with_velocity", type=int, default=0)
     p.add_argument("--recompute_vel", type=int, default=1)
@@ -92,6 +103,13 @@ def build_argparser():
     p.add_argument("--kp_jitter", type=float, default=0.0)
     p.add_argument("--sample_random", type=int, default=1)
     p.add_argument("--sample_seed", type=int, default=1234)
+    p.add_argument("--stage1_cache", type=str, default="")
+    p.add_argument(
+        "--stage1_cache_mode",
+        type=str,
+        default="none",
+        choices=["none", "save", "load", "auto"],
+    )
     p.add_argument("--sample_unique", type=int, default=1)
     return p
 
@@ -188,6 +206,50 @@ def _build_known_mask_values(
         known_values[:, :, :2] = torch.where(mask_start, start_pos, known_values[:, :, :2])
         known_values[:, :, :2] = torch.where(mask_goal, goal_pos, known_values[:, :, :2])
     return known_mask, known_values
+
+
+def _build_anchor_conf(
+    mask_s: torch.Tensor,
+    student_mask: Optional[torch.Tensor],
+    use_student: bool,
+    conf_teacher: float,
+    conf_student: float,
+    conf_endpoints: float,
+    conf_missing: float,
+    clamp_endpoints: bool,
+) -> torch.Tensor:
+    conf = torch.full_like(mask_s.float(), float(conf_missing))
+    conf = torch.where(mask_s, torch.full_like(conf, float(conf_teacher)), conf)
+    if student_mask is not None and use_student:
+        conf = torch.where(student_mask & mask_s, torch.full_like(conf, float(conf_student)), conf)
+    if clamp_endpoints:
+        conf[:, 0] = float(conf_endpoints)
+        conf[:, -1] = float(conf_endpoints)
+    return conf
+
+
+def _soft_clamp_lambda(s: int, levels: int, schedule: str, max_val: float) -> float:
+    if levels <= 0:
+        return float(max_val)
+    frac = float(s) / float(levels)
+    if schedule == "linear":
+        return float(max_val) * frac
+    if schedule == "cosine":
+        return float(max_val) * 0.5 * (1.0 + math.cos(math.pi * (1.0 - frac)))
+    return float(max_val)
+
+
+def _anneal_conf(conf: torch.Tensor, s: int, levels: int, mode: str) -> torch.Tensor:
+    if conf is None or mode == "none" or levels <= 0:
+        return conf
+    frac = float(s) / float(levels)
+    if mode == "linear":
+        lam = 1.0 - frac
+    elif mode == "cosine":
+        lam = 0.5 * (1.0 + math.cos(math.pi * frac))
+    else:
+        lam = 0.0
+    return conf + (1.0 - conf) * float(lam)
 
 
 def _sample_keypoints_ddim(
@@ -319,7 +381,7 @@ def main():
     interp_model = None
     payload_interp = {}
     if not args.skip_stage2:
-        mask_channels = 2 if args.stage2_mode == "adj" else 1
+        mask_channels = (2 if args.stage2_mode == "adj" else 1) + (1 if args.anchor_conf else 0)
         interp_model = InterpLevelDenoiser(
             data_dim=data_dim,
             use_sdf=bool(args.use_sdf),
@@ -344,6 +406,13 @@ def main():
                 interp_clamp = bool(interp_meta.get("use_start_goal"))
             else:
                 interp_clamp = None
+            if interp_meta.get("anchor_conf") is not None:
+                interp_anchor_conf = bool(interp_meta.get("anchor_conf"))
+                if interp_anchor_conf != bool(args.anchor_conf):
+                    raise ValueError(
+                        f"Stage2 checkpoint anchor_conf mismatch: ckpt={interp_anchor_conf} args={bool(args.anchor_conf)}. "
+                        "Use --override_meta 1 to force."
+                    )
             if interp_cond is not None and interp_cond != bool(args.cond_start_goal):
                 raise ValueError(
                     f"Stage2 checkpoint cond_start_goal mismatch: ckpt={interp_cond} args={bool(args.cond_start_goal)}. "
@@ -516,6 +585,20 @@ def main():
     gen.manual_seed(1234)
     idx_global = 0
 
+    cache = None
+    cache_mode = args.stage1_cache_mode
+    cache_path = args.stage1_cache
+    if cache_mode != "none" and cache_path:
+        if cache_mode in {"load", "auto"} and os.path.exists(cache_path):
+            cache = torch.load(cache_path, map_location="cpu")
+            if "idx" not in cache or "z_pred" not in cache or "x_pred" not in cache:
+                raise ValueError("stage1_cache missing required keys: idx, z_pred, x_pred")
+        elif cache_mode == "load":
+            raise ValueError(f"stage1_cache_mode=load but file not found: {cache_path}")
+    cache_write = None
+    if cache is None and cache_mode in {"save", "auto"} and cache_path:
+        cache_write = {"idx": [], "z_pred": [], "x_pred": []}
+
     metrics_path = os.path.join(args.out_dir, "metrics.csv")
     interp_list = []
     refined_list = []
@@ -558,54 +641,83 @@ def main():
                 if x0_gt is not None:
                     x0_gt = x0_gt.to(device)
                 B = cond["start_goal"].shape[0]
-                if args.kp_index_mode == "random":
-                    idx, masks = sample_fixed_k_indices_batch(
-                        B, args.T, args.K_min, generator=gen, device=device, ensure_endpoints=True
-                    )
-                else:
-                    jitter = args.kp_jitter if args.kp_index_mode == "uniform_jitter" else 0.0
-                    idx, masks = sample_fixed_k_indices_uniform_batch(
-                        B, args.T, args.K_min, generator=gen, device=device, ensure_endpoints=True, jitter=jitter
-                    )
-
-                # Predicted keypoints (Stage 1).
-                known_mask, known_values = _build_known_mask_values(
-                    idx, cond, data_dim, args.T, bool(args.clamp_endpoints)
-                )
-                if args.logit_space:
-                    known_values = logit_pos(known_values, eps=args.logit_eps)
-                if args.save_diffusion_frames:
-                    z_pred, z_steps = _sample_keypoints_ddim(
-                        kp_model,
-                        schedule,
-                        idx,
-                        known_mask,
-                        known_values,
-                        cond,
-                        args.ddim_steps,
-                        args.T,
-                        schedule_name=args.ddim_schedule,
-                        return_intermediates=True,
-                    )
-                else:
-                    z_pred = _sample_keypoints_ddim(
-                        kp_model,
-                        schedule,
-                        idx,
-                        known_mask,
-                        known_values,
-                        cond,
-                        args.ddim_steps,
-                        args.T,
-                        schedule_name=args.ddim_schedule,
-                    )
+                use_cache = cache is not None
+                if use_cache:
+                    if idx_global + B > cache["idx"].shape[0]:
+                        raise ValueError("stage1_cache has fewer samples than requested")
+                    idx = cache["idx"][idx_global : idx_global + B].to(device)
+                    z_pred = cache["z_pred"][idx_global : idx_global + B].to(device)
+                    x_pred = cache["x_pred"][idx_global : idx_global + B].to(device)
+                    masks = torch.zeros((B, args.T), device=device, dtype=torch.bool)
+                    masks.scatter_(1, idx, True)
                     z_steps = None
-                if args.logit_space:
-                    z_pred = sigmoid_pos(z_pred)
-                    if z_steps is not None:
-                        z_steps = [sigmoid_pos(z_step) for z_step in z_steps]
+                else:
+                    if args.kp_index_mode == "random":
+                        idx, masks = sample_fixed_k_indices_batch(
+                            B, args.T, args.K_min, generator=gen, device=device, ensure_endpoints=True
+                        )
+                    else:
+                        jitter = args.kp_jitter if args.kp_index_mode == "uniform_jitter" else 0.0
+                        idx, masks = sample_fixed_k_indices_uniform_batch(
+                            B, args.T, args.K_min, generator=gen, device=device, ensure_endpoints=True, jitter=jitter
+                        )
 
-                x_pred = interpolate_from_indices(idx, z_pred, args.T, recompute_velocity=bool(args.recompute_vel))
+                    # Predicted keypoints (Stage 1).
+                    known_mask, known_values = _build_known_mask_values(
+                        idx, cond, data_dim, args.T, bool(args.clamp_endpoints)
+                    )
+                    if args.logit_space:
+                        known_values = logit_pos(known_values, eps=args.logit_eps)
+                    if args.save_diffusion_frames:
+                        z_pred, z_steps = _sample_keypoints_ddim(
+                            kp_model,
+                            schedule,
+                            idx,
+                            known_mask,
+                            known_values,
+                            cond,
+                            args.ddim_steps,
+                            args.T,
+                            schedule_name=args.ddim_schedule,
+                            return_intermediates=True,
+                        )
+                    else:
+                        z_pred = _sample_keypoints_ddim(
+                            kp_model,
+                            schedule,
+                            idx,
+                            known_mask,
+                            known_values,
+                            cond,
+                            args.ddim_steps,
+                            args.T,
+                            schedule_name=args.ddim_schedule,
+                        )
+                        z_steps = None
+                    if args.logit_space:
+                        z_pred = sigmoid_pos(z_pred)
+                        if z_steps is not None:
+                            z_steps = [sigmoid_pos(z_step) for z_step in z_steps]
+
+                    x_pred = interpolate_from_indices(
+                        idx, z_pred, args.T, recompute_velocity=bool(args.recompute_vel)
+                    )
+                    if cache_write is not None:
+                        cache_write["idx"].append(idx.detach().cpu())
+                        cache_write["z_pred"].append(z_pred.detach().cpu())
+                        cache_write["x_pred"].append(x_pred.detach().cpu())
+                conf_pred = None
+                if args.anchor_conf:
+                    conf_pred = _build_anchor_conf(
+                        masks,
+                        masks,
+                        True,
+                        args.anchor_conf_teacher,
+                        args.anchor_conf_student,
+                        args.anchor_conf_endpoints,
+                        args.anchor_conf_missing,
+                        bool(args.clamp_endpoints),
+                    )
 
                 # Oracle keypoints interpolation.
                 z_oracle = None
@@ -637,10 +749,18 @@ def main():
                     for s in range(args.levels, 0, -1):
                         mask_s = masks_levels[:, s]
                         mask_prev = masks_levels[:, s - 1]
-                        mask_in = torch.stack([mask_s, mask_prev], dim=-1)
+                        if args.anchor_conf and conf_pred is not None:
+                            conf_s = _anneal_conf(conf_pred, s, args.levels, args.anchor_conf_anneal_mode)
+                            mask_in = torch.stack([mask_s.float(), mask_prev.float(), conf_s], dim=-1)
+                        else:
+                            conf_s = None
+                            mask_in = torch.stack([mask_s, mask_prev], dim=-1)
                         s_level = torch.full((B,), s, device=device, dtype=torch.long)
                         delta_hat = interp_model(x_curr, s_level, mask_in, cond)
                         x_curr = x_curr + delta_hat
+                        if args.soft_anchor_clamp and conf_s is not None:
+                            lam = _soft_clamp_lambda(s, args.levels, args.soft_clamp_schedule, args.soft_clamp_max)
+                            x_curr = apply_soft_clamp(x_curr, x_pred, conf_s, lam, args.clamp_dims)
                         if args.clamp_policy == "all_anchors":
                             clamp_mask = masks
                         elif args.clamp_policy == "endpoints":
@@ -659,10 +779,28 @@ def main():
                         for s in range(args.levels, 0, -1):
                             mask_s = masks_levels[:, s]
                             mask_prev = masks_levels[:, s - 1]
-                            mask_in = torch.stack([mask_s, mask_prev], dim=-1)
+                            if args.anchor_conf:
+                                conf_s = _build_anchor_conf(
+                                    mask_s,
+                                    None,
+                                    False,
+                                    args.anchor_conf_teacher,
+                                    args.anchor_conf_student,
+                                    args.anchor_conf_endpoints,
+                                    args.anchor_conf_missing,
+                                    bool(args.clamp_endpoints),
+                                )
+                                conf_s = _anneal_conf(conf_s, s, args.levels, args.anchor_conf_anneal_mode)
+                                mask_in = torch.stack([mask_s.float(), mask_prev.float(), conf_s], dim=-1)
+                            else:
+                                conf_s = None
+                                mask_in = torch.stack([mask_s, mask_prev], dim=-1)
                             s_level = torch.full((B,), s, device=device, dtype=torch.long)
                             delta_hat = interp_model(x_curr, s_level, mask_in, cond)
                             x_curr = x_curr + delta_hat
+                            if args.soft_anchor_clamp and conf_s is not None:
+                                lam = _soft_clamp_lambda(s, args.levels, args.soft_clamp_schedule, args.soft_clamp_max)
+                                x_curr = apply_soft_clamp(x_curr, x_oracle, conf_s, lam, args.clamp_dims)
                             if args.clamp_policy == "all_anchors":
                                 clamp_mask = masks
                             elif args.clamp_policy == "endpoints":
@@ -676,8 +814,16 @@ def main():
                         x_hat_oracle = x_curr
                 else:
                     s_level = torch.full((B,), args.levels, device=device, dtype=torch.long)
-                    delta_hat = interp_model(x_pred, s_level, masks, cond)
+                    if args.anchor_conf and conf_pred is not None:
+                        conf_s = _anneal_conf(conf_pred, args.levels, args.levels, args.anchor_conf_anneal_mode)
+                        mask_in = torch.stack([masks.float(), conf_s], dim=-1)
+                    else:
+                        mask_in = masks
+                    delta_hat = interp_model(x_pred, s_level, mask_in, cond)
                     x_hat = x_pred + delta_hat
+                    if args.soft_anchor_clamp and conf_pred is not None:
+                        lam = _soft_clamp_lambda(args.levels, args.levels, args.soft_clamp_schedule, args.soft_clamp_max)
+                        x_hat = apply_soft_clamp(x_hat, x_pred, conf_pred, lam, args.clamp_dims)
                     if args.clamp_policy == "all_anchors":
                         clamp_mask = masks
                     elif args.clamp_policy == "endpoints":
@@ -689,8 +835,27 @@ def main():
                     if clamp_mask is not None:
                         x_hat = apply_clamp(x_hat, x_pred, clamp_mask, args.clamp_dims)
                     if x_oracle is not None:
-                        delta_hat = interp_model(x_oracle, s_level, masks, cond)
+                        if args.anchor_conf:
+                            conf_oracle = _build_anchor_conf(
+                                masks,
+                                None,
+                                False,
+                                args.anchor_conf_teacher,
+                                args.anchor_conf_student,
+                                args.anchor_conf_endpoints,
+                                args.anchor_conf_missing,
+                                bool(args.clamp_endpoints),
+                            )
+                            conf_oracle = _anneal_conf(conf_oracle, args.levels, args.levels, args.anchor_conf_anneal_mode)
+                            mask_in = torch.stack([masks.float(), conf_oracle], dim=-1)
+                        else:
+                            conf_oracle = None
+                            mask_in = masks
+                        delta_hat = interp_model(x_oracle, s_level, mask_in, cond)
                         x_hat_oracle = x_oracle + delta_hat
+                        if args.soft_anchor_clamp and conf_oracle is not None:
+                            lam = _soft_clamp_lambda(args.levels, args.levels, args.soft_clamp_schedule, args.soft_clamp_max)
+                            x_hat_oracle = apply_soft_clamp(x_hat_oracle, x_oracle, conf_oracle, lam, args.clamp_dims)
                         if clamp_mask is not None:
                             x_hat_oracle = apply_clamp(x_hat_oracle, x_oracle, clamp_mask, args.clamp_dims)
 
@@ -1008,6 +1173,15 @@ def main():
                             )
                             step_trajs.append(x_step[0].detach().cpu().numpy())
                         steps_list.append(np.stack(step_trajs, axis=0))
+
+    if cache_write is not None:
+        cache_out = {
+            "idx": torch.cat(cache_write["idx"], dim=0) if cache_write["idx"] else torch.empty((0,), dtype=torch.long),
+            "z_pred": torch.cat(cache_write["z_pred"], dim=0) if cache_write["z_pred"] else torch.empty((0,)),
+            "x_pred": torch.cat(cache_write["x_pred"], dim=0) if cache_write["x_pred"] else torch.empty((0,)),
+            "args": vars(args),
+        }
+        torch.save(cache_out, cache_path)
 
     if args.save_npz:
         out_npz = os.path.join(args.out_dir, "samples.npz")
