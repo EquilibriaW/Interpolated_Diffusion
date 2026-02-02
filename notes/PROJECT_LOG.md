@@ -355,3 +355,23 @@ This is inspired by **cold/soft diffusion**: corruption is not necessarily Gauss
 - Move to B200 instance; re‑setup env from `notes/pip_freeze.txt`.
 - Download small subset of Wan2.1 synthetic shards (e.g. `shard-0000*.tar`) and verify loader.
 - Implement Wan2.1 LoRA finetune for phase‑1 and phase‑2.
+
+## 2026-02-02 (Milestone / RCM distillation)
+
+### Milestone Definition
+- Target: after distillation, achieve **quality comparable to 4‑step RCM** with:
+  - few steps for Phase‑1 keyframes,
+  - interpolation,
+  - **1–2 step** Phase‑2 correction (ideally 1 step).
+- Goal: demonstrate **compute efficiency vs full‑sequence diffusion** while maintaining comparable quality.
+
+### Distillation Direction
+- Add **RCM / step distillation** to reduce sampling steps for Phase‑1 and Phase‑2.
+- Phase‑1 is already cheaper; Phase‑2 should converge to 1–2 steps post‑distillation.
+- SLA / AR diffusion are orthogonal and postponed.
+
+### Next Implementation Plan (Video)
+- Build teacher full‑sequence model (Wan2.1) and distill:
+  1) Phase‑1 keyframe diffusion to few steps,
+  2) Phase‑2 refiner to 1–2 steps.
+- Evaluate vs 4‑step RCM baselines.
