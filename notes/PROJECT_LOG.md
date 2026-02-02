@@ -284,3 +284,74 @@ Include: date, command or script used, dataset/checkpoint paths, key settings, a
 - Use Wan2.1 synthetic webdataset subset for initial experiments (latents + text embeds + prompts).
 - Implement phase‑1/phase‑2 finetuning on Wan2.1 backbone (LoRA likely), keep VAE + text encoder frozen.
 - D_phi for video should be trained with a **teacher diffusion** (Wan2.1 full‑sequence) and a **student** defined as keyframes+interpolator. Selector then distills per‑segment costs; confirm per‑step KL weighting schedule.
+
+## 2026-02-02 (State Summary / Theory)
+
+### Project Goal
+Two‑phase diffusion model for sequence/video generation:
+- **Phase‑1 (keyframes/keypoints)**: generate a sparse set of keyframes/points from noise.
+- **Interpolator**: fill missing frames/points in latent space (or position space in maze).
+- **Phase‑2 (refiner)**: denoise the full sequence given keyframes+interp as corrupted input.
+
+This is inspired by **cold/soft diffusion**: corruption is not necessarily Gaussian; still treat it as a diffusion‑like denoising process. Phase‑2 corruption combines **interpolation replacement** + optional **Gaussian noise on missing tokens only**.
+
+### Why two‑phase
+- Full‑sequence diffusion is expensive and overkills for structured sequences.
+- Keyframes capture “structure”; interpolator captures low‑entropy content.
+- Phase‑2 corrects interpolator errors (ideally) and learns a clean full‑sequence model.
+
+### Key technical pieces (Maze)
+- Keypoints are **nested masks**: more keypoints = lower noise level.
+- DP selection: choose K indices to minimize a KL proxy between **teacher** and **student** distributions.
+  - Maze teacher ≈ GT trajectories (acceptable proxy).
+  - Student = keypoints + interpolation; cost computed per‑segment.
+- D_phi predicts per‑segment difficulty/cost for DP; selector predicts keyframe indices from cond.
+- Selector should provide **informative** keyframes; phase‑2 corruption removes least‑informative points first in foward process, so that in backwards process, the most informative will be added back.
+
+### Phase‑1 details
+- Input: K keypoints + index mask, plus optional features (gaps, t_norm, difficulty).
+- Conditioned on maze map + start/goal (cond_start_goal=1).
+- Index policy mix: selector/uniform/random for robustness.
+
+### Phase‑2 details
+- Corruption: replace non‑anchors with interpolated points (and optional Gaussian noise on missing points).
+- Nested masks per level (K_s) – as noise decreases, **more keypoints are revealed**.
+- Forward process: remove least‑informative points first; backward: add most‑informative points.
+
+### Observations (Maze)
+- Selector helps **phase‑1** keypoints substantially.
+- Phase‑2 sometimes fails to correct when interpolations are already good; tends to “do nothing.”
+- Uniform masks previously gave stronger corrections but worse keyframes.
+- Selector masks create larger max gaps (heavy tails), making phase‑2 harder.
+- Adding small Gaussian noise + matching inference noise to training schedule (noise on missing points only) improves stability; still needs more correction strength.
+
+### Video Transition
+- **Teacher for D_phi must be a full video diffusion model** (Wan 2.1 or similar). Maze GT is not sufficient.
+- D_phi should be trained using **diffusion‑per‑step KL** between teacher and student:
+  - Teacher: full‑sequence denoiser.
+  - Student: keyframes + interpolator.
+  - Weight per step using SNR schedule (s_min=0.1, s_max=10, gamma=1).
+- Selector then distills D_phi outputs → per‑segment costs → DP labels → predicts indices from cond only.
+- Phase‑1/Phase‑2 should both be **Wan2.1 finetunes** (likely LoRA), keeping VAE + text encoder frozen.
+
+### Current Video Plan
+1) Use **Wan2.1 synthetic webdataset** subset (latents + text embeds + prompts) for initial testing.
+2) Implement phase‑1 + phase‑2 finetunes on Wan2.1 backbone.
+3) D_phi training uses teacher Wan2.1; selector trained from D_phi DP labels.
+4) Interpolation in **latent space** (VAE). Keyframes are selected latent tokens.
+5) Conditioning: text prompt + clip length (and later segment difficulty tokens).
+
+### Key Datasets
+- **DiDeMo**: HF video tar parts; flattened to `data/didemo/video/{train,test}` (8395/1004). Used for text‑conditioned baseline experiments.
+- **Wan2.1 synthetic**: webdataset shards with `*.latent.pt`, `*.embed.pt`, `*.prompt.txt`. Large (≈2.1TB for 250K). Use shard subset.
+
+### Open Questions (Video)
+- Teacher/Student noise mismatch: D_phi should align with teacher diffusion noise; phase‑2 corruption is interpolation+Gaussian.
+- How to best condition selector without GT: text prompt + clip length, maybe coarse motion cues.
+- Phase‑2 correction strength when phase‑1+interp is already good; may need noise schedule, negative mining, or mask mixing.
+
+### Next Steps
+- Upload checkpoints/runs and codex state to Drive.
+- Move to B200 instance; re‑setup env from `notes/pip_freeze.txt`.
+- Download small subset of Wan2.1 synthetic shards (e.g. `shard-0000*.tar`) and verify loader.
+- Implement Wan2.1 LoRA finetune for phase‑1 and phase‑2.
