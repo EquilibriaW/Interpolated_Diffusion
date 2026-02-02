@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 
+import math
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -47,6 +48,11 @@ def build_argparser():
     p.add_argument("--k_schedule", type=str, default="geom", choices=["doubling", "linear", "geom"])
     p.add_argument("--k_geom_gamma", type=float, default=None)
     p.add_argument("--sg_map_sigma", type=float, default=1.5)
+    p.add_argument("--sel_kl_weight", type=float, default=0.02)
+    p.add_argument("--sel_tau_start", type=float, default=1.0)
+    p.add_argument("--sel_tau_end", type=float, default=0.3)
+    p.add_argument("--sel_tau_anneal", type=str, default="cosine", choices=["none", "linear", "cosine"])
+    p.add_argument("--sel_tau_frac", type=float, default=0.8)
     p.add_argument("--log_dir", type=str, default="runs/keypoint_selector")
     p.add_argument("--ckpt_dir", type=str, default="checkpoints/keypoint_selector")
     p.add_argument("--save_every", type=int, default=2000)
@@ -62,6 +68,18 @@ def _parse_int_list(spec: str) -> tuple[int, ...]:
     if not parts:
         raise ValueError("empty int list")
     return tuple(int(p) for p in parts)
+
+
+def _anneal_tau(step: int, total_steps: int, start: float, end: float, frac: float, mode: str) -> float:
+    if mode == "none":
+        return float(start)
+    horizon = max(1, int(total_steps * max(0.0, min(1.0, frac))))
+    t = min(step / float(horizon), 1.0)
+    if mode == "linear":
+        return float(start + (end - start) * t)
+    if mode == "cosine":
+        return float(end + (start - end) * 0.5 * (1.0 + math.cos(math.pi * t)))
+    return float(start)
 
 
 def main():
@@ -153,6 +171,23 @@ def main():
         loss = criterion(logits, target)
         weights = 1.0 + (pos_weight.unsqueeze(1) - 1.0) * target
         loss = (loss * weights).mean()
+        kl = None
+        entropy = None
+        tau = _anneal_tau(
+            step,
+            args.steps,
+            float(args.sel_tau_start),
+            float(args.sel_tau_end),
+            float(args.sel_tau_frac),
+            str(args.sel_tau_anneal),
+        )
+        if args.sel_kl_weight > 0.0:
+            logits_i = logits[:, 1:-1] / max(1e-6, float(tau))
+            logp = torch.log_softmax(logits_i, dim=-1)
+            p = logp.exp()
+            kl = (p * (logp + math.log(max(1, args.T - 2)))).sum(dim=-1).mean()
+            entropy = -(p * logp).sum(dim=-1).mean()
+            loss = loss + float(args.sel_kl_weight) * kl
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -162,6 +197,11 @@ def main():
         if step % 100 == 0:
             pbar.set_description(f"loss {loss.item():.4f}")
             writer.add_scalar("train/loss", loss.item(), step)
+            writer.add_scalar("train/sel_tau", tau, step)
+            if kl is not None:
+                writer.add_scalar("train/sel_kl", kl.item(), step)
+            if entropy is not None:
+                writer.add_scalar("train/sel_entropy", entropy.item(), step)
 
         if step > 0 and step % args.save_every == 0:
             ckpt_path = os.path.join(args.ckpt_dir, f"ckpt_{step:07d}.pt")
@@ -189,6 +229,11 @@ def main():
                 "k_geom_gamma": None if args.k_geom_gamma is None else float(args.k_geom_gamma),
                 "sg_map_sigma": float(args.sg_map_sigma),
                 "maze_channels": args.maze_channels,
+                "sel_kl_weight": float(args.sel_kl_weight),
+                "sel_tau_start": float(args.sel_tau_start),
+                "sel_tau_end": float(args.sel_tau_end),
+                "sel_tau_anneal": str(args.sel_tau_anneal),
+                "sel_tau_frac": float(args.sel_tau_frac),
             }
             save_checkpoint(ckpt_path, model, optimizer, step, ema=None, meta=meta)
 
@@ -217,6 +262,11 @@ def main():
         "k_geom_gamma": None if args.k_geom_gamma is None else float(args.k_geom_gamma),
         "sg_map_sigma": float(args.sg_map_sigma),
         "maze_channels": args.maze_channels,
+        "sel_kl_weight": float(args.sel_kl_weight),
+        "sel_tau_start": float(args.sel_tau_start),
+        "sel_tau_end": float(args.sel_tau_end),
+        "sel_tau_anneal": str(args.sel_tau_anneal),
+        "sel_tau_frac": float(args.sel_tau_frac),
     }
     save_checkpoint(final_path, model, optimizer, args.steps, ema=None, meta=meta)
     writer.flush()

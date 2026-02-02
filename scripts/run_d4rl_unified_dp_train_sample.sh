@@ -86,6 +86,11 @@ SELECTOR_COND_BIAS_MODE=${SELECTOR_COND_BIAS_MODE:-encoder}
 SELECTOR_USE_LEVEL=${SELECTOR_USE_LEVEL:-1}
 SELECTOR_LEVEL_MODE=${SELECTOR_LEVEL_MODE:-k_norm}
 SELECTOR_SG_MAP_SIGMA=${SELECTOR_SG_MAP_SIGMA:-1.5}
+SELECTOR_KL_WEIGHT=${SELECTOR_KL_WEIGHT:-0.02}
+SELECTOR_TAU_START=${SELECTOR_TAU_START:-1.0}
+SELECTOR_TAU_END=${SELECTOR_TAU_END:-0.3}
+SELECTOR_TAU_ANNEAL=${SELECTOR_TAU_ANNEAL:-cosine}
+SELECTOR_TAU_FRAC=${SELECTOR_TAU_FRAC:-0.8}
 SELECTOR_MAZE_CHANNELS=${SELECTOR_MAZE_CHANNELS:-${KP_MAZE_CHANNELS}}
 
 S2_KP_INDEX_MODE=${S2_KP_INDEX_MODE:-selector}
@@ -175,6 +180,11 @@ PYTHONPATH=. ${PYTHON} -m src.train.train_keypoint_selector \
   --use_level "${SELECTOR_USE_LEVEL}" --level_mode "${SELECTOR_LEVEL_MODE}" \
   --levels "${LEVELS}" --k_schedule "${K_SCHEDULE}" ${K_GEOM_GAMMA:+--k_geom_gamma "${K_GEOM_GAMMA}"} \
   --sg_map_sigma "${SELECTOR_SG_MAP_SIGMA}" \
+  --sel_kl_weight "${SELECTOR_KL_WEIGHT}" \
+  --sel_tau_start "${SELECTOR_TAU_START}" \
+  --sel_tau_end "${SELECTOR_TAU_END}" \
+  --sel_tau_anneal "${SELECTOR_TAU_ANNEAL}" \
+  --sel_tau_frac "${SELECTOR_TAU_FRAC}" \
   --ckpt_dir "${SELECTOR_CKPT}" --log_dir "${SELECTOR_LOG}"
 
 echo "==> Train unified stage-1 keypoints (DP mix)"

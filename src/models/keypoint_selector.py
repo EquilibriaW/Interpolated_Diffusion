@@ -200,7 +200,9 @@ class KeypointSelector(nn.Module):
         return self.out(q).squeeze(-1)
 
 
-def select_topk_indices(logits: torch.Tensor, K: int) -> torch.Tensor:
+def select_topk_indices(
+    logits: torch.Tensor, K: int, stochastic: bool = False, tau: float = 1.0
+) -> torch.Tensor:
     if logits.dim() != 2:
         raise ValueError("logits must be [B,T]")
     B, T = logits.shape
@@ -213,7 +215,16 @@ def select_topk_indices(logits: torch.Tensor, K: int) -> torch.Tensor:
         idx[:, 1] = T - 1
         return idx
     interior = logits[:, 1:-1]
-    topk = torch.topk(interior, K - 2, dim=1).indices + 1
+    if stochastic:
+        eps = 1e-6
+        gumbel = -torch.log(-torch.log(torch.rand_like(interior).clamp_min(eps)).clamp_min(eps))
+        tau = float(tau)
+        if tau <= 0.0:
+            tau = 1.0
+        scores = (interior + gumbel) / tau
+    else:
+        scores = interior
+    topk = torch.topk(scores, K - 2, dim=1).indices + 1
     idx = torch.cat(
         [
             torch.zeros((B, 1), device=logits.device, dtype=torch.long),
