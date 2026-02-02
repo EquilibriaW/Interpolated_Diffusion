@@ -6,15 +6,21 @@ import torch.nn.functional as F
 
 
 class MazeEncoder(nn.Module):
-    def __init__(self, in_channels: int, d_cond: int = 128):
+    def __init__(self, in_channels: int, d_cond: int = 128, channels: tuple[int, ...] = (32, 64)):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.fc = nn.Linear(64, d_cond)
+        if len(channels) == 0:
+            raise ValueError("channels must be non-empty")
+        layers = []
+        c_in = in_channels
+        for c_out in channels:
+            layers.append(nn.Conv2d(c_in, c_out, kernel_size=3, padding=1))
+            layers.append(nn.SiLU())
+            c_in = c_out
+        self.convs = nn.Sequential(*layers)
+        self.fc = nn.Linear(channels[-1], d_cond)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.silu(self.conv1(x))
-        x = F.silu(self.conv2(x))
+        x = self.convs(x)
         x = x.mean(dim=[2, 3])
         return self.fc(x)
 
@@ -33,12 +39,18 @@ class StartGoalEncoder(nn.Module):
 
 
 class MazeConditionEncoder(nn.Module):
-    def __init__(self, use_sdf: bool = False, d_cond: int = 128, use_start_goal: bool = True):
+    def __init__(
+        self,
+        use_sdf: bool = False,
+        d_cond: int = 128,
+        use_start_goal: bool = True,
+        maze_channels: tuple[int, ...] = (32, 64),
+    ):
         super().__init__()
         in_channels = 2 if use_sdf else 1
         self.use_sdf = use_sdf
         self.use_start_goal = use_start_goal
-        self.maze = MazeEncoder(in_channels, d_cond)
+        self.maze = MazeEncoder(in_channels, d_cond, channels=maze_channels)
         self.sg = StartGoalEncoder(d_cond) if use_start_goal else None
 
     def forward(self, cond: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -57,3 +69,19 @@ class MazeConditionEncoder(nn.Module):
             sg_emb = self.sg(cond["start_goal"])
             return maze_emb + sg_emb
         return maze_emb
+
+
+class TextConditionEncoder(nn.Module):
+    def __init__(self, text_dim: int, d_cond: int = 128):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(text_dim, d_cond),
+            nn.SiLU(),
+            nn.Linear(d_cond, d_cond),
+        )
+
+    def forward(self, cond: Dict[str, torch.Tensor]) -> torch.Tensor:
+        text = cond.get("text_embed")
+        if text is None:
+            raise ValueError("text_embed missing from cond")
+        return self.proj(text)

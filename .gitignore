@@ -16,6 +16,14 @@ miniconda/
 mujoco210/
 mujoco210-linux-x86_64.tar.gz
 config/
+data/didemo/
+data/didemo_cache/
+data/LSMDC/
+data/lsmdc/
+data/wan_synth/
+tmp_repos/
+
+notes/*.tgz
 
 *.pt
 *.npz

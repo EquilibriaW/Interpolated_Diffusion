@@ -180,12 +180,14 @@ def plot_trajectories(
     footer: Optional[str] = None,
     plot_points: bool = False,
     keypoints: Optional[List[np.ndarray]] = None,
+    flip_y: bool = True,
 ):
     occ = _to_numpy(occ)
     trajs = [_to_numpy(traj) for traj in trajs]
     h, w = occ.shape
     fig, ax = plt.subplots(figsize=(4, 4))
-    ax.imshow(occ, cmap="gray_r", origin="upper")
+    origin = "upper" if flip_y else "lower"
+    ax.imshow(occ, cmap="gray_r", origin=origin)
     if colors is None:
         colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
     for i, traj in enumerate(trajs):
@@ -214,7 +216,10 @@ def plot_trajectories(
     ax.set_yticks([])
     ax.legend(loc="lower right", fontsize=6)
     ax.set_xlim([0, max(w - 1, 1)])
-    ax.set_ylim([max(h - 1, 1), 0])
+    if flip_y:
+        ax.set_ylim([max(h - 1, 1), 0])
+    else:
+        ax.set_ylim([0, max(h - 1, 1)])
     if title is not None:
         ax.set_title(title, fontsize=8)
     if footer is not None:

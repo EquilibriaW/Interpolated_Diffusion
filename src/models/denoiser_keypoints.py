@@ -47,16 +47,25 @@ class KeypointDenoiser(nn.Module):
         use_start_goal: bool = True,
         data_dim: int = 2,
         pos_dim: Optional[int] = None,
+        cond_encoder: Optional[nn.Module] = None,
         use_checkpoint: bool = False,
+        kp_feat_dim: int = 0,
+        maze_channels: tuple[int, ...] = (32, 64),
     ):
         super().__init__()
         self.data_dim = data_dim
+        self.d_cond = d_cond
+        self.kp_feat_dim = kp_feat_dim
         if pos_dim is None:
             pos_dim = d_model // 2
         self.pos_dim = pos_dim
-        self.in_proj = nn.Linear(data_dim + pos_dim + data_dim, d_model)
+        self.in_proj = nn.Linear(data_dim + pos_dim + data_dim + kp_feat_dim, d_model)
         self.t_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
-        self.cond_enc = MazeConditionEncoder(use_sdf=use_sdf, d_cond=d_cond, use_start_goal=use_start_goal)
+        if cond_encoder is None:
+            cond_encoder = MazeConditionEncoder(
+                use_sdf=use_sdf, d_cond=d_cond, use_start_goal=use_start_goal, maze_channels=maze_channels
+            )
+        self.cond_enc = cond_encoder
         self.cond_proj = nn.Linear(d_cond, d_model)
         self.transformer = TransformerEncoder(
             d_model=d_model,
@@ -82,12 +91,23 @@ class KeypointDenoiser(nn.Module):
         B, K, D = z_t.shape
         pos = idx.float() / max(1.0, float(T - 1))
         pos_emb = continuous_time_embedding(pos, self.pos_dim)
-        x = torch.cat([z_t, pos_emb, known_mask.float()], dim=-1)
+        if self.kp_feat_dim > 0 and cond is not None and "kp_feat" in cond:
+            kp_feat = cond["kp_feat"]
+            if kp_feat.shape[:2] != (B, K):
+                raise ValueError("kp_feat must have shape [B,K,F]")
+            if kp_feat.shape[-1] != self.kp_feat_dim:
+                raise ValueError("kp_feat_dim mismatch")
+        else:
+            kp_feat = torch.zeros((B, K, self.kp_feat_dim), device=z_t.device, dtype=z_t.dtype)
+        x = torch.cat([z_t, pos_emb, known_mask.float(), kp_feat], dim=-1)
         h = self.in_proj(x)
         t_emb = timestep_embedding(t, h.shape[-1])
         t_emb = self.t_embed(t_emb)
         h = h + t_emb.unsqueeze(1)
-        cond_vec = self.cond_enc(cond)
+        if cond and self.cond_enc is not None:
+            cond_vec = self.cond_enc(cond)
+        else:
+            cond_vec = torch.zeros((B, self.d_cond), device=z_t.device, dtype=z_t.dtype)
         h = h + self.cond_proj(cond_vec).unsqueeze(1)
         h = self.transformer(h, cond=cond_vec)
         return self.out(h)

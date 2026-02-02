@@ -257,6 +257,94 @@ def build_nested_masks_from_base(
     return masks_levels, idx_levels
 
 
+def build_nested_masks_from_logits(
+    logits: torch.Tensor,
+    K_min: int,
+    levels: int,
+    k_schedule: str = "doubling",
+    k_geom_gamma: float = None,
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    if logits.dim() != 2:
+        raise ValueError("logits must be [B, T]")
+    if levels < 1:
+        raise ValueError("levels must be >= 1")
+    B, T = logits.shape
+    if T < 2:
+        raise ValueError("T must be >= 2 when using endpoints")
+    device = logits.device
+    K_list = _compute_k_schedule(T, K_min, levels, schedule=k_schedule, geom_gamma=k_geom_gamma)
+    if K_list[levels] < 2:
+        raise ValueError("K_min must be >= 2 to include endpoints")
+
+    # Rank interior indices by descending logit. Endpoints are always included.
+    interior = logits[:, 1:-1]
+    order_interior = torch.argsort(interior, dim=1, descending=True) + 1
+    endpoints = torch.zeros((B, 2), device=device, dtype=torch.long)
+    endpoints[:, 1] = T - 1
+    order = torch.cat([endpoints, order_interior], dim=1)  # [B, T]
+
+    masks_levels = torch.zeros((B, levels + 1, T), dtype=torch.bool, device=device)
+    idx_levels: List[torch.Tensor] = [None for _ in range(levels + 1)]
+    for s in range(levels + 1):
+        K_s = K_list[s]
+        idx_s = order[:, :K_s]
+        idx_s = torch.sort(idx_s, dim=1).values
+        idx_levels[s] = idx_s
+        masks_levels[:, s].scatter_(1, idx_s, True)
+    return masks_levels, idx_levels
+
+
+def build_nested_masks_from_level_logits(
+    logits_levels: torch.Tensor,
+    K_min: int,
+    levels: int,
+    k_schedule: str = "doubling",
+    k_geom_gamma: float = None,
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    if logits_levels.dim() != 3:
+        raise ValueError("logits_levels must be [B, L, T]")
+    B, L, T = logits_levels.shape
+    if levels < 1:
+        raise ValueError("levels must be >= 1")
+    if L != levels + 1:
+        raise ValueError(f"logits_levels second dim must be levels+1 ({levels+1}), got {L}")
+    if T < 2:
+        raise ValueError("T must be >= 2 when using endpoints")
+    device = logits_levels.device
+    K_list = _compute_k_schedule(T, K_min, levels, schedule=k_schedule, geom_gamma=k_geom_gamma)
+    masks_levels = torch.zeros((B, levels + 1, T), dtype=torch.bool, device=device)
+    idx_levels: List[torch.Tensor] = [None for _ in range(levels + 1)]
+
+    selected = torch.zeros((B, T), dtype=torch.bool, device=device)
+    selected[:, 0] = True
+    selected[:, -1] = True
+
+    for s in range(levels, -1, -1):
+        K_s = K_list[s]
+        need = K_s - selected.sum(dim=1)
+        if torch.any(need < 0):
+            raise ValueError("K_schedule produced decreasing K values; ensure nestedness.")
+        if torch.any(need > 0):
+            scores = logits_levels[:, s, :].clone()
+            scores[selected] = -1e9
+            max_need = int(need.max().item())
+            if max_need > 0:
+                top_idx = torch.topk(scores, max_need, dim=1).indices
+                for b in range(B):
+                    k_need = int(need[b].item())
+                    if k_need <= 0:
+                        continue
+                    chosen = top_idx[b, :k_need]
+                    selected[b].scatter_(0, chosen, True)
+        masks_levels[:, s] = selected
+
+    for s in range(levels + 1):
+        K_s = K_list[s]
+        idx_s = torch.topk(masks_levels[:, s].float(), K_s, dim=1).indices
+        idx_levels[s] = torch.sort(idx_s, dim=1).values
+    return masks_levels, idx_levels
+
+
 def interpolate_from_indices(
     idx: torch.Tensor,
     vals: torch.Tensor,
@@ -269,6 +357,7 @@ def interpolate_from_indices(
         raise ValueError("vals must be [B, K, D]")
     B, K = idx.shape
     _, _, D = vals.shape
+    idx = idx.contiguous()
     device = idx.device
     t_grid = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
     seg = torch.searchsorted(idx, t_grid, right=True) - 1
@@ -277,8 +366,8 @@ def interpolate_from_indices(
     right_idx = idx.gather(1, seg + 1)
     left_val = vals.gather(1, seg.unsqueeze(-1).expand(B, T, D))
     right_val = vals.gather(1, (seg + 1).unsqueeze(-1).expand(B, T, D))
-    denom = (right_idx - left_idx).clamp(min=1).unsqueeze(-1)
-    w = (t_grid - left_idx).unsqueeze(-1) / denom
+    denom = (right_idx - left_idx).clamp(min=1).to(vals.dtype).unsqueeze(-1)
+    w = (t_grid - left_idx).to(vals.dtype).unsqueeze(-1) / denom
     y = left_val + w * (right_val - left_val)
     y.scatter_(1, idx.unsqueeze(-1).expand(B, K, D), vals)
     if recompute_velocity and D == 4:

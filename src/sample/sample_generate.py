@@ -16,6 +16,9 @@ from src.corruptions.keyframes import (
     sample_fixed_k_indices_batch,
     sample_fixed_k_indices_uniform_batch,
     build_nested_masks_from_base,
+    build_nested_masks_from_logits,
+    build_nested_masks_from_level_logits,
+    _compute_k_schedule,
 )
 from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset, PreparedTrajectoryDataset
 from src.diffusion.ddpm import _timesteps, ddim_step
@@ -24,6 +27,9 @@ from src.eval.metrics import collision_rate, goal_distance, success
 from src.eval.visualize import plot_maze2d_geom_walls, plot_maze2d_trajectories, plot_trajectories
 from src.models.denoiser_interp_levels import InterpLevelDenoiser
 from src.models.denoiser_keypoints import KeypointDenoiser
+from src.models.keypoint_selector import KeypointSelector, select_topk_indices
+from src.models.segment_cost import SegmentCostPredictor
+from src.selection.epiplexity_dp import build_segment_features_from_idx
 from src.utils.clamp import apply_clamp, apply_soft_clamp
 from src.utils.device import get_device
 from src.utils.normalize import logit_pos, sigmoid_pos
@@ -61,6 +67,33 @@ def build_argparser():
     p.add_argument("--recompute_vel", type=int, default=1)
     p.add_argument("--logit_space", type=int, default=1)
     p.add_argument("--logit_eps", type=float, default=1e-5)
+    p.add_argument("--pos_clip", type=int, default=0)
+    p.add_argument("--pos_clip_min", type=float, default=0.0)
+    p.add_argument("--pos_clip_max", type=float, default=1.0)
+    p.add_argument("--s2_sample_noise_mode", type=str, default="none", choices=["none", "constant", "level"])
+    p.add_argument("--s2_sample_noise_sigma", type=float, default=0.0)
+    p.add_argument("--s2_sample_noise_scale", type=float, default=1.0)
+    p.add_argument("--s2_corrupt_sigma_max", type=float, default=None)
+    p.add_argument("--s2_corrupt_sigma_min", type=float, default=None)
+    p.add_argument("--s2_corrupt_sigma_pow", type=float, default=None)
+    p.add_argument("--use_kp_feat", type=int, default=0)
+    p.add_argument("--kp_feat_dim", type=int, default=0)
+    p.add_argument("--dphi_ckpt", type=str, default=None)
+    p.add_argument("--dphi_use_ema", type=int, default=1)
+    p.add_argument("--kp_d_model", type=int, default=None)
+    p.add_argument("--kp_n_layers", type=int, default=None)
+    p.add_argument("--kp_n_heads", type=int, default=None)
+    p.add_argument("--kp_d_ff", type=int, default=None)
+    p.add_argument("--kp_d_cond", type=int, default=None)
+    p.add_argument("--kp_maze_channels", type=str, default=None)
+    p.add_argument("--selector_ckpt", type=str, default=None)
+    p.add_argument("--selector_use_ema", type=int, default=1)
+    p.add_argument("--s2_d_model", type=int, default=None)
+    p.add_argument("--s2_n_layers", type=int, default=None)
+    p.add_argument("--s2_n_heads", type=int, default=None)
+    p.add_argument("--s2_d_ff", type=int, default=None)
+    p.add_argument("--s2_d_cond", type=int, default=None)
+    p.add_argument("--s2_maze_channels", type=str, default=None)
     p.add_argument("--use_ema", type=int, default=1)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl", "d4rl_prepared"])
@@ -81,7 +114,10 @@ def build_argparser():
     p.add_argument("--use_start_goal", type=int, default=1, help="Deprecated. Use --clamp_endpoints/--cond_start_goal.")
     p.add_argument("--clamp_endpoints", type=int, default=1)
     p.add_argument("--cond_start_goal", type=int, default=1)
+    p.add_argument("--cond_start_goal_kp", type=int, default=None)
+    p.add_argument("--cond_start_goal_s2", type=int, default=None)
     p.add_argument("--override_meta", type=int, default=0)
+    p.add_argument("--override_interp_meta", type=int, default=0)
     p.add_argument("--clamp_policy", type=str, default="endpoints", choices=["none", "endpoints", "all_anchors"])
     p.add_argument("--clamp_dims", type=str, default="pos", choices=["pos", "all"])
     p.add_argument("--oracle_keypoints", type=int, default=0)
@@ -99,7 +135,12 @@ def build_argparser():
     p.add_argument("--plot_keypoints", type=int, default=1)
     p.add_argument("--plot_points", type=int, default=0)
     p.add_argument("--force_single", type=int, default=0)
-    p.add_argument("--kp_index_mode", type=str, default="uniform", choices=["random", "uniform", "uniform_jitter"])
+    p.add_argument(
+        "--kp_index_mode",
+        type=str,
+        default="uniform",
+        choices=["random", "uniform", "uniform_jitter", "selector"],
+    )
     p.add_argument("--kp_jitter", type=float, default=0.0)
     p.add_argument("--sample_random", type=int, default=1)
     p.add_argument("--sample_seed", type=int, default=1234)
@@ -112,6 +153,35 @@ def build_argparser():
     )
     p.add_argument("--sample_unique", type=int, default=1)
     return p
+
+
+def _compute_sigma_for_level(
+    K_s: int,
+    K_min: int,
+    sigma_max: float,
+    sigma_min: float,
+    sigma_pow: float,
+) -> float:
+    if sigma_max <= 0.0:
+        return 0.0
+    if K_s <= K_min:
+        return float(sigma_max)
+    ratio = float(K_min) / float(K_s)
+    sigma = float(sigma_max) * (ratio ** float(sigma_pow))
+    sigma = min(float(sigma_max), sigma)
+    sigma = max(float(sigma_min), sigma)
+    return sigma
+
+
+def _apply_s2_noise(x: torch.Tensor, mask: Optional[torch.Tensor], sigma: float, scale: float) -> torch.Tensor:
+    if sigma <= 0.0 or scale <= 0.0:
+        return x
+    noise = torch.randn_like(x[:, :, :2]) * float(sigma) * float(scale)
+    if mask is not None:
+        miss = ~mask.bool()
+        noise = noise * miss.unsqueeze(-1)
+    x[:, :, :2] = x[:, :, :2] + noise
+    return x
 
 
 def get_cond_from_sample(sample: dict) -> dict:
@@ -144,7 +214,7 @@ def _export_video(frames_dir: str, fmt: str, fps: int):
     try:
         import imageio.v2 as imageio
 
-        with imageio.get_writer(out_path, fps=fps) as writer:
+        with imageio.get_writer(out_path, fps=fps, macro_block_size=1) as writer:
             for fname in frames:
                 writer.append_data(imageio.imread(os.path.join(frames_dir, fname)))
         return
@@ -163,6 +233,8 @@ def _export_video(frames_dir: str, fmt: str, fps: int):
         subprocess.run(cmd, check=False)
     else:
         print("Video export skipped (gif requires imageio).")
+
+
 
 
 def _normalize_walls(
@@ -206,6 +278,42 @@ def _build_known_mask_values(
         known_values[:, :, :2] = torch.where(mask_start, start_pos, known_values[:, :, :2])
         known_values[:, :, :2] = torch.where(mask_goal, goal_pos, known_values[:, :, :2])
     return known_mask, known_values
+
+
+def _kp_feat_from_idx(
+    idx: torch.Tensor,
+    T: int,
+    kp_feat_dim: int,
+    left_diff: torch.Tensor | None = None,
+    right_diff: torch.Tensor | None = None,
+) -> torch.Tensor:
+    B, K = idx.shape
+    feat = torch.zeros((B, K, kp_feat_dim), device=idx.device, dtype=torch.float32)
+    if kp_feat_dim <= 0:
+        return feat
+    denom = float(max(1, T - 1))
+    t_norm = idx.float() / denom
+    feat[:, :, 0] = 0.0
+    feat[:, :, 1] = 0.0
+    if K > 1:
+        gaps = (idx[:, 1:] - idx[:, :-1]).float() / denom
+        feat[:, 1:, 0] = gaps
+        feat[:, :-1, 1] = gaps
+    if kp_feat_dim >= 3:
+        feat[:, :, 2] = t_norm
+    if kp_feat_dim >= 5 and left_diff is not None and right_diff is not None:
+        feat[:, :, 3] = left_diff
+        feat[:, :, 4] = right_diff
+    return feat
+
+
+def _parse_int_list(spec: str, fallback: str) -> tuple[int, ...]:
+    if spec is None:
+        spec = fallback
+    parts = [p.strip() for p in str(spec).split(",") if p.strip()]
+    if not parts:
+        raise ValueError("empty int list")
+    return tuple(int(p) for p in parts)
 
 
 def _build_anchor_conf(
@@ -263,14 +371,24 @@ def _sample_keypoints_ddim(
     T: int,
     schedule_name: str = "linear",
     return_intermediates: bool = False,
+    pos_clip: bool = False,
+    pos_clip_min: float = 0.0,
+    pos_clip_max: float = 1.0,
 ):
     device = idx.device
     B, K = idx.shape
     D = known_values.shape[-1]
     n_train = schedule["alpha_bar"].shape[0]
     times = _timesteps(n_train, steps, schedule=schedule_name)
+    def _clip_pos(z_in: torch.Tensor) -> torch.Tensor:
+        if not pos_clip:
+            return z_in
+        z_in[..., :2] = z_in[..., :2].clamp(min=pos_clip_min, max=pos_clip_max)
+        return z_in
+
     z = torch.randn((B, K, D), device=device)
     z = torch.where(known_mask, known_values, z)
+    z = _clip_pos(z)
     intermediates = [z.detach().clone()] if return_intermediates else None
     for i in range(len(times) - 1):
         t = torch.full((B,), int(times[i]), device=device, dtype=torch.long)
@@ -278,6 +396,7 @@ def _sample_keypoints_ddim(
         eps = model(z, t, idx, known_mask, cond, T)
         z = ddim_step(z, eps, t, t_prev, schedule, eta=0.0)
         z = torch.where(known_mask, known_values, z)
+        z = _clip_pos(z)
         if return_intermediates:
             intermediates.append(z.detach().clone())
     if return_intermediates:
@@ -345,6 +464,10 @@ def main():
         elif meta.get("use_start_goal") is not None:
             args.cond_start_goal = int(bool(meta.get("use_start_goal")))
         args.use_start_goal = int(bool(args.cond_start_goal))
+        if "--use_kp_feat" not in sys.argv and meta.get("use_kp_feat") is not None:
+            args.use_kp_feat = int(bool(meta.get("use_kp_feat")))
+        if "--kp_feat_dim" not in sys.argv and meta.get("kp_feat_dim") is not None:
+            args.kp_feat_dim = int(meta.get("kp_feat_dim"))
         if meta.get("window_mode") is not None:
             args.window_mode = str(meta.get("window_mode"))
         if meta.get("goal_mode") is not None:
@@ -365,14 +488,126 @@ def main():
             args.env_id = meta.get("env_id")
         if meta.get("d4rl_flip_y") is not None:
             args.d4rl_flip_y = int(bool(meta.get("d4rl_flip_y")))
+        if "--kp_d_model" not in sys.argv and meta.get("kp_d_model") is not None:
+            args.kp_d_model = int(meta.get("kp_d_model"))
+        if "--kp_n_layers" not in sys.argv and meta.get("kp_n_layers") is not None:
+            args.kp_n_layers = int(meta.get("kp_n_layers"))
+        if "--kp_n_heads" not in sys.argv and meta.get("kp_n_heads") is not None:
+            args.kp_n_heads = int(meta.get("kp_n_heads"))
+        if "--kp_d_ff" not in sys.argv and meta.get("kp_d_ff") is not None:
+            args.kp_d_ff = int(meta.get("kp_d_ff"))
+        if "--kp_d_cond" not in sys.argv and meta.get("kp_d_cond") is not None:
+            args.kp_d_cond = int(meta.get("kp_d_cond"))
+        if "--kp_maze_channels" not in sys.argv and meta.get("kp_maze_channels") is not None:
+            args.kp_maze_channels = str(meta.get("kp_maze_channels"))
 
     device = get_device(args.device)
     data_dim = 4 if args.with_velocity else 2
+    cond_start_goal_kp = (
+        bool(args.cond_start_goal_kp) if args.cond_start_goal_kp is not None else bool(args.cond_start_goal)
+    )
+
+    dphi_model = None
+    dphi_seg_feat_dim = None
+    if args.dphi_ckpt:
+        payload = torch.load(args.dphi_ckpt, map_location="cpu")
+        meta_dphi = payload.get("meta", {}) if isinstance(payload, dict) else {}
+        if meta_dphi.get("stage") != "segment_cost":
+            raise ValueError("dphi_ckpt does not appear to be a segment_cost checkpoint")
+        if meta_dphi.get("T") is not None and int(meta_dphi.get("T")) != int(args.T):
+            raise ValueError(f"dphi_ckpt T mismatch: ckpt={meta_dphi.get('T')} args={args.T}")
+        if meta_dphi.get("use_sdf") is not None and bool(meta_dphi.get("use_sdf")) != bool(args.use_sdf):
+            raise ValueError("dphi_ckpt use_sdf mismatch")
+        if meta_dphi.get("cond_start_goal") is not None and bool(meta_dphi.get("cond_start_goal")) != bool(args.cond_start_goal):
+            raise ValueError("dphi_ckpt cond_start_goal mismatch")
+        if not bool(args.use_kp_feat) or int(args.kp_feat_dim) < 5:
+            raise ValueError("dphi_ckpt requires use_kp_feat=1 and kp_feat_dim>=5")
+        maze_channels = meta_dphi.get("maze_channels", "32,64")
+        dphi_model = SegmentCostPredictor(
+            d_cond=int(meta_dphi.get("d_cond", 128)),
+            seg_feat_dim=int(meta_dphi.get("seg_feat_dim", 3)),
+            hidden_dim=int(meta_dphi.get("hidden_dim", 256)),
+            n_layers=int(meta_dphi.get("n_layers", 3)),
+            dropout=float(meta_dphi.get("dropout", 0.0)),
+            use_sdf=bool(args.use_sdf),
+            use_start_goal=bool(args.cond_start_goal),
+            maze_channels=_parse_int_list(maze_channels, "32,64"),
+        ).to(device)
+        dphi_state = payload.get("model", payload)
+        dphi_model.load_state_dict(dphi_state)
+        if bool(args.dphi_use_ema) and isinstance(payload, dict) and "ema" in payload:
+            from src.utils.ema import EMA
+
+            ema_dphi = EMA(dphi_model.parameters())
+            ema_dphi.load_state_dict(payload["ema"])
+            ema_dphi.copy_to(dphi_model.parameters())
+        dphi_model.eval()
+        dphi_seg_feat_dim = int(dphi_model.seg_feat_dim)
+    elif bool(args.use_kp_feat) and int(args.kp_feat_dim) > 3:
+        raise ValueError("kp_feat_dim>3 requires --dphi_ckpt for predicted difficulties")
+
+    selector_model = None
+    selector_use_level = False
+    selector_level_mode = "k_norm"
+    if args.kp_index_mode == "selector":
+        if args.selector_ckpt is None:
+            raise ValueError("kp_index_mode=selector requires --selector_ckpt")
+        payload = torch.load(args.selector_ckpt, map_location="cpu")
+        meta_sel = payload.get("meta", {}) if isinstance(payload, dict) else {}
+        if meta_sel.get("stage") != "selector":
+            raise ValueError("selector_ckpt does not appear to be a selector checkpoint")
+        if meta_sel.get("T") is not None and int(meta_sel.get("T")) != int(args.T):
+            raise ValueError(f"selector_ckpt T mismatch: ckpt={meta_sel.get('T')} args={args.T}")
+        if meta_sel.get("K") is not None and int(meta_sel.get("K")) != int(args.K_min):
+            raise ValueError(f"selector_ckpt K mismatch: ckpt={meta_sel.get('K')} args={args.K_min}")
+        if meta_sel.get("use_sdf") is not None and bool(meta_sel.get("use_sdf")) != bool(args.use_sdf):
+            raise ValueError("selector_ckpt use_sdf mismatch")
+        if meta_sel.get("cond_start_goal") is not None and bool(meta_sel.get("cond_start_goal")) != bool(args.cond_start_goal):
+            raise ValueError("selector_ckpt cond_start_goal mismatch")
+        selector_use_level = bool(meta_sel.get("use_level", False))
+        selector_level_mode = str(meta_sel.get("level_mode", "k_norm"))
+        maze_channels = meta_sel.get("maze_channels", "32,64")
+        selector_model = KeypointSelector(
+            T=int(meta_sel.get("T", args.T)),
+            d_model=int(meta_sel.get("d_model", 256)),
+            n_heads=int(meta_sel.get("n_heads", 8)),
+            d_ff=int(meta_sel.get("d_ff", 512)),
+            n_layers=int(meta_sel.get("n_layers", 2)),
+            pos_dim=int(meta_sel.get("pos_dim", 64)),
+            dropout=float(meta_sel.get("dropout", 0.0)),
+            use_sdf=bool(args.use_sdf),
+            use_start_goal=bool(args.cond_start_goal),
+            use_sg_map=bool(meta_sel.get("use_sg_map", True)),
+            use_sg_token=bool(meta_sel.get("use_sg_token", True)),
+            use_goal_dist_token=bool(meta_sel.get("use_goal_dist_token", False)),
+            use_cond_bias=bool(meta_sel.get("use_cond_bias", False)),
+            cond_bias_mode=str(meta_sel.get("cond_bias_mode", "memory")),
+            use_level=selector_use_level,
+            level_mode=selector_level_mode,
+            sg_map_sigma=float(meta_sel.get("sg_map_sigma", 1.5)),
+            maze_channels=_parse_int_list(maze_channels, "32,64"),
+        ).to(device)
+        selector_state = payload.get("model", payload)
+        selector_model.load_state_dict(selector_state)
+        if bool(args.selector_use_ema) and isinstance(payload, dict) and "ema" in payload:
+            from src.utils.ema import EMA
+
+            ema_sel = EMA(selector_model.parameters())
+            ema_sel.load_state_dict(payload["ema"])
+            ema_sel.copy_to(selector_model.parameters())
+        selector_model.eval()
 
     kp_model = KeypointDenoiser(
+        d_model=int(args.kp_d_model) if args.kp_d_model is not None else 256,
+        n_layers=int(args.kp_n_layers) if args.kp_n_layers is not None else 8,
+        n_heads=int(args.kp_n_heads) if args.kp_n_heads is not None else 8,
+        d_ff=int(args.kp_d_ff) if args.kp_d_ff is not None else 1024,
+        d_cond=int(args.kp_d_cond) if args.kp_d_cond is not None else 128,
         data_dim=data_dim,
         use_sdf=bool(args.use_sdf),
-        use_start_goal=bool(args.cond_start_goal),
+        use_start_goal=cond_start_goal_kp,
+        kp_feat_dim=int(args.kp_feat_dim) if bool(args.use_kp_feat) else 0,
+        maze_channels=_parse_int_list(args.kp_maze_channels, "32,64"),
     ).to(device)
     if "model" not in payload_kp:
         raise FileNotFoundError(f"Checkpoint not found or invalid: {args.ckpt_keypoints}")
@@ -380,20 +615,67 @@ def main():
     kp_model.load_state_dict(payload_kp["model"])
     interp_model = None
     payload_interp = {}
+    interp_meta = {}
     if not args.skip_stage2:
+        if os.path.exists(args.ckpt_interp):
+            payload_interp = torch.load(args.ckpt_interp, map_location="cpu")
+            if isinstance(payload_interp, dict):
+                interp_meta = payload_interp.get("meta", {}) if isinstance(payload_interp, dict) else {}
+        cond_start_goal_s2 = (
+            bool(args.cond_start_goal_s2) if args.cond_start_goal_s2 is not None else bool(args.cond_start_goal)
+        )
+        if interp_meta and args.cond_start_goal_s2 is None:
+            if interp_meta.get("cond_start_goal") is not None:
+                cond_start_goal_s2 = bool(interp_meta.get("cond_start_goal"))
+            elif interp_meta.get("use_start_goal") is not None:
+                cond_start_goal_s2 = bool(interp_meta.get("use_start_goal"))
+        if interp_meta:
+            if "--s2_d_model" not in sys.argv and interp_meta.get("s2_d_model") is not None:
+                args.s2_d_model = int(interp_meta.get("s2_d_model"))
+            if "--s2_n_layers" not in sys.argv and interp_meta.get("s2_n_layers") is not None:
+                args.s2_n_layers = int(interp_meta.get("s2_n_layers"))
+            if "--s2_n_heads" not in sys.argv and interp_meta.get("s2_n_heads") is not None:
+                args.s2_n_heads = int(interp_meta.get("s2_n_heads"))
+            if "--s2_d_ff" not in sys.argv and interp_meta.get("s2_d_ff") is not None:
+                args.s2_d_ff = int(interp_meta.get("s2_d_ff"))
+            if "--s2_d_cond" not in sys.argv and interp_meta.get("s2_d_cond") is not None:
+                args.s2_d_cond = int(interp_meta.get("s2_d_cond"))
+            if "--s2_maze_channels" not in sys.argv and interp_meta.get("s2_maze_channels") is not None:
+                args.s2_maze_channels = str(interp_meta.get("s2_maze_channels"))
+
+        s2_corrupt_sigma_max = float(
+            args.s2_corrupt_sigma_max
+            if args.s2_corrupt_sigma_max is not None
+            else interp_meta.get("corrupt_sigma_max", 0.0)
+        )
+        s2_corrupt_sigma_min = float(
+            args.s2_corrupt_sigma_min
+            if args.s2_corrupt_sigma_min is not None
+            else interp_meta.get("corrupt_sigma_min", 0.0)
+        )
+        s2_corrupt_sigma_pow = float(
+            args.s2_corrupt_sigma_pow
+            if args.s2_corrupt_sigma_pow is not None
+            else interp_meta.get("corrupt_sigma_pow", 1.0)
+        )
+
         mask_channels = (2 if args.stage2_mode == "adj" else 1) + (1 if args.anchor_conf else 0)
         interp_model = InterpLevelDenoiser(
+            d_model=int(args.s2_d_model) if args.s2_d_model is not None else 256,
+            n_layers=int(args.s2_n_layers) if args.s2_n_layers is not None else 8,
+            n_heads=int(args.s2_n_heads) if args.s2_n_heads is not None else 8,
+            d_ff=int(args.s2_d_ff) if args.s2_d_ff is not None else 1024,
+            d_cond=int(args.s2_d_cond) if args.s2_d_cond is not None else 128,
             data_dim=data_dim,
             use_sdf=bool(args.use_sdf),
             max_levels=args.levels,
-            use_start_goal=bool(args.cond_start_goal),
+            use_start_goal=cond_start_goal_s2,
             mask_channels=mask_channels,
+            maze_channels=_parse_int_list(args.s2_maze_channels, "32,64"),
         ).to(device)
-        payload_interp = torch.load(args.ckpt_interp, map_location="cpu") if os.path.exists(args.ckpt_interp) else {}
         if "model" not in payload_interp:
             raise FileNotFoundError(f"Checkpoint not found or invalid: {args.ckpt_interp}")
-        interp_meta = payload_interp.get("meta", {}) if isinstance(payload_interp, dict) else {}
-        if interp_meta and not args.override_meta:
+        if interp_meta and not bool(args.override_interp_meta):
             if interp_meta.get("cond_start_goal") is not None:
                 interp_cond = bool(interp_meta.get("cond_start_goal"))
             elif interp_meta.get("use_start_goal") is not None:
@@ -411,17 +693,17 @@ def main():
                 if interp_anchor_conf != bool(args.anchor_conf):
                     raise ValueError(
                         f"Stage2 checkpoint anchor_conf mismatch: ckpt={interp_anchor_conf} args={bool(args.anchor_conf)}. "
-                        "Use --override_meta 1 to force."
+                        "Use --override_interp_meta 1 to force."
                     )
-            if interp_cond is not None and interp_cond != bool(args.cond_start_goal):
+            if interp_cond is not None and interp_cond != bool(cond_start_goal_s2):
                 raise ValueError(
-                    f"Stage2 checkpoint cond_start_goal mismatch: ckpt={interp_cond} args={bool(args.cond_start_goal)}. "
-                    "Use --override_meta 1 to force."
+                    f"Stage2 checkpoint cond_start_goal mismatch: ckpt={interp_cond} args={bool(cond_start_goal_s2)}. "
+                    "Use --override_interp_meta 1 to force."
                 )
             if interp_clamp is not None and interp_clamp != bool(args.clamp_endpoints):
                 raise ValueError(
                     f"Stage2 checkpoint clamp_endpoints mismatch: ckpt={interp_clamp} args={bool(args.clamp_endpoints)}. "
-                    "Use --override_meta 1 to force."
+                    "Use --override_interp_meta 1 to force."
                 )
         interp_model.load_state_dict(payload_interp["model"])
 
@@ -520,6 +802,23 @@ def main():
         pos_low = getattr(dataset, "pos_low", None)
         pos_scale = getattr(dataset, "pos_scale", None)
         flip_y = bool(getattr(dataset, "flip_y", False))
+        if dataset_name == "d4rl_prepared" and args.prepared_path:
+            meta_dir = os.path.dirname(args.prepared_path)
+            meta_candidates = [
+                os.path.join(meta_dir, "meta.json"),
+                os.path.splitext(args.prepared_path)[0] + "_meta.json",
+            ]
+            for meta_path in meta_candidates:
+                if not os.path.exists(meta_path):
+                    continue
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta_prepared = json.load(f)
+                    if meta_prepared is not None and "d4rl_flip_y" in meta_prepared:
+                        flip_y = bool(meta_prepared.get("d4rl_flip_y"))
+                        break
+                except Exception:
+                    continue
         if mj_walls and pos_low is not None and pos_scale is not None:
             mj_walls_norm = _normalize_walls(mj_walls, pos_low, pos_scale, flip_y)
         if maze_scale is None and maze_map is not None and pos_scale is not None:
@@ -550,6 +849,8 @@ def main():
         if n == 1:
             axes = [axes]
         h, w = occ.shape
+        scale_w = max(w - 1, 1)
+        scale_h = max(h - 1, 1)
         for ax, panel in zip(axes, panels):
             traj = panel["traj"]
             label = panel["label"]
@@ -557,21 +858,25 @@ def main():
             kp = panel.get("kp", None)
             sg = panel.get("sg", None)
             footer = panel.get("footer", None)
-            ax.imshow(occ, cmap="gray_r", origin="upper")
+            origin = "upper" if flip_y else "lower"
+            ax.imshow(occ, cmap="gray_r", origin=origin)
             xy = traj[:, :2]
             if bool(args.plot_points):
                 base_color = "0.6" if (kp is not None and kp.size > 0) else "tab:blue"
-                ax.scatter(xy[:, 0] * w, xy[:, 1] * h, color=base_color, s=6)
+                ax.scatter(xy[:, 0] * scale_w, xy[:, 1] * scale_h, color=base_color, s=6)
             else:
-                ax.plot(xy[:, 0] * w, xy[:, 1] * h, color="tab:blue", linewidth=2.0)
+                ax.plot(xy[:, 0] * scale_w, xy[:, 1] * scale_h, color="tab:blue", linewidth=2.0)
             if sg is not None and sg.shape[0] >= 4:
-                ax.scatter([sg[0] * w], [sg[1] * h], s=25, color="tab:green")
-                ax.scatter([sg[2] * w], [sg[3] * h], s=40, color="tab:red", marker="x")
+                ax.scatter([sg[0] * scale_w], [sg[1] * scale_h], s=25, color="tab:green")
+                ax.scatter([sg[2] * scale_w], [sg[3] * scale_h], s=40, color="tab:red", marker="x")
             if kp is not None and kp.size > 0:
-                ax.scatter(kp[:, 0] * w, kp[:, 1] * h, s=20, color="tab:orange")
+                ax.scatter(kp[:, 0] * scale_w, kp[:, 1] * scale_h, s=20, color="tab:orange")
             ax.set_title(f"{label} | coll={coll:.3f}", fontsize=9)
-            ax.set_xlim([0, w])
-            ax.set_ylim([h, 0])
+            ax.set_xlim([0, scale_w])
+            if flip_y:
+                ax.set_ylim([scale_h, 0])
+            else:
+                ax.set_ylim([0, scale_h])
             ax.set_xticks([])
             ax.set_yticks([])
             if footer:
@@ -609,6 +914,8 @@ def main():
     start_goal_list = []
     difficulty_list = []
     steps_list = []
+    occ_list = []
+    sdf_list = []
     occ_np = None
     sdf_np = None
     run_config = {
@@ -641,6 +948,7 @@ def main():
                 if x0_gt is not None:
                     x0_gt = x0_gt.to(device)
                 B = cond["start_goal"].shape[0]
+                selector_logits = None
                 use_cache = cache is not None
                 if use_cache:
                     if idx_global + B > cache["idx"].shape[0]:
@@ -648,6 +956,17 @@ def main():
                     idx = cache["idx"][idx_global : idx_global + B].to(device)
                     z_pred = cache["z_pred"][idx_global : idx_global + B].to(device)
                     x_pred = cache["x_pred"][idx_global : idx_global + B].to(device)
+                    if bool(args.clamp_endpoints) and "start_goal" in cond:
+                        sg = cond["start_goal"]
+                        start = sg[:, :2]
+                        goal = sg[:, 2:]
+                        err_start = (x_pred[:, 0, :2] - start).abs().max().item()
+                        err_goal = (x_pred[:, -1, :2] - goal).abs().max().item()
+                        if err_start > 1e-4 or err_goal > 1e-4:
+                            raise ValueError(
+                                "stage1_cache endpoints mismatch with current start_goal. "
+                                "Clear cache or set STAGE1_CACHE_MODE=none."
+                            )
                     masks = torch.zeros((B, args.T), device=device, dtype=torch.bool)
                     masks.scatter_(1, idx, True)
                     z_steps = None
@@ -656,10 +975,43 @@ def main():
                         idx, masks = sample_fixed_k_indices_batch(
                             B, args.T, args.K_min, generator=gen, device=device, ensure_endpoints=True
                         )
-                    else:
+                    elif args.kp_index_mode in {"uniform", "uniform_jitter"}:
                         jitter = args.kp_jitter if args.kp_index_mode == "uniform_jitter" else 0.0
                         idx, masks = sample_fixed_k_indices_uniform_batch(
                             B, args.T, args.K_min, generator=gen, device=device, ensure_endpoints=True, jitter=jitter
+                        )
+                    else:
+                        if selector_model is None:
+                            raise ValueError("kp_index_mode=selector but selector model not loaded")
+                        with torch.no_grad():
+                            if selector_use_level:
+                                if selector_level_mode == "s_norm":
+                                    level_val = float(args.levels) / float(max(1, args.levels))
+                                else:
+                                    level_val = float(args.K_min) / float(max(1, args.T - 1))
+                                cond_sel = dict(cond)
+                                cond_sel["level"] = torch.full((B, 1), level_val, device=device)
+                                logits = selector_model(cond_sel)
+                            else:
+                                logits = selector_model(cond)
+                        idx = select_topk_indices(logits, args.K_min)
+                        masks = torch.zeros((B, args.T), device=device, dtype=torch.bool)
+                        masks.scatter_(1, idx, True)
+                    selector_logits = logits if args.kp_index_mode == "selector" else None
+
+                    if bool(args.use_kp_feat) and int(args.kp_feat_dim) > 0:
+                        left_diff = None
+                        right_diff = None
+                        if dphi_model is not None:
+                            seg_feat_sel = build_segment_features_from_idx(idx, args.T, dphi_seg_feat_dim)
+                            seg_cost = dphi_model(cond, seg_feat_sel)
+                            K = idx.shape[1]
+                            left_diff = torch.zeros((B, K), device=device, dtype=torch.float32)
+                            right_diff = torch.zeros((B, K), device=device, dtype=torch.float32)
+                            left_diff[:, 1:] = seg_cost
+                            right_diff[:, :-1] = seg_cost
+                        cond["kp_feat"] = _kp_feat_from_idx(
+                            idx, args.T, int(args.kp_feat_dim), left_diff, right_diff
                         )
 
                     # Predicted keypoints (Stage 1).
@@ -680,6 +1032,9 @@ def main():
                             args.T,
                             schedule_name=args.ddim_schedule,
                             return_intermediates=True,
+                            pos_clip=bool(args.pos_clip) and not bool(args.logit_space),
+                            pos_clip_min=args.pos_clip_min,
+                            pos_clip_max=args.pos_clip_max,
                         )
                     else:
                         z_pred = _sample_keypoints_ddim(
@@ -692,6 +1047,9 @@ def main():
                             args.ddim_steps,
                             args.T,
                             schedule_name=args.ddim_schedule,
+                            pos_clip=bool(args.pos_clip) and not bool(args.logit_space),
+                            pos_clip_min=args.pos_clip_min,
+                            pos_clip_max=args.pos_clip_max,
                         )
                         z_steps = None
                     if args.logit_space:
@@ -734,23 +1092,86 @@ def main():
                 if args.skip_stage2 or interp_model is None:
                     x_hat = x_pred
                 elif args.stage2_mode == "adj":
-                    masks_levels, _ = build_nested_masks_from_base(
-                        idx,
-                        args.T,
-                        args.levels,
-                        generator=gen,
-                        device=device,
-                        k_schedule=args.k_schedule,
-                        k_geom_gamma=args.k_geom_gamma,
-                    )
+                    if args.kp_index_mode == "selector":
+                        if selector_model is None:
+                            raise ValueError("kp_index_mode=selector but selector model not loaded")
+                        if selector_use_level:
+                            k_list = _compute_k_schedule(
+                                args.T, args.K_min, args.levels, schedule=args.k_schedule, geom_gamma=args.k_geom_gamma
+                            )
+                            logits_levels = []
+                            for s in range(args.levels + 1):
+                                if selector_level_mode == "s_norm":
+                                    level_val = float(s) / float(max(1, args.levels))
+                                else:
+                                    level_val = float(k_list[s]) / float(max(1, args.T - 1))
+                                cond_sel = dict(cond)
+                                cond_sel["level"] = torch.full((B, 1), level_val, device=device)
+                                with torch.no_grad():
+                                    logits_s = selector_model(cond_sel)
+                                logits_levels.append(logits_s)
+                            logits_levels = torch.stack(logits_levels, dim=1)
+                            masks_levels, _ = build_nested_masks_from_level_logits(
+                                logits_levels,
+                                args.K_min,
+                                args.levels,
+                                k_schedule=args.k_schedule,
+                                k_geom_gamma=args.k_geom_gamma,
+                            )
+                        else:
+                            if selector_logits is None:
+                                with torch.no_grad():
+                                    selector_logits = selector_model(cond)
+                            masks_levels, _ = build_nested_masks_from_logits(
+                                selector_logits,
+                                args.K_min,
+                                args.levels,
+                                k_schedule=args.k_schedule,
+                                k_geom_gamma=args.k_geom_gamma,
+                            )
+                    else:
+                        masks_levels, _ = build_nested_masks_from_base(
+                            idx,
+                            args.T,
+                            args.levels,
+                            generator=gen,
+                            device=device,
+                            k_schedule=args.k_schedule,
+                            k_geom_gamma=args.k_geom_gamma,
+                        )
+                    sigma_levels = None
+                    if args.s2_sample_noise_mode == "level":
+                        k_list = _compute_k_schedule(
+                            args.T, args.K_min, args.levels, schedule=args.k_schedule, geom_gamma=args.k_geom_gamma
+                        )
+                        sigma_levels = [
+                            _compute_sigma_for_level(
+                                int(k_list[s]),
+                                args.K_min,
+                                s2_corrupt_sigma_max,
+                                s2_corrupt_sigma_min,
+                                s2_corrupt_sigma_pow,
+                            )
+                            for s in range(args.levels + 1)
+                        ]
                     x_curr = x_pred
                     if args.save_diffusion_frames:
                         stage2_steps = []
                     for s in range(args.levels, 0, -1):
                         mask_s = masks_levels[:, s]
                         mask_prev = masks_levels[:, s - 1]
-                        if args.anchor_conf and conf_pred is not None:
-                            conf_s = _anneal_conf(conf_pred, s, args.levels, args.anchor_conf_anneal_mode)
+                        if args.anchor_conf:
+                            conf_s = _build_anchor_conf(
+                                mask_s,
+                                None,
+                                False,
+                                args.anchor_conf_teacher,
+                                args.anchor_conf_student,
+                                args.anchor_conf_endpoints,
+                                args.anchor_conf_missing,
+                                bool(args.clamp_endpoints),
+                            )
+                            conf_s = _anneal_conf(conf_s, s, args.levels, args.anchor_conf_anneal_mode)
                             mask_in = torch.stack([mask_s.float(), mask_prev.float(), conf_s], dim=-1)
                         else:
                             conf_s = None
@@ -758,11 +1179,17 @@ def main():
                         s_level = torch.full((B,), s, device=device, dtype=torch.long)
                         delta_hat = interp_model(x_curr, s_level, mask_in, cond)
                         x_curr = x_curr + delta_hat
+                        if args.s2_sample_noise_mode != "none":
+                            if args.s2_sample_noise_mode == "constant":
+                                sigma = float(args.s2_sample_noise_sigma)
+                            else:
+                                sigma = float(sigma_levels[s]) if sigma_levels is not None else 0.0
+                            x_curr = _apply_s2_noise(x_curr, mask_s, sigma, args.s2_sample_noise_scale)
                         if args.soft_anchor_clamp and conf_s is not None:
                             lam = _soft_clamp_lambda(s, args.levels, args.soft_clamp_schedule, args.soft_clamp_max)
                             x_curr = apply_soft_clamp(x_curr, x_pred, conf_s, lam, args.clamp_dims)
                         if args.clamp_policy == "all_anchors":
-                            clamp_mask = masks
+                            clamp_mask = mask_s
                         elif args.clamp_policy == "endpoints":
                             clamp_mask = torch.zeros_like(mask_s)
                             clamp_mask[:, 0] = True
@@ -771,6 +1198,8 @@ def main():
                             clamp_mask = None
                         if clamp_mask is not None:
                             x_curr = apply_clamp(x_curr, x_pred, clamp_mask, args.clamp_dims)
+                        if args.pos_clip:
+                            x_curr[:, :, :2] = x_curr[:, :, :2].clamp(min=args.pos_clip_min, max=args.pos_clip_max)
                         if stage2_steps is not None:
                             stage2_steps.append(x_curr.detach().clone())
                     x_hat = x_curr
@@ -798,11 +1227,17 @@ def main():
                             s_level = torch.full((B,), s, device=device, dtype=torch.long)
                             delta_hat = interp_model(x_curr, s_level, mask_in, cond)
                             x_curr = x_curr + delta_hat
+                            if args.s2_sample_noise_mode != "none":
+                                if args.s2_sample_noise_mode == "constant":
+                                    sigma = float(args.s2_sample_noise_sigma)
+                                else:
+                                    sigma = float(sigma_levels[s]) if sigma_levels is not None else 0.0
+                                x_curr = _apply_s2_noise(x_curr, mask_s, sigma, args.s2_sample_noise_scale)
                             if args.soft_anchor_clamp and conf_s is not None:
                                 lam = _soft_clamp_lambda(s, args.levels, args.soft_clamp_schedule, args.soft_clamp_max)
                                 x_curr = apply_soft_clamp(x_curr, x_oracle, conf_s, lam, args.clamp_dims)
                             if args.clamp_policy == "all_anchors":
-                                clamp_mask = masks
+                                clamp_mask = mask_s
                             elif args.clamp_policy == "endpoints":
                                 clamp_mask = torch.zeros_like(mask_s)
                                 clamp_mask[:, 0] = True
@@ -811,7 +1246,9 @@ def main():
                                 clamp_mask = None
                             if clamp_mask is not None:
                                 x_curr = apply_clamp(x_curr, x_oracle, clamp_mask, args.clamp_dims)
-                        x_hat_oracle = x_curr
+                            if args.pos_clip:
+                                x_curr[:, :, :2] = x_curr[:, :, :2].clamp(min=args.pos_clip_min, max=args.pos_clip_max)
+                            x_hat_oracle = x_curr
                 else:
                     s_level = torch.full((B,), args.levels, device=device, dtype=torch.long)
                     if args.anchor_conf and conf_pred is not None:
@@ -821,6 +1258,18 @@ def main():
                         mask_in = masks
                     delta_hat = interp_model(x_pred, s_level, mask_in, cond)
                     x_hat = x_pred + delta_hat
+                    if args.s2_sample_noise_mode != "none":
+                        if args.s2_sample_noise_mode == "constant":
+                            sigma = float(args.s2_sample_noise_sigma)
+                        else:
+                            sigma = _compute_sigma_for_level(
+                                int(args.K_min),
+                                args.K_min,
+                                s2_corrupt_sigma_max,
+                                s2_corrupt_sigma_min,
+                                s2_corrupt_sigma_pow,
+                            )
+                        x_hat = _apply_s2_noise(x_hat, masks, sigma, args.s2_sample_noise_scale)
                     if args.soft_anchor_clamp and conf_pred is not None:
                         lam = _soft_clamp_lambda(args.levels, args.levels, args.soft_clamp_schedule, args.soft_clamp_max)
                         x_hat = apply_soft_clamp(x_hat, x_pred, conf_pred, lam, args.clamp_dims)
@@ -853,6 +1302,18 @@ def main():
                             mask_in = masks
                         delta_hat = interp_model(x_oracle, s_level, mask_in, cond)
                         x_hat_oracle = x_oracle + delta_hat
+                        if args.s2_sample_noise_mode != "none":
+                            if args.s2_sample_noise_mode == "constant":
+                                sigma = float(args.s2_sample_noise_sigma)
+                            else:
+                                sigma = _compute_sigma_for_level(
+                                    int(args.K_min),
+                                    args.K_min,
+                                    s2_corrupt_sigma_max,
+                                    s2_corrupt_sigma_min,
+                                    s2_corrupt_sigma_pow,
+                                )
+                            x_hat_oracle = _apply_s2_noise(x_hat_oracle, masks, sigma, args.s2_sample_noise_scale)
                         if args.soft_anchor_clamp and conf_oracle is not None:
                             lam = _soft_clamp_lambda(args.levels, args.levels, args.soft_clamp_schedule, args.soft_clamp_max)
                             x_hat_oracle = apply_soft_clamp(x_hat_oracle, x_oracle, conf_oracle, lam, args.clamp_dims)
@@ -914,6 +1375,12 @@ def main():
                     )
 
                     if args.save_npz:
+                        occ_list.append(occ_t.detach().cpu().numpy())
+                        if "sdf" in cond:
+                            sdf_t = cond["sdf"][b]
+                            if sdf_t.dim() == 3:
+                                sdf_t = sdf_t[0]
+                            sdf_list.append(sdf_t.detach().cpu().numpy())
                         if occ_np is None:
                             occ_np = occ_t.detach().cpu().numpy()
                         if sdf_np is None and "sdf" in cond:
@@ -1005,6 +1472,7 @@ def main():
                                     out_path=out_path,
                                     plot_points=bool(args.plot_points),
                                     keypoints=kps,
+                                    flip_y=flip_y,
                                 )
                             elif mj_walls_norm is not None:
                                 norm_trajs = [interp_np[:, :2], refined_np[:, :2]]
@@ -1035,7 +1503,14 @@ def main():
                                 )
                             else:
                                 occ = occ_t.detach().cpu().numpy()
-                                plot_trajectories(occ, trajs, labels, out_path=out_path, plot_points=bool(args.plot_points))
+                                plot_trajectories(
+                                    occ,
+                                    trajs,
+                                    labels,
+                                    out_path=out_path,
+                                    plot_points=bool(args.plot_points),
+                                    flip_y=flip_y,
+                                )
 
                     if args.save_debug and args.save_diffusion_frames and z_steps is not None:
                         frames_dir = os.path.join(args.out_dir, "diffusion_steps", f"sample_{idx_global:04d}")
@@ -1059,6 +1534,7 @@ def main():
                                     footer=footer,
                                     plot_points=bool(args.plot_points),
                                     keypoints=[z_step[0].detach().cpu().numpy()[:, :2]] if args.plot_keypoints else None,
+                                    flip_y=flip_y,
                                 )
                             elif mj_walls_norm is not None:
                                 plot_maze2d_geom_walls(
@@ -1092,6 +1568,7 @@ def main():
                                     out_path=frame_path,
                                     plot_points=bool(args.plot_points),
                                     keypoints=[z_step[0].detach().cpu().numpy()[:, :2]] if args.plot_keypoints else None,
+                                    flip_y=flip_y,
                                 )
                         if args.frames_include_stage2 and not args.skip_stage2:
                             base = len(step_indices)
@@ -1106,6 +1583,7 @@ def main():
                                         out_path=frame_path,
                                         footer=footer,
                                         plot_points=bool(args.plot_points),
+                                        flip_y=flip_y,
                                     )
                                 elif mj_walls_norm is not None:
                                     plot_maze2d_geom_walls(
@@ -1137,6 +1615,7 @@ def main():
                                         out_path=frame_path,
                                         footer=footer,
                                         plot_points=bool(args.plot_points),
+                                        flip_y=flip_y,
                                     )
 
                             if stage2_steps is not None and len(stage2_steps) > 0:
@@ -1197,9 +1676,13 @@ def main():
             save_kwargs["gt"] = np.stack(gt_list, axis=0)
         if difficulty_list:
             save_kwargs["difficulty"] = np.asarray(difficulty_list, dtype=np.int64)
-        if occ_np is not None:
+        if occ_list:
+            save_kwargs["occ"] = np.stack(occ_list, axis=0)
+        elif occ_np is not None:
             save_kwargs["occ"] = occ_np
-        if sdf_np is not None:
+        if sdf_list:
+            save_kwargs["sdf"] = np.stack(sdf_list, axis=0)
+        elif sdf_np is not None:
             save_kwargs["sdf"] = sdf_np
         if args.save_steps_npz and steps_list:
             save_kwargs["interp_steps"] = np.stack(steps_list, axis=0)

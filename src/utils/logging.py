@@ -9,6 +9,12 @@ class NullWriter:
     def add_histogram(self, *args, **kwargs):
         return None
 
+    def add_text(self, *args, **kwargs):
+        return None
+
+    def add_hparams(self, *args, **kwargs):
+        return None
+
     def flush(self):
         return None
 

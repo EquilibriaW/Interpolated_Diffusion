@@ -379,6 +379,7 @@ class D4RLMazeDataset(Dataset):
         turn_angle_deg: float = 30.0,
         episode_split_mod: Optional[int] = None,
         episode_split_val: int = 0,
+        require_accept: bool = False,
     ):
         gym = _maybe_import_d4rl()
         env = gym.make(env_id)
@@ -403,6 +404,7 @@ class D4RLMazeDataset(Dataset):
         self.turn_angle_deg = turn_angle_deg
         self.episode_split_mod = episode_split_mod
         self.episode_split_val = episode_split_val
+        self.require_accept = bool(require_accept)
 
         self.obs = dataset["observations"].astype(np.float32)
         terminals = dataset.get("terminals")
@@ -505,7 +507,7 @@ class D4RLMazeDataset(Dataset):
                     # D4RL pointmaze observations are in grid index coordinates (0..W-1),
                     # not offset by +0.5 like the wall geom centers.
                     low = np.array([0.0, 0.0], dtype=np.float32)
-                    high = np.array([w * float(scale), h * float(scale)], dtype=np.float32)
+                    high = np.array([(w - 1) * float(scale), (h - 1) * float(scale)], dtype=np.float32)
 
         if low is None or high is None:
             try:
@@ -596,22 +598,12 @@ class D4RLMazeDataset(Dataset):
                 sample["cond"]["sdf"] = self.sdf
             return sample
 
-        gen = torch.Generator()
-        gen.manual_seed(self.seed + idx)
-        sample = _draw(gen)
-        if (
-            self.max_collision_rate is None
-            and self.min_goal_dist is None
-            and self.min_path_len is None
-            and self.min_tortuosity is None
-            and self.min_turns is None
-        ):
-            return sample
-
-        for attempt in range(self.max_resample_tries):
+        def _check(sample):
+            stats = {}
             accept = True
             if self.max_collision_rate is not None:
                 coll = collision_rate(sample["cond"]["occ"][0], sample["x"])
+                stats["collision_rate"] = float(coll)
                 if coll > float(self.max_collision_rate):
                     accept = False
             if accept and self.min_goal_dist is not None:
@@ -620,11 +612,13 @@ class D4RLMazeDataset(Dataset):
                 sg[:2] = sg[:2] * self.pos_scale[:2] + self.pos_low[:2]
                 sg[2:] = sg[2:] * self.pos_scale[:2] + self.pos_low[:2]
                 goal_dist = torch.norm(sg[:2] - sg[2:]).item()
+                stats["goal_dist"] = float(goal_dist)
                 if goal_dist < float(self.min_goal_dist):
                     accept = False
             if accept and self.min_path_len is not None:
                 traj = sample["x"][:, :2] * self.pos_scale[:2] + self.pos_low[:2]
                 path_len = torch.norm(traj[1:] - traj[:-1], dim=-1).sum().item()
+                stats["path_len"] = float(path_len)
                 if path_len < float(self.min_path_len):
                     accept = False
             if accept and (self.min_tortuosity is not None or self.min_turns is not None):
@@ -635,6 +629,7 @@ class D4RLMazeDataset(Dataset):
                 straight = torch.norm(traj[-1] - traj[0]).item()
                 if self.min_tortuosity is not None:
                     tort = path_len / max(straight, 1e-6)
+                    stats["tortuosity"] = float(tort)
                     if tort < float(self.min_tortuosity):
                         accept = False
                 if accept and self.min_turns is not None:
@@ -652,12 +647,35 @@ class D4RLMazeDataset(Dataset):
                         turns = int((angles >= thresh).sum().item())
                     else:
                         turns = 0
+                    stats["turns"] = int(turns)
                     if turns < int(self.min_turns):
                         accept = False
+            return accept, stats
+
+        gen = torch.Generator()
+        gen.manual_seed(self.seed + idx)
+        sample = _draw(gen)
+        if (
+            self.max_collision_rate is None
+            and self.min_goal_dist is None
+            and self.min_path_len is None
+            and self.min_tortuosity is None
+            and self.min_turns is None
+        ):
+            return sample
+
+        last_stats = {}
+        for attempt in range(self.max_resample_tries):
+            accept, last_stats = _check(sample)
             if accept:
                 return sample
             gen.manual_seed(self.seed + idx + (attempt + 1) * 1000003)
             sample = _draw(gen)
+        if self.require_accept:
+            raise RuntimeError(
+                f"D4RLMazeDataset: failed to satisfy constraints after {self.max_resample_tries} tries. "
+                f"stats={last_stats}"
+            )
         return sample
 
 
@@ -671,26 +689,59 @@ class PreparedTrajectoryDataset(Dataset):
         if occ.ndim == 2:
             occ = occ[None, ...]
         self.occ = occ
+        self.occ_per_sample = occ.ndim == 3 and occ.shape[0] == self.x.shape[0]
         self.sdf = None
         if use_sdf and "sdf" in data:
             sdf = data["sdf"].astype(np.float32)
             if sdf.ndim == 2:
                 sdf = sdf[None, ...]
             self.sdf = sdf
+        self.sdf_per_sample = False
+        if self.sdf is not None and self.sdf.ndim == 3 and self.sdf.shape[0] == self.x.shape[0]:
+            self.sdf_per_sample = True
+        self.kp_idx = data.get("kp_idx")
+        if self.kp_idx is not None:
+            self.kp_idx = self.kp_idx.astype(np.int64)
+        self.kp_feat = data.get("kp_feat")
+        if self.kp_feat is not None:
+            self.kp_feat = self.kp_feat.astype(np.float32)
+        self.kp_mask_levels = data.get("kp_mask_levels")
+        if self.kp_mask_levels is not None:
+            self.kp_mask_levels = self.kp_mask_levels.astype(np.bool_)
+        self.kp_mask_levels_per_sample = False
+        if self.kp_mask_levels is not None and self.kp_mask_levels.ndim == 3 and self.kp_mask_levels.shape[0] == self.x.shape[0]:
+            self.kp_mask_levels_per_sample = True
 
     def __len__(self):
         return self.x.shape[0]
 
     def __getitem__(self, idx: int):
+        occ = self.occ[idx] if self.occ_per_sample else self.occ
+        if occ.ndim == 2:
+            occ = occ[None, ...]
+        sdf = None
+        if self.sdf is not None:
+            sdf = self.sdf[idx] if self.sdf_per_sample else self.sdf
+            if sdf.ndim == 2:
+                sdf = sdf[None, ...]
         sample = {
             "x": torch.from_numpy(self.x[idx]),
             "cond": {
-                "occ": torch.from_numpy(self.occ),
+                "occ": torch.from_numpy(occ),
                 "start_goal": torch.from_numpy(self.start_goal[idx]),
             },
         }
+        if self.kp_idx is not None:
+            sample["cond"]["kp_idx"] = torch.from_numpy(self.kp_idx[idx])
+        if self.kp_feat is not None:
+            sample["cond"]["kp_feat"] = torch.from_numpy(self.kp_feat[idx])
+        if self.kp_mask_levels is not None:
+            if self.kp_mask_levels_per_sample:
+                sample["cond"]["kp_mask_levels"] = torch.from_numpy(self.kp_mask_levels[idx])
+            else:
+                sample["cond"]["kp_mask_levels"] = torch.from_numpy(self.kp_mask_levels)
         if self.difficulty is not None:
             sample["difficulty"] = torch.tensor(int(self.difficulty[idx]), dtype=torch.int64)
-        if self.sdf is not None:
-            sample["cond"]["sdf"] = torch.from_numpy(self.sdf)
+        if sdf is not None:
+            sample["cond"]["sdf"] = torch.from_numpy(sdf)
         return sample

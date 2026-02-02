@@ -30,6 +30,7 @@ def main() -> None:
     p.add_argument("--goal_mode", type=str, default="window_end", choices=["env", "window_end"])
     p.add_argument("--episode_split_mod", type=int, default=None)
     p.add_argument("--episode_split_val", type=int, default=0)
+    p.add_argument("--require_accept", type=int, default=0)
     p.add_argument("--max_collision_rate", type=float, default=0.0)
     p.add_argument("--max_resample_tries", type=int, default=200)
     p.add_argument("--min_goal_dist", type=float, default=6.0)
@@ -71,6 +72,7 @@ def main() -> None:
         goal_mode=args.goal_mode,
         episode_split_mod=args.episode_split_mod,
         episode_split_val=args.episode_split_val,
+        require_accept=bool(args.require_accept),
     )
 
     easy_ds = D4RLMazeDataset(
@@ -93,6 +95,7 @@ def main() -> None:
         goal_mode=args.goal_mode,
         episode_split_mod=args.episode_split_mod,
         episode_split_val=args.episode_split_val,
+        require_accept=bool(args.require_accept),
     )
 
     first = hard_ds[0] if n_hard > 0 else easy_ds[0]
@@ -163,6 +166,7 @@ def main() -> None:
         "easy_min_tortuosity": args.easy_min_tortuosity,
         "easy_min_turns": args.easy_min_turns,
         "easy_turn_angle_deg": args.easy_turn_angle_deg,
+        "require_accept": bool(args.require_accept),
     }
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)

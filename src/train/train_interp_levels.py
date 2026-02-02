@@ -8,17 +8,29 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.corruptions.keyframes import build_nested_masks_batch, interpolate_from_indices
+from src.corruptions.keyframes import (
+    _compute_k_schedule,
+    build_nested_masks_batch,
+    build_nested_masks_from_base,
+    build_nested_masks_from_level_logits,
+    build_nested_masks_from_logits,
+    interpolate_from_indices,
+    sample_fixed_k_indices_uniform_batch,
+)
 from src.data.dataset import D4RLMazeDataset, ParticleMazeDataset, PreparedTrajectoryDataset
 from src.diffusion.ddpm import _timesteps, ddim_step
 from src.diffusion.schedules import make_alpha_bars, make_beta_schedule
 from src.models.denoiser_interp_levels import InterpLevelDenoiser
 from src.models.denoiser_keypoints import KeypointDenoiser
+from src.models.keypoint_selector import KeypointSelector, select_topk_indices
+from src.models.segment_cost import SegmentCostPredictor
+from src.selection.epiplexity_dp import build_segment_features, build_segment_precompute
 from src.utils.checkpoint import load_checkpoint, save_checkpoint
 from src.utils.device import get_autocast_dtype, get_device
 from src.utils.ema import EMA
 from src.utils.logging import create_writer
 from src.utils.normalize import logit_pos, sigmoid_pos
+from src.utils.run_config import write_run_config
 from src.utils.seed import get_seed_from_env, set_seed
 
 
@@ -28,6 +40,26 @@ def build_argparser():
     p.add_argument("--K_min", type=int, default=8)
     p.add_argument("--levels", type=int, default=3)
     p.add_argument("--stage2_mode", type=str, default="adj", choices=["x0", "adj"])
+    p.add_argument(
+        "--kp_index_mode",
+        type=str,
+        default="random",
+        choices=["random", "uniform", "dp_precomputed", "selector"],
+    )
+    p.add_argument(
+        "--mask_policy_mix",
+        type=str,
+        default="",
+        help="Optional mix for stage-2 masks, e.g. 'selector:0.5,uniform:0.5'. Overrides kp_index_mode per batch.",
+    )
+    p.add_argument("--selector_ckpt", type=str, default=None)
+    p.add_argument("--selector_use_ema", type=int, default=1)
+    p.add_argument("--s2_d_model", type=int, default=384)
+    p.add_argument("--s2_n_layers", type=int, default=12)
+    p.add_argument("--s2_n_heads", type=int, default=12)
+    p.add_argument("--s2_d_ff", type=int, default=1536)
+    p.add_argument("--s2_d_cond", type=int, default=128)
+    p.add_argument("--s2_maze_channels", type=str, default="32,64,128,128")
     p.add_argument("--level_sampling", type=str, default="high", choices=["uniform", "high"])
     p.add_argument("--level_high_prob", type=float, default=0.5)
     p.add_argument("--batch", type=int, default=256)
@@ -93,7 +125,7 @@ def build_argparser():
     p.add_argument("--anchor_conf_missing", type=float, default=0.0)
     p.add_argument("--anchor_conf_anneal", type=int, default=1)
     p.add_argument("--anchor_conf_anneal_mode", type=str, default="linear", choices=["linear", "cosine", "none"])
-    p.add_argument("--corrupt_mode", type=str, default="dist", choices=["none", "dist"])
+    p.add_argument("--corrupt_mode", type=str, default="dist", choices=["none", "dist", "gauss"])
     p.add_argument("--corrupt_sigma_max", type=float, default=0.08)
     p.add_argument("--corrupt_sigma_min", type=float, default=0.012)
     p.add_argument("--corrupt_sigma_pow", type=float, default=0.75)
@@ -101,8 +133,13 @@ def build_argparser():
     p.add_argument("--corrupt_index_jitter_max", type=int, default=0)
     p.add_argument("--corrupt_index_jitter_prob", type=float, default=0.0)
     p.add_argument("--corrupt_index_jitter_pow", type=float, default=1.0)
+    p.add_argument("--pos_clip", type=int, default=0)
+    p.add_argument("--pos_clip_min", type=float, default=0.0)
+    p.add_argument("--pos_clip_max", type=float, default=1.0)
     p.add_argument("--debug_corrupt_stats", type=int, default=0)
     p.add_argument("--debug_corrupt_every", type=int, default=500)
+    p.add_argument("--dphi_ckpt", type=str, default=None)
+    p.add_argument("--dphi_use_ema", type=int, default=1)
     return p
 
 
@@ -127,6 +164,37 @@ def _build_known_mask_values(
         known_values[:, :, :2] = torch.where(mask_start, start_pos, known_values[:, :, :2])
         known_values[:, :, :2] = torch.where(mask_goal, goal_pos, known_values[:, :, :2])
     return known_mask, known_values
+
+
+def _kp_feat_from_idx(
+    idx: torch.Tensor,
+    T: int,
+    kp_feat_dim: int,
+    left_diff: torch.Tensor | None = None,
+    right_diff: torch.Tensor | None = None,
+) -> torch.Tensor:
+    B, K = idx.shape
+    feat = torch.zeros((B, K, kp_feat_dim), device=idx.device, dtype=torch.float32)
+    if kp_feat_dim <= 0:
+        return feat
+    denom = float(max(1, T - 1))
+    if kp_feat_dim >= 3:
+        feat[:, :, 2] = idx.float() / denom
+    if K > 1:
+        gaps = (idx[:, 1:] - idx[:, :-1]).float() / denom
+        feat[:, 1:, 0] = gaps
+        feat[:, :-1, 1] = gaps
+    if kp_feat_dim >= 5 and left_diff is not None and right_diff is not None:
+        feat[:, :, 3] = left_diff
+        feat[:, :, 4] = right_diff
+    return feat
+
+
+def _parse_int_list(spec: str) -> tuple[int, ...]:
+    parts = [p.strip() for p in str(spec).split(",") if p.strip()]
+    if not parts:
+        raise ValueError("empty int list")
+    return tuple(int(p) for p in parts)
 
 
 def _sample_keypoints_ddim(
@@ -175,6 +243,9 @@ def build_interp_level_batch(
     corrupt_index_jitter_prob: float = 0.0,
     corrupt_index_jitter_pow: float = 1.0,
     clamp_endpoints: bool = True,
+    pos_clip: bool = False,
+    pos_clip_min: float = 0.0,
+    pos_clip_max: float = 1.0,
 ):
     B, T, D = x0.shape
     device = x0.device
@@ -207,11 +278,14 @@ def build_interp_level_batch(
                 anchor_sigma,
                 jitter,
                 corrupt_index_jitter_prob,
+                corrupt_mode,
                 clamp_endpoints,
                 recompute_velocity,
             )
         else:
             xs = interpolate_from_indices(idx, vals, T, recompute_velocity=recompute_velocity)
+        if pos_clip:
+            xs[..., :2] = xs[..., :2].clamp(min=pos_clip_min, max=pos_clip_max)
         x_s[sel] = xs
         mask_s[sel] = masks_levels[sel, s]
     return x_s, mask_s, s_idx, masks_levels, idx_levels
@@ -236,6 +310,9 @@ def build_interp_adjacent_batch(
     corrupt_index_jitter_prob: float = 0.0,
     corrupt_index_jitter_pow: float = 1.0,
     clamp_endpoints: bool = True,
+    pos_clip: bool = False,
+    pos_clip_min: float = 0.0,
+    pos_clip_max: float = 1.0,
 ):
     B, T, D = x0.shape
     device = x0.device
@@ -278,6 +355,7 @@ def build_interp_adjacent_batch(
                 anchor_sigma_s,
                 jitter_s,
                 corrupt_index_jitter_prob,
+                corrupt_mode,
                 clamp_endpoints,
                 recompute_velocity,
             )
@@ -290,12 +368,16 @@ def build_interp_adjacent_batch(
                 anchor_sigma_prev,
                 jitter_prev,
                 corrupt_index_jitter_prob,
+                corrupt_mode,
                 clamp_endpoints,
                 recompute_velocity,
             )
         else:
             x_s[sel] = interpolate_from_indices(idx, vals, T, recompute_velocity=recompute_velocity)
             x_prev[sel] = interpolate_from_indices(idx_prev, vals_prev, T, recompute_velocity=recompute_velocity)
+        if pos_clip:
+            x_s[sel, :, :2] = x_s[sel, :, :2].clamp(min=pos_clip_min, max=pos_clip_max)
+            x_prev[sel, :, :2] = x_prev[sel, :, :2].clamp(min=pos_clip_min, max=pos_clip_max)
         mask_s[sel] = masks_levels[sel, s]
         mask_prev[sel] = masks_levels[sel, s - 1]
     return x_s, x_prev, mask_s, mask_prev, s_idx, masks_levels, idx_levels
@@ -317,6 +399,35 @@ def _compute_sigma_for_level(
     sigma = min(float(sigma_max), sigma)
     sigma = max(float(sigma_min), sigma)
     return sigma
+
+
+def _parse_policy_mix(spec: str):
+    if not spec:
+        return []
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    mix = []
+    for part in parts:
+        if ":" not in part:
+            raise ValueError(f"Invalid mask_policy_mix entry: {part}")
+        name, weight = part.split(":", 1)
+        name = name.strip()
+        weight = float(weight.strip())
+        mix.append((name, weight))
+    total = sum(w for _, w in mix)
+    if total <= 0:
+        raise ValueError("mask_policy_mix weights must sum to > 0")
+    mix = [(n, w / total) for n, w in mix]
+    return mix
+
+
+def _sample_policy(mix, generator: torch.Generator, device: torch.device) -> str:
+    r = torch.rand((), generator=generator, device=device).item()
+    acc = 0.0
+    for name, weight in mix:
+        acc += weight
+        if r <= acc:
+            return name
+    return mix[-1][0]
 
 
 def _compute_jitter_for_level(K_s: int, K_min: int, jitter_max: int, jitter_pow: float) -> int:
@@ -353,6 +464,7 @@ def _corrupt_from_anchors(
     anchor_sigma: float,
     index_jitter: int,
     index_jitter_prob: float,
+    mode: str,
     clamp_endpoints: bool,
     recompute_velocity: bool,
 ) -> torch.Tensor:
@@ -382,7 +494,7 @@ def _corrupt_from_anchors(
         vals[:, :, :2] = vals[:, :, :2] + noise_vals[:, :, :2]
     x = interpolate_from_indices(idx, vals, T, recompute_velocity=False)
     if sigma > 0.0:
-        alpha = _distance_alpha(idx, T)
+        alpha = _distance_alpha(idx, T) if mode == "dist" else 1.0
         noise = torch.zeros_like(x)
         noise[:, :, :2] = torch.randn(
             (B, T, 2), generator=generator, device=source.device, dtype=source.dtype
@@ -495,8 +607,8 @@ def main():
         if "--cond_start_goal" not in sys.argv:
             args.cond_start_goal = int(bool(args.use_start_goal))
     args.use_start_goal = int(bool(args.cond_start_goal))
-    if args.dataset not in {"d4rl", "d4rl_prepared"}:
-        raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl or d4rl_prepared.")
+    if args.dataset not in {"d4rl", "d4rl_prepared", "toy_video"}:
+        raise ValueError("Particle/synthetic datasets are disabled; use --dataset d4rl, d4rl_prepared, or toy_video.")
     seed = args.seed if args.seed is not None else get_seed_from_env()
     set_seed(seed, deterministic=bool(args.deterministic))
 
@@ -559,18 +671,31 @@ def main():
     data_dim = 4 if args.with_velocity else 2
     mask_channels = (2 if args.stage2_mode == "adj" else 1) + (1 if args.anchor_conf else 0)
     model = InterpLevelDenoiser(
+        d_model=int(args.s2_d_model),
+        n_layers=int(args.s2_n_layers),
+        n_heads=int(args.s2_n_heads),
+        d_ff=int(args.s2_d_ff),
+        d_cond=int(args.s2_d_cond),
         data_dim=data_dim,
         use_sdf=bool(args.use_sdf),
         max_levels=args.levels,
         use_checkpoint=bool(args.use_checkpoint),
         use_start_goal=bool(args.cond_start_goal),
         mask_channels=mask_channels,
+        maze_channels=_parse_int_list(args.s2_maze_channels),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     ema = EMA(model.parameters(), decay=args.ema_decay) if args.ema else None
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     writer = create_writer(args.log_dir)
+    write_run_config(
+        args.log_dir,
+        args,
+        writer=writer,
+        prepared_path=args.prepared_path,
+        extra={"stage": "interp_levels"},
+    )
 
     start_step = 0
     if args.resume:
@@ -595,10 +720,65 @@ def main():
             clamp_endpoints_kp = bool(meta.get("clamp_endpoints"))
         else:
             clamp_endpoints_kp = bool(args.clamp_endpoints)
+        kp_feat_dim = 0
+        if meta.get("kp_feat_dim") is not None:
+            kp_feat_dim = int(meta.get("kp_feat_dim"))
+        dphi_model = None
+        seg_feat = None
+        seg_id = None
+        if kp_feat_dim > 3:
+            if not args.dphi_ckpt:
+                raise ValueError("bootstrap_stage1_ckpt expects kp_feat_dim>3 but no --dphi_ckpt provided")
+            payload_dphi = torch.load(args.dphi_ckpt, map_location="cpu")
+            meta_dphi = payload_dphi.get("meta", {}) if isinstance(payload_dphi, dict) else {}
+            if meta_dphi.get("stage") != "segment_cost":
+                raise ValueError("dphi_ckpt does not appear to be a segment_cost checkpoint")
+            if meta_dphi.get("T") is not None and int(meta_dphi.get("T")) != int(args.T):
+                raise ValueError(f"dphi_ckpt T mismatch: ckpt={meta_dphi.get('T')} args={args.T}")
+            if meta_dphi.get("use_sdf") is not None and bool(meta_dphi.get("use_sdf")) != bool(args.use_sdf):
+                raise ValueError("dphi_ckpt use_sdf mismatch")
+            if meta_dphi.get("cond_start_goal") is not None and bool(meta_dphi.get("cond_start_goal")) != bool(
+                args.cond_start_goal
+            ):
+                raise ValueError("dphi_ckpt cond_start_goal mismatch")
+            maze_channels = meta_dphi.get("maze_channels", "32,64")
+            dphi_model = SegmentCostPredictor(
+                d_cond=int(meta_dphi.get("d_cond", 128)),
+                seg_feat_dim=int(meta_dphi.get("seg_feat_dim", 3)),
+                hidden_dim=int(meta_dphi.get("hidden_dim", 256)),
+                n_layers=int(meta_dphi.get("n_layers", 3)),
+                dropout=float(meta_dphi.get("dropout", 0.0)),
+                use_sdf=bool(args.use_sdf),
+                use_start_goal=bool(args.cond_start_goal),
+                maze_channels=_parse_int_list(maze_channels),
+            ).to(device)
+            dphi_state = payload_dphi.get("model", payload_dphi)
+            dphi_model.load_state_dict(dphi_state)
+            if bool(args.dphi_use_ema) and isinstance(payload_dphi, dict) and "ema" in payload_dphi:
+                ema_dphi = EMA(dphi_model.parameters())
+                ema_dphi.load_state_dict(payload_dphi["ema"])
+                ema_dphi.copy_to(dphi_model.parameters())
+            dphi_model.eval()
+            precomp = build_segment_precompute(args.T, 1, device)
+            seg_feat = build_segment_features(args.T, precomp.seg_i, precomp.seg_j).to(device)
+            seg_id = precomp.seg_id
+        kp_d_model = int(meta.get("kp_d_model", 256))
+        kp_n_layers = int(meta.get("kp_n_layers", 8))
+        kp_n_heads = int(meta.get("kp_n_heads", 8))
+        kp_d_ff = int(meta.get("kp_d_ff", 1024))
+        kp_d_cond = int(meta.get("kp_d_cond", 128))
+        kp_maze_channels = _parse_int_list(meta.get("kp_maze_channels", "32,64"))
         bootstrap_model = KeypointDenoiser(
+            d_model=kp_d_model,
+            n_layers=kp_n_layers,
+            n_heads=kp_n_heads,
+            d_ff=kp_d_ff,
+            d_cond=kp_d_cond,
             data_dim=data_dim,
             use_sdf=bool(args.use_sdf),
             use_start_goal=use_start_goal_kp,
+            kp_feat_dim=kp_feat_dim,
+            maze_channels=kp_maze_channels,
         ).to(device)
         if args.bootstrap_use_ema:
             ema_boot = EMA(bootstrap_model.parameters())
@@ -629,6 +809,67 @@ def main():
         betas_boot = make_beta_schedule(schedule_name, n_train).to(device)
         bootstrap_schedule = make_alpha_bars(betas_boot)
 
+    selector_model = None
+    selector_use_level = False
+    selector_level_mode = "k_norm"
+    policy_mix = _parse_policy_mix(args.mask_policy_mix)
+    if policy_mix:
+        allowed = {"selector", "uniform", "random_nested", "random", "dp_precomputed"}
+        for name, _ in policy_mix:
+            if name not in allowed:
+                raise ValueError(f"Unknown mask policy in mix: {name}")
+    need_selector = args.kp_index_mode == "selector" or any(
+        name == "selector" for name, _ in policy_mix
+    )
+    if need_selector and args.selector_ckpt is None:
+        raise ValueError("mask_policy_mix includes selector but selector model not loaded")
+
+    if need_selector:
+        payload = torch.load(args.selector_ckpt, map_location="cpu")
+        meta_sel = payload.get("meta", {}) if isinstance(payload, dict) else {}
+        if meta_sel.get("stage") != "selector":
+            raise ValueError("selector_ckpt does not appear to be a selector checkpoint")
+        if meta_sel.get("T") is not None and int(meta_sel.get("T")) != int(args.T):
+            raise ValueError(f"selector_ckpt T mismatch: ckpt={meta_sel.get('T')} args={args.T}")
+        if meta_sel.get("K") is not None and int(meta_sel.get("K")) != int(args.K_min):
+            raise ValueError(f"selector_ckpt K mismatch: ckpt={meta_sel.get('K')} args={args.K_min}")
+        if meta_sel.get("use_sdf") is not None and bool(meta_sel.get("use_sdf")) != bool(args.use_sdf):
+            raise ValueError("selector_ckpt use_sdf mismatch")
+        if meta_sel.get("cond_start_goal") is not None and bool(meta_sel.get("cond_start_goal")) != bool(
+            args.cond_start_goal
+        ):
+            raise ValueError("selector_ckpt cond_start_goal mismatch")
+        selector_use_level = bool(meta_sel.get("use_level", False))
+        selector_level_mode = str(meta_sel.get("level_mode", "k_norm"))
+        maze_channels = meta_sel.get("maze_channels", "32,64")
+        selector_model = KeypointSelector(
+            T=int(meta_sel.get("T", args.T)),
+            d_model=int(meta_sel.get("d_model", 256)),
+            n_heads=int(meta_sel.get("n_heads", 8)),
+            d_ff=int(meta_sel.get("d_ff", 512)),
+            n_layers=int(meta_sel.get("n_layers", 2)),
+            pos_dim=int(meta_sel.get("pos_dim", 64)),
+            dropout=float(meta_sel.get("dropout", 0.0)),
+            use_sdf=bool(args.use_sdf),
+            use_start_goal=bool(args.cond_start_goal),
+            use_sg_map=bool(meta_sel.get("use_sg_map", True)),
+            use_sg_token=bool(meta_sel.get("use_sg_token", True)),
+            use_goal_dist_token=bool(meta_sel.get("use_goal_dist_token", False)),
+            use_cond_bias=bool(meta_sel.get("use_cond_bias", False)),
+            cond_bias_mode=str(meta_sel.get("cond_bias_mode", "memory")),
+            use_level=selector_use_level,
+            level_mode=selector_level_mode,
+            sg_map_sigma=float(meta_sel.get("sg_map_sigma", 1.5)),
+            maze_channels=_parse_int_list(maze_channels),
+        ).to(device)
+        selector_state = payload.get("model", payload)
+        selector_model.load_state_dict(selector_state)
+        if bool(args.selector_use_ema) and isinstance(payload, dict) and "ema" in payload:
+            ema_sel = EMA(selector_model.parameters())
+            ema_sel.load_state_dict(payload["ema"])
+            ema_sel.copy_to(selector_model.parameters())
+        selector_model.eval()
+
     gen = torch.Generator(device=device)
     gen.manual_seed(seed + 23)
 
@@ -646,16 +887,85 @@ def main():
         x0 = batch["x"].to(device)
         cond = {k: v.to(device) for k, v in batch["cond"].items()}
 
-        masks_levels, idx_levels = build_nested_masks_batch(
-            x0.shape[0],
-            args.T,
-            args.K_min,
-            args.levels,
-            generator=gen,
-            device=device,
-            k_schedule=args.k_schedule,
-            k_geom_gamma=args.k_geom_gamma,
-        )
+        mask_policy = args.kp_index_mode
+        if policy_mix:
+            mask_policy = _sample_policy(policy_mix, gen, device)
+            if mask_policy == "random":
+                mask_policy = "random_nested"
+
+        if mask_policy == "random_nested":
+            masks_levels, idx_levels = build_nested_masks_batch(
+                x0.shape[0],
+                args.T,
+                args.K_min,
+                args.levels,
+                generator=gen,
+                device=device,
+                k_schedule=args.k_schedule,
+                k_geom_gamma=args.k_geom_gamma,
+            )
+        else:
+            if mask_policy == "dp_precomputed":
+                if "kp_idx" not in batch["cond"]:
+                    raise ValueError("kp_index_mode=dp_precomputed requires kp_idx in dataset")
+                idx_base = batch["cond"]["kp_idx"].to(device)
+            elif mask_policy == "selector":
+                if selector_model is None:
+                    raise ValueError("kp_index_mode=selector but selector model not loaded")
+                if selector_use_level:
+                    k_list = _compute_k_schedule(
+                        args.T, args.K_min, args.levels, schedule=args.k_schedule, geom_gamma=args.k_geom_gamma
+                    )
+                    logits_levels = []
+                    for s in range(args.levels + 1):
+                        if selector_level_mode == "s_norm":
+                            level_val = float(s) / float(max(1, args.levels))
+                        else:
+                            level_val = float(k_list[s]) / float(max(1, args.T - 1))
+                        cond_sel = dict(cond)
+                        cond_sel["level"] = torch.full((x0.shape[0], 1), level_val, device=device)
+                        with torch.no_grad():
+                            logits_s = selector_model(cond_sel)
+                        logits_levels.append(logits_s)
+                    logits_levels = torch.stack(logits_levels, dim=1)
+                    masks_levels, idx_levels = build_nested_masks_from_level_logits(
+                        logits_levels,
+                        args.K_min,
+                        args.levels,
+                        k_schedule=args.k_schedule,
+                        k_geom_gamma=args.k_geom_gamma,
+                    )
+                else:
+                    with torch.no_grad():
+                        logits = selector_model(cond)
+                    masks_levels, idx_levels = build_nested_masks_from_logits(
+                        logits,
+                        args.K_min,
+                        args.levels,
+                        k_schedule=args.k_schedule,
+                        k_geom_gamma=args.k_geom_gamma,
+                    )
+            elif mask_policy == "uniform":
+                idx_base, _ = sample_fixed_k_indices_uniform_batch(
+                    x0.shape[0],
+                    args.T,
+                    args.K_min,
+                    generator=gen,
+                    device=device,
+                    ensure_endpoints=True,
+                )
+            else:
+                raise ValueError(f"Unknown kp_index_mode: {mask_policy}")
+            if mask_policy != "selector":
+                masks_levels, idx_levels = build_nested_masks_from_base(
+                    idx_base,
+                    args.T,
+                    args.levels,
+                    generator=gen,
+                    device=device,
+                    k_schedule=args.k_schedule,
+                    k_geom_gamma=args.k_geom_gamma,
+                )
 
         x0_used = x0
         use_mask = torch.zeros((x0.shape[0],), device=device, dtype=torch.bool)
@@ -679,6 +989,23 @@ def main():
                 )
                 if bootstrap_logit:
                     known_values = logit_pos(known_values, eps=bootstrap_logit_eps)
+                cond_boot = cond
+                if kp_feat_dim > 0:
+                    left_diff = None
+                    right_diff = None
+                    if dphi_model is not None:
+                        seg_pred = dphi_model(cond, seg_feat)
+                        seg_ids = seg_id[idx_s[:, :-1], idx_s[:, 1:]]
+                        if torch.any(seg_ids < 0):
+                            raise ValueError("Invalid segment id lookup for kp_feat")
+                        seg_cost = seg_pred.gather(1, seg_ids)
+                        K = idx_s.shape[1]
+                        left_diff = torch.zeros((x0.shape[0], K), device=device, dtype=torch.float32)
+                        right_diff = torch.zeros((x0.shape[0], K), device=device, dtype=torch.float32)
+                        left_diff[:, 1:] = seg_cost
+                        right_diff[:, :-1] = seg_cost
+                    cond_boot = dict(cond)
+                    cond_boot["kp_feat"] = _kp_feat_from_idx(idx_s, args.T, kp_feat_dim, left_diff, right_diff)
                 with torch.no_grad():
                     z_hat = _sample_keypoints_ddim(
                         bootstrap_model,
@@ -686,7 +1013,7 @@ def main():
                         idx_s,
                         known_mask,
                         known_values,
-                        cond,
+                        cond_boot,
                         args.bootstrap_ddim_steps,
                         args.T,
                         schedule_name=args.bootstrap_ddim_schedule,
@@ -734,6 +1061,9 @@ def main():
                 corrupt_index_jitter_prob=args.corrupt_index_jitter_prob,
                 corrupt_index_jitter_pow=args.corrupt_index_jitter_pow,
                 clamp_endpoints=bool(args.clamp_endpoints),
+                pos_clip=bool(args.pos_clip),
+                pos_clip_min=float(args.pos_clip_min),
+                pos_clip_max=float(args.pos_clip_max),
             )
             if args.debug_corrupt_stats and (step % args.debug_corrupt_every == 0):
                 _log_corrupt_stats(writer, step, s_idx, args.levels, x0, x_s, x_prev)
@@ -785,6 +1115,9 @@ def main():
                 corrupt_index_jitter_prob=args.corrupt_index_jitter_prob,
                 corrupt_index_jitter_pow=args.corrupt_index_jitter_pow,
                 clamp_endpoints=bool(args.clamp_endpoints),
+                pos_clip=bool(args.pos_clip),
+                pos_clip_min=float(args.pos_clip_min),
+                pos_clip_max=float(args.pos_clip_max),
             )
             if args.debug_corrupt_stats and (step % args.debug_corrupt_every == 0):
                 _log_corrupt_stats(writer, step, s_idx, args.levels, x0, x_s, None)
@@ -879,6 +1212,15 @@ def main():
                 "use_start_goal": bool(args.cond_start_goal),
                 "clamp_endpoints": bool(args.clamp_endpoints),
                 "cond_start_goal": bool(args.cond_start_goal),
+                "kp_index_mode": args.kp_index_mode,
+                "mask_policy_mix": args.mask_policy_mix,
+                "selector_ckpt": args.selector_ckpt,
+                "s2_d_model": int(args.s2_d_model),
+                "s2_n_layers": int(args.s2_n_layers),
+                "s2_n_heads": int(args.s2_n_heads),
+                "s2_d_ff": int(args.s2_d_ff),
+                "s2_d_cond": int(args.s2_d_cond),
+                "s2_maze_channels": args.s2_maze_channels,
             }
             save_checkpoint(ckpt_path, model, optimizer, step, ema, meta=meta)
 
@@ -917,6 +1259,15 @@ def main():
         "use_start_goal": bool(args.cond_start_goal),
         "clamp_endpoints": bool(args.clamp_endpoints),
         "cond_start_goal": bool(args.cond_start_goal),
+        "kp_index_mode": args.kp_index_mode,
+        "mask_policy_mix": args.mask_policy_mix,
+        "selector_ckpt": args.selector_ckpt,
+        "s2_d_model": int(args.s2_d_model),
+        "s2_n_layers": int(args.s2_n_layers),
+        "s2_n_heads": int(args.s2_n_heads),
+        "s2_d_ff": int(args.s2_d_ff),
+        "s2_d_cond": int(args.s2_d_cond),
+        "s2_maze_channels": args.s2_maze_channels,
     }
     save_checkpoint(final_path, model, optimizer, args.steps, ema, meta=meta)
     writer.flush()

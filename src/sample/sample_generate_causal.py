@@ -14,6 +14,8 @@ from src.diffusion.schedules import make_alpha_bars, make_beta_schedule
 from src.eval.visualize import plot_maze2d_geom_walls, plot_maze2d_trajectories, plot_trajectories
 from src.models.denoiser_interp_levels_causal import InterpLevelCausalDenoiser
 from src.models.denoiser_keypoints import KeypointDenoiser
+from src.models.segment_cost import SegmentCostPredictor
+from src.selection.epiplexity_dp import build_segment_features, build_segment_precompute
 from src.utils.clamp import apply_clamp
 from src.utils.device import get_device
 from src.utils.normalize import logit_pos, sigmoid_pos
@@ -38,6 +40,22 @@ def build_argparser():
     p.add_argument("--logit_space", type=int, default=0)
     p.add_argument("--logit_eps", type=float, default=1e-5)
     p.add_argument("--use_ema", type=int, default=1)
+    p.add_argument("--use_kp_feat", type=int, default=0)
+    p.add_argument("--kp_feat_dim", type=int, default=0)
+    p.add_argument("--dphi_ckpt", type=str, default=None)
+    p.add_argument("--dphi_use_ema", type=int, default=1)
+    p.add_argument("--kp_d_model", type=int, default=None)
+    p.add_argument("--kp_n_layers", type=int, default=None)
+    p.add_argument("--kp_n_heads", type=int, default=None)
+    p.add_argument("--kp_d_ff", type=int, default=None)
+    p.add_argument("--kp_d_cond", type=int, default=None)
+    p.add_argument("--kp_maze_channels", type=str, default=None)
+    p.add_argument("--s2_d_model", type=int, default=None)
+    p.add_argument("--s2_n_layers", type=int, default=None)
+    p.add_argument("--s2_n_heads", type=int, default=None)
+    p.add_argument("--s2_d_ff", type=int, default=None)
+    p.add_argument("--s2_d_cond", type=int, default=None)
+    p.add_argument("--s2_maze_channels", type=str, default=None)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--dataset", type=str, default="d4rl", choices=["particle", "synthetic", "d4rl", "d4rl_prepared"])
     p.add_argument("--prepared_path", type=str, default=None)
@@ -77,6 +95,39 @@ def _unnormalize_pos(x: torch.Tensor, pos_low: torch.Tensor, pos_scale: torch.Te
     return pos * pos_scale[:2] + pos_low[:2]
 
 
+def _kp_feat_from_idx(
+    idx: torch.Tensor,
+    T: int,
+    kp_feat_dim: int,
+    left_diff: torch.Tensor | None = None,
+    right_diff: torch.Tensor | None = None,
+) -> torch.Tensor:
+    B, K = idx.shape
+    feat = torch.zeros((B, K, kp_feat_dim), device=idx.device, dtype=torch.float32)
+    if kp_feat_dim <= 0:
+        return feat
+    denom = float(max(1, T - 1))
+    if kp_feat_dim >= 3:
+        feat[:, :, 2] = idx.float() / denom
+    if K > 1:
+        gaps = (idx[:, 1:] - idx[:, :-1]).float() / denom
+        feat[:, 1:, 0] = gaps
+        feat[:, :-1, 1] = gaps
+    if kp_feat_dim >= 5 and left_diff is not None and right_diff is not None:
+        feat[:, :, 3] = left_diff
+        feat[:, :, 4] = right_diff
+    return feat
+
+
+def _parse_int_list(spec: str, fallback: str) -> tuple[int, ...]:
+    if spec is None:
+        spec = fallback
+    parts = [p.strip() for p in str(spec).split(",") if p.strip()]
+    if not parts:
+        raise ValueError("empty int list")
+    return tuple(int(p) for p in parts)
+
+
 def _ensure_mujoco_env():
     if "MUJOCO_PY_MUJOCO_PATH" not in os.environ:
         for candidate in ("/workspace/mujoco210", os.path.expanduser("~/.mujoco/mujoco210")):
@@ -104,7 +155,7 @@ def _export_video(frames_dir: str, fmt: str, fps: int):
     try:
         import imageio.v2 as imageio
 
-        with imageio.get_writer(out_path, fps=fps) as writer:
+        with imageio.get_writer(out_path, fps=fps, macro_block_size=1) as writer:
             for fname in frames:
                 writer.append_data(imageio.imread(os.path.join(frames_dir, fname)))
         return
@@ -192,6 +243,10 @@ def main():
             args.logit_space = int(bool(meta.get("logit_space")))
         if meta.get("logit_eps") is not None:
             args.logit_eps = float(meta.get("logit_eps"))
+        if "--use_kp_feat" not in sys.argv and meta.get("use_kp_feat") is not None:
+            args.use_kp_feat = int(bool(meta.get("use_kp_feat")))
+        if "--kp_feat_dim" not in sys.argv and meta.get("kp_feat_dim") is not None:
+            args.kp_feat_dim = int(meta.get("kp_feat_dim"))
         if meta.get("clamp_endpoints") is not None:
             args.clamp_endpoints = int(bool(meta.get("clamp_endpoints")))
         elif meta.get("use_start_goal") is not None:
@@ -221,20 +276,111 @@ def main():
             args.env_id = meta.get("env_id")
         if meta.get("d4rl_flip_y") is not None:
             args.d4rl_flip_y = int(bool(meta.get("d4rl_flip_y")))
+        if "--kp_d_model" not in sys.argv and meta.get("kp_d_model") is not None:
+            args.kp_d_model = int(meta.get("kp_d_model"))
+        if "--kp_n_layers" not in sys.argv and meta.get("kp_n_layers") is not None:
+            args.kp_n_layers = int(meta.get("kp_n_layers"))
+        if "--kp_n_heads" not in sys.argv and meta.get("kp_n_heads") is not None:
+            args.kp_n_heads = int(meta.get("kp_n_heads"))
+        if "--kp_d_ff" not in sys.argv and meta.get("kp_d_ff") is not None:
+            args.kp_d_ff = int(meta.get("kp_d_ff"))
+        if "--kp_d_cond" not in sys.argv and meta.get("kp_d_cond") is not None:
+            args.kp_d_cond = int(meta.get("kp_d_cond"))
+        if "--kp_maze_channels" not in sys.argv and meta.get("kp_maze_channels") is not None:
+            args.kp_maze_channels = str(meta.get("kp_maze_channels"))
+
+    interp_meta = {}
+    if os.path.exists(args.ckpt_interp):
+        try:
+            payload_interp_meta = torch.load(args.ckpt_interp, map_location="cpu")
+            if isinstance(payload_interp_meta, dict):
+                interp_meta = payload_interp_meta.get("meta", {}) or {}
+        except Exception:
+            interp_meta = {}
+    if interp_meta:
+        if "--s2_d_model" not in sys.argv and interp_meta.get("s2_d_model") is not None:
+            args.s2_d_model = int(interp_meta.get("s2_d_model"))
+        if "--s2_n_layers" not in sys.argv and interp_meta.get("s2_n_layers") is not None:
+            args.s2_n_layers = int(interp_meta.get("s2_n_layers"))
+        if "--s2_n_heads" not in sys.argv and interp_meta.get("s2_n_heads") is not None:
+            args.s2_n_heads = int(interp_meta.get("s2_n_heads"))
+        if "--s2_d_ff" not in sys.argv and interp_meta.get("s2_d_ff") is not None:
+            args.s2_d_ff = int(interp_meta.get("s2_d_ff"))
+        if "--s2_d_cond" not in sys.argv and interp_meta.get("s2_d_cond") is not None:
+            args.s2_d_cond = int(interp_meta.get("s2_d_cond"))
+        if "--s2_maze_channels" not in sys.argv and interp_meta.get("s2_maze_channels") is not None:
+            args.s2_maze_channels = str(interp_meta.get("s2_maze_channels"))
 
     device = get_device(args.device)
     data_dim = 4 if args.with_velocity else 2
 
+    dphi_model = None
+    seg_feat = None
+    seg_id = None
+    if args.dphi_ckpt:
+        payload = torch.load(args.dphi_ckpt, map_location="cpu")
+        meta_dphi = payload.get("meta", {}) if isinstance(payload, dict) else {}
+        if meta_dphi.get("stage") != "segment_cost":
+            raise ValueError("dphi_ckpt does not appear to be a segment_cost checkpoint")
+        if meta_dphi.get("T") is not None and int(meta_dphi.get("T")) != int(args.T):
+            raise ValueError(f"dphi_ckpt T mismatch: ckpt={meta_dphi.get('T')} args={args.T}")
+        if meta_dphi.get("use_sdf") is not None and bool(meta_dphi.get("use_sdf")) != bool(args.use_sdf):
+            raise ValueError("dphi_ckpt use_sdf mismatch")
+        if meta_dphi.get("cond_start_goal") is not None and bool(meta_dphi.get("cond_start_goal")) != bool(
+            args.cond_start_goal
+        ):
+            raise ValueError("dphi_ckpt cond_start_goal mismatch")
+        if not bool(args.use_kp_feat) or int(args.kp_feat_dim) < 5:
+            raise ValueError("dphi_ckpt requires use_kp_feat=1 and kp_feat_dim>=5")
+        maze_channels = meta_dphi.get("maze_channels", "32,64")
+        dphi_model = SegmentCostPredictor(
+            d_cond=int(meta_dphi.get("d_cond", 128)),
+            seg_feat_dim=int(meta_dphi.get("seg_feat_dim", 3)),
+            hidden_dim=int(meta_dphi.get("hidden_dim", 256)),
+            n_layers=int(meta_dphi.get("n_layers", 3)),
+            dropout=float(meta_dphi.get("dropout", 0.0)),
+            use_sdf=bool(args.use_sdf),
+            use_start_goal=bool(args.cond_start_goal),
+            maze_channels=_parse_int_list(maze_channels, "32,64"),
+        ).to(device)
+        dphi_state = payload.get("model", payload)
+        dphi_model.load_state_dict(dphi_state)
+        if bool(args.dphi_use_ema) and isinstance(payload, dict) and "ema" in payload:
+            from src.utils.ema import EMA
+
+            ema_dphi = EMA(dphi_model.parameters())
+            ema_dphi.load_state_dict(payload["ema"])
+            ema_dphi.copy_to(dphi_model.parameters())
+        dphi_model.eval()
+        precomp = build_segment_precompute(args.T, 1, device)
+        seg_feat = build_segment_features(args.T, precomp.seg_i, precomp.seg_j).to(device)
+        seg_id = precomp.seg_id
+    elif bool(args.use_kp_feat) and int(args.kp_feat_dim) > 3:
+        raise ValueError("kp_feat_dim>3 requires --dphi_ckpt for predicted difficulties")
+
     kp_model = KeypointDenoiser(
+        d_model=int(args.kp_d_model) if args.kp_d_model is not None else 256,
+        n_layers=int(args.kp_n_layers) if args.kp_n_layers is not None else 8,
+        n_heads=int(args.kp_n_heads) if args.kp_n_heads is not None else 8,
+        d_ff=int(args.kp_d_ff) if args.kp_d_ff is not None else 1024,
+        d_cond=int(args.kp_d_cond) if args.kp_d_cond is not None else 128,
         data_dim=data_dim,
         use_sdf=bool(args.use_sdf),
         use_start_goal=bool(args.cond_start_goal),
+        kp_feat_dim=int(args.kp_feat_dim) if bool(args.use_kp_feat) else 0,
+        maze_channels=_parse_int_list(args.kp_maze_channels, "32,64"),
     ).to(device)
     interp_model = InterpLevelCausalDenoiser(
+        d_model=int(args.s2_d_model) if args.s2_d_model is not None else 256,
+        n_layers=int(args.s2_n_layers) if args.s2_n_layers is not None else 8,
+        n_heads=int(args.s2_n_heads) if args.s2_n_heads is not None else 8,
+        d_ff=int(args.s2_d_ff) if args.s2_d_ff is not None else 1024,
+        d_cond=int(args.s2_d_cond) if args.s2_d_cond is not None else 128,
         data_dim=data_dim,
         use_sdf=bool(args.use_sdf),
         max_levels=args.levels,
         use_start_goal=bool(args.cond_start_goal),
+        maze_channels=_parse_int_list(args.s2_maze_channels, "32,64"),
     ).to(device)
 
     payload_kp = torch.load(args.ckpt_keypoints, map_location="cpu") if os.path.exists(args.ckpt_keypoints) else {}
@@ -381,6 +527,23 @@ def main():
 
             cond_chunk = {k: v for k, v in cond.items()}
             cond_chunk["start_goal"] = torch.cat([left, right], dim=0).view(1, 4)
+            if bool(args.use_kp_feat) and int(args.kp_feat_dim) > 0:
+                left_diff = None
+                right_diff = None
+                if dphi_model is not None:
+                    seg_pred = dphi_model(cond_chunk, seg_feat)
+                    seg_ids = seg_id[idx_local[:, :-1], idx_local[:, 1:]]
+                    if torch.any(seg_ids < 0):
+                        raise ValueError("Invalid segment id lookup for kp_feat")
+                    seg_cost = seg_pred.gather(1, seg_ids)
+                    K = idx_local.shape[1]
+                    left_diff = torch.zeros((1, K), device=device, dtype=torch.float32)
+                    right_diff = torch.zeros((1, K), device=device, dtype=torch.float32)
+                    left_diff[:, 1:] = seg_cost
+                    right_diff[:, :-1] = seg_cost
+                cond_chunk["kp_feat"] = _kp_feat_from_idx(
+                    idx_local, local_T, int(args.kp_feat_dim), left_diff, right_diff
+                )
 
             z_hat = _sample_keypoints_ddim(
                 kp_model, schedule, idx_local, known_mask, known_values, cond_chunk, args.ddim_steps, local_T
@@ -448,10 +611,22 @@ def main():
                         )
                     else:
                         occ = cond["occ"][0, 0].detach().cpu().numpy()
-                        plot_trajectories(occ, [traj[:, :2].detach().cpu().numpy()], [f"chunk {frame_idx}"], out_path=frame_path)
+                        plot_trajectories(
+                            occ,
+                            [traj[:, :2].detach().cpu().numpy()],
+                            [f"chunk {frame_idx}"],
+                            out_path=frame_path,
+                            flip_y=flip_y,
+                        )
                 else:
                     occ = cond["occ"][0, 0].detach().cpu().numpy()
-                    plot_trajectories(occ, [traj[:, :2].detach().cpu().numpy()], [f"chunk {frame_idx}"], out_path=frame_path)
+                    plot_trajectories(
+                        occ,
+                        [traj[:, :2].detach().cpu().numpy()],
+                        [f"chunk {frame_idx}"],
+                        out_path=frame_path,
+                        flip_y=flip_y,
+                    )
                 frame_idx += 1
 
         if data_dim > 2 and args.recompute_vel:
@@ -489,11 +664,23 @@ def main():
             else:
                 occ = cond["occ"][0, 0].detach().cpu().numpy()
                 pred = x_gen.detach().cpu().numpy()
-                plot_trajectories(occ, [pred[:, :2]], ["pred"], out_path=out_path)
+                plot_trajectories(
+                    occ,
+                    [pred[:, :2]],
+                    ["pred"],
+                    out_path=out_path,
+                    flip_y=flip_y,
+                )
         else:
             occ = cond["occ"][0, 0].detach().cpu().numpy()
             pred = x_gen.detach().cpu().numpy()
-            plot_trajectories(occ, [pred[:, :2]], ["pred"], out_path=out_path)
+            plot_trajectories(
+                occ,
+                [pred[:, :2]],
+                ["pred"],
+                out_path=out_path,
+                flip_y=flip_y,
+            )
         if args.save_chunk_frames and frames_dir is not None:
             _export_video(frames_dir, args.export_video, args.video_fps)
 

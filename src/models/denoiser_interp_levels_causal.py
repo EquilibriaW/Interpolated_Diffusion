@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -23,14 +23,21 @@ class InterpLevelCausalDenoiser(nn.Module):
         max_levels: int = 8,
         use_checkpoint: bool = False,
         mask_channels: int = 1,
+        cond_encoder: Optional[nn.Module] = None,
+        maze_channels: tuple[int, ...] = (32, 64),
     ):
         super().__init__()
         self.data_dim = data_dim
+        self.d_cond = d_cond
         self.mask_channels = mask_channels
         self.in_proj = nn.Linear(data_dim + mask_channels, d_model)
         self.level_emb = nn.Embedding(max_levels + 1, d_model)
         self.level_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
-        self.cond_enc = MazeConditionEncoder(use_sdf=use_sdf, d_cond=d_cond, use_start_goal=use_start_goal)
+        if cond_encoder is None:
+            cond_encoder = MazeConditionEncoder(
+                use_sdf=use_sdf, d_cond=d_cond, use_start_goal=use_start_goal, maze_channels=maze_channels
+            )
+        self.cond_enc = cond_encoder
         self.cond_proj = nn.Linear(d_cond, d_model)
         self.transformer = TransformerEncoder(
             d_model=d_model,
@@ -68,7 +75,10 @@ class InterpLevelCausalDenoiser(nn.Module):
         h = h + pos.unsqueeze(0)
         level = self.level_proj(self.level_emb(s))
         h = h + level.unsqueeze(1)
-        cond_vec = self.cond_enc(cond)
+        if cond and self.cond_enc is not None:
+            cond_vec = self.cond_enc(cond)
+        else:
+            cond_vec = torch.zeros((B, self.d_cond), device=x_s.device, dtype=x_s.dtype)
         h = h + self.cond_proj(cond_vec).unsqueeze(1)
         h = self.transformer(h, cond=cond_vec)
         return self.out(h)

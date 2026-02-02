@@ -183,6 +183,41 @@ python -m src.sample.sample_generate_causal \
   --out_dir runs/gen_causal
 ```
 
+## DiDeMo (text-conditioned video, 2-5s)
+
+Fetch metadata + download videos (AWS script port):
+
+```bash
+python scripts/datasets/didemo/fetch_didemo_metadata.py --out_dir data/didemo
+python scripts/datasets/didemo/download_videos_aws.py --download --video_directory data/didemo/videos --data_dir data/didemo
+```
+
+Stage-1 keypoint diffusion (text-conditioned, VAE-latent tokens):
+
+```bash
+python -m src.train.train_keypoints_didemo --T 16 --K 4 --frame_size 64 --clip_seconds 5 --patch_size 2 --batch 8 --steps 20000
+```
+
+Stage-2 interpolation-corruption denoiser:
+
+```bash
+python -m src.train.train_interp_levels_didemo --T 16 --K_min 4 --levels 4 --frame_size 64 --clip_seconds 5 --patch_size 2 --batch 4 --steps 20000
+```
+
+Optional: precompute VAE latents + CLIP text embeddings (speeds up training):
+
+```bash
+python scripts/datasets/didemo/precompute_cache.py --split train --max_items 1000 --batch 8 --shard_size 256 \
+  --out_dir data/didemo_cache --data_dir data/didemo --video_dir data/didemo/videos
+```
+
+Then train from cache:
+
+```bash
+python -m src.train.train_keypoints_didemo --cache_dir data/didemo_cache --use_cached_text 1 --steps 20000
+python -m src.train.train_interp_levels_didemo --cache_dir data/didemo_cache --use_cached_text 1 --steps 20000
+```
+
 ## Notes
 
 - Mixed precision and gradient accumulation are enabled by default.

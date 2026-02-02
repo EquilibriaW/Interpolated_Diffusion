@@ -1,5 +1,15 @@
 torch
+torchvision
 numpy
 matplotlib
 tqdm
 tensorboard
+webdataset
+huggingface_hub
+transformers
+diffusers
+accelerate
+safetensors
+pillow
+imageio
+imageio-ffmpeg
