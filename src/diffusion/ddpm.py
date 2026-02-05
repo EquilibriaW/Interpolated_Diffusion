@@ -17,12 +17,20 @@ def q_sample(r0: torch.Tensor, t: torch.Tensor, schedule: Dict[str, torch.Tensor
         noise = torch.randn_like(r0)
     sqrt_alpha_bar = _gather(schedule["sqrt_alpha_bar"], t)
     sqrt_one_minus = _gather(schedule["sqrt_one_minus_alpha_bar"], t)
+    while sqrt_alpha_bar.dim() < r0.dim():
+        sqrt_alpha_bar = sqrt_alpha_bar.unsqueeze(-1)
+    while sqrt_one_minus.dim() < r0.dim():
+        sqrt_one_minus = sqrt_one_minus.unsqueeze(-1)
     return sqrt_alpha_bar * r0 + sqrt_one_minus * noise, noise
 
 
 def predict_x0_from_eps(rt: torch.Tensor, eps: torch.Tensor, t: torch.Tensor, schedule: Dict[str, torch.Tensor]):
     sqrt_alpha_bar = _gather(schedule["sqrt_alpha_bar"], t)
     sqrt_one_minus = _gather(schedule["sqrt_one_minus_alpha_bar"], t)
+    while sqrt_alpha_bar.dim() < rt.dim():
+        sqrt_alpha_bar = sqrt_alpha_bar.unsqueeze(-1)
+    while sqrt_one_minus.dim() < rt.dim():
+        sqrt_one_minus = sqrt_one_minus.unsqueeze(-1)
     return (rt - sqrt_one_minus * eps) / torch.clamp(sqrt_alpha_bar, min=1e-8)
 
 
@@ -30,6 +38,10 @@ def ddim_step(rt: torch.Tensor, eps: torch.Tensor, t: torch.Tensor, t_prev: torc
     # Deterministic DDIM by default (eta=0).
     alpha_bar_t = _gather(schedule["alpha_bar"], t)
     alpha_bar_prev = _gather(schedule["alpha_bar"], t_prev)
+    while alpha_bar_t.dim() < rt.dim():
+        alpha_bar_t = alpha_bar_t.unsqueeze(-1)
+    while alpha_bar_prev.dim() < rt.dim():
+        alpha_bar_prev = alpha_bar_prev.unsqueeze(-1)
     x0 = (rt - torch.sqrt(1.0 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
     if eta == 0.0:
         rt_prev = torch.sqrt(alpha_bar_prev) * x0 + torch.sqrt(1.0 - alpha_bar_prev) * eps
@@ -49,6 +61,12 @@ def ddpm_step(rt: torch.Tensor, eps: torch.Tensor, t: torch.Tensor, schedule: Di
     betas = _gather(schedule["betas"], t)
     alphas = _gather(schedule["alphas"], t)
     alpha_bar = _gather(schedule["alpha_bar"], t)
+    while betas.dim() < rt.dim():
+        betas = betas.unsqueeze(-1)
+    while alphas.dim() < rt.dim():
+        alphas = alphas.unsqueeze(-1)
+    while alpha_bar.dim() < rt.dim():
+        alpha_bar = alpha_bar.unsqueeze(-1)
     sqrt_one_minus = torch.sqrt(1.0 - alpha_bar)
     mean = (1.0 / torch.sqrt(alphas)) * (rt - (betas / sqrt_one_minus) * eps)
     if torch.all(t == 0):

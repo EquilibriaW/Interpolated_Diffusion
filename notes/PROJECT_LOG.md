@@ -198,6 +198,49 @@ Include: date, command or script used, dataset/checkpoint paths, key settings, a
     - refined collision ≈ **0.0769** (Δ ≈ **-0.0027**)
     - interp MSE‑to‑GT ≈ **0.00164**
     - refined MSE‑to‑GT ≈ **0.00143**
+
+## 2026-02-04
+
+### Decisions / Requests
+- **Performance**: GPU underutilized during Wan synth interpolator training → prioritize data pipeline parallelism and overlap H2D with compute.
+- **Latent straightening**: investigate making Wan2.1 VAE latents more interpolation‑friendly; prefer a cheap method (OK to add an adapter if raw frames are unavailable).
+
+### Implementation Status
+- **Dataloader parallelism** (Wan synth): added optional `prefetch_factor`, `persistent_workers`, `pin_memory` to WebDataset loaders (`src/data/wan_synth.py`).
+- **Training loop perf** (Wan synth flow/lerp interpolator): added vectorized triplet sampling, optional GPU prefetcher, and optional `torch.compile` (`src/train/train_flow_interpolator_wansynth.py`).
+- **Latent straightener (Option B)**: added `LatentStraightener` model (`src/models/latent_straightener.py`) and training script (`src/train/train_latent_straightener_wansynth.py`) with linearity + recon losses and throughput knobs.
+- **Straightener integration**: flow/lerp interpolator training can optionally run in straightened space via `--straightener_ckpt` (`src/train/train_flow_interpolator_wansynth.py`).
+
+### Notes / Plan
+- **Dataset check**: Wan synth shards currently contain only `latent.pt`, `embed.pt`, `prompt.txt` (no raw frames). VAE fine‑tune for straightening would require raw videos; otherwise use a **latent‑space straightener**:
+  - Train small adapters `S` and `R` on latent triplets so `R(S(z))≈z` and `S(z_t)≈(1‑α)S(z_0)+αS(z_1)` (linearity loss).
+  - Use `S` before interpolation and `R` after, keeping decoder/denoiser in original latent space.
+
+## 2026-02-03
+
+### Implementation Fixes (Wan synth pipeline)
+- `src/data/wan_synth.py`: replaced unsupported `wds.zip` with `_ZippedIterableDataset` for pairing anchors + base; added `prefetch_factor=None` when `num_workers=0`.
+- `scripts/run_wansynth_pipeline_debug.sh` and `scripts/run_wansynth_pipeline_full.sh`: added `ANCHOR_NUM_WORKERS` (default `0`) for deterministic anchor ordering.
+- `scripts/datasets/wan_synth/precompute_phase1_anchors.py`: warning when `num_workers>0` (can reorder samples vs anchors).
+- `src/corruptions/video_keyframes.py`:
+  - `build_video_token_interp_adjacent_batch` now accepts `anchor_idx` and handles anchor replacement for levels where `K_s > K_base` via lookup (only replaces indices present in `anchor_idx`).
+  - `build_video_token_interp_level_batch` signature now includes `anchor_values`/`anchor_idx` and uses the same lookup logic.
+  - Flow interpolator inputs cast to flow dtype; flow outputs cast back to token dtype to avoid bf16/fp32 mismatches.
+- `src/train/train_interp_levels_wansynth.py`: `_anneal_conf` now broadcasts correctly for `[B,T,N]` tensors.
+
+### Debug Run (Wan synth)
+- Script: `scripts/run_wansynth_pipeline_debug.sh`
+- Command:
+  - `DATA_PATTERN="data/wan_synth/Wan2.1_14B_480p_16:9_Euler-step100_shift-3.0_cfg-5.0_seed-0_250K/shard-0000*.tar"`
+  - `WAN_DTYPE=bf16 BATCH=2 NUM_WORKERS=8 SHUFFLE_BUFFER=1000`
+  - `ANCHOR_NUM_WORKERS=0 ANCHOR_OUT=data/wan_synth_anchors_debug_ordered8`
+  - `FLOW_STEPS=2 P1_STEPS=2 P2_STEPS=5`
+  - `FLOW_SAVE_EVERY=1 P1_SAVE_EVERY=1 P2_SAVE_EVERY=1`
+- Result: **debug pipeline completed successfully**.
+  - Flow loss ≈ `0.2372`
+  - Phase‑1 loss ≈ `1.4062`
+  - Phase‑2 loss ≈ `0.7035`
+  - Phase‑1/2 step time ≈ `7–10s` per step (bf16, B=2, grad‑ckpt on).
     - collision improved in **32%** of samples; worse in **30%** (rest unchanged)
     - MSE improved in **56%**; worse in **44%**
   - Interpretation: stage‑2 is **slightly corrective on average**, but improvements are weak and inconsistent; many cases still degrade (especially for collision).
@@ -375,3 +418,405 @@ This is inspired by **cold/soft diffusion**: corruption is not necessarily Gauss
   1) Phase‑1 keyframe diffusion to few steps,
   2) Phase‑2 refiner to 1–2 steps.
 - Evaluate vs 4‑step RCM baselines.
+
+## 2026-02-03
+
+### Decisions / Requests
+- Reaffirmed video direction: **Wan2.1 synthetic (TurboDiffusion) dataset** is the initial training data source; download a shard subset for early experiments.
+- Phase‑1 and Phase‑2 will be **Wan2.1 finetunes**. Start with **LoRA** for iteration speed; after stability, **unfreeze attention + MLP** blocks to increase capacity (keep VAE + text encoder frozen).
+- Keep selector **entropy‑controlled** (Gumbel‑Top‑K + KL‑to‑uniform + temperature anneal) for video experiments.
+- Training plan for Wan2.1: debug with a **small shard subset**, then train on the **full synthetic dataset**. Run **three training jobs**:
+  1) LoRA rank **r=8**,
+  2) LoRA rank **r=32**,
+  3) Full finetune on top of Wan2.1 weights (no LoRA).
+- D_phi/DP for video: **student uses teacher model with non‑keyframes replaced by interpolator output**; DP selects masks to minimize teacher‑vs‑student KL aggregated over diffusion steps.
+- Use **D_phi‑derived difficulty features immediately** for pipeline debugging (not deferred).
+- Potential objective mismatch between selector (teacher‑KL) and refiner loss is **flagged only**, not assumed.
+- Phase‑2 corruption should **replace anchors with actual Phase‑1 outputs** (not Gaussian noise). This should match the true anchor error distribution.
+- Interpolation for video should be **latent‑space only** to meet inference compute goals (no decode/flow/RAFT at inference).
+- Phase‑2 training will use **Phase‑1 outputs with replacement probability p** (anchor replacement is stochastic). Phase‑1 is **frozen** during Phase‑2 training. Phase‑1 outputs for Phase‑2 are **precomputed** (cached).
+- Wan2.1 backbone should be instantiated at **full size** (≈1.3B/“1.4B”), **no layer reduction** or slim configs.
+- Interpolator design direction: **one‑pass, deterministic latent‑space motion‑compensated warp + blend** (no iterative VFI).  
+  - Predict forward/backward flow + occlusion/blend mask (and optional tiny residual) from endpoint latents.  
+  - Warp endpoints in latent space, blend with mask; optional residual refinement.  
+  - Train with latent L1 (optional decode‑space L1), endpoint consistency, and gap‑length distribution matching.  
+  - Optionally output uncertainty mask to guide phase‑2 corruption/noise injection (focus denoiser on unreliable regions).  
+  - Keep interpolator **cheap** (small convnet, 2–3 scales max, no heavy attention).  
+
+### Implementation Updates
+- Added **LoRA injection utilities** (`src/models/lora.py`) targeting attention + MLP (configurable), with trainable‑params logging.
+- Added Wan2.1 synthetic **Phase‑1/Phase‑2 token‑space training scripts**:
+  - `src/train/train_keypoints_wansynth.py`
+  - `src/train/train_interp_levels_wansynth.py`
+- Added **latent‑space interpolator training** for Wan synth: `src/train/train_video_interpolator_wansynth.py`.
+- Added **Phase‑1 anchor precompute** for Wan synth: `scripts/datasets/wan_synth/precompute_phase1_anchors.py`.
+- Video corruption now supports **anchor replacement with external Phase‑1 anchors** (`anchor_values`, `anchor_idx`) in `src/corruptions/video_keyframes.py`.
+- Default video interpolation mode in Wan synth stage‑2 training set to **smooth** (not learned).
+- Added **latent flow‑warp interpolator** with **mask + uncertainty** outputs (`src/models/latent_flow_interpolator.py`) and training script `src/train/train_flow_interpolator_wansynth.py`.
+- Integrated **flow interpolation + uncertainty‑gated corruption** into Wan synth Phase‑2 (token) corruption and added flags in `train_interp_levels_wansynth.py`.
+- Added optional **flow interpolation** path for Wan backbone Phase‑1 training and Phase‑1 anchor precompute (`train_keypoints_wansynth.py`, `precompute_phase1_anchors.py`).
+- Added pipeline scripts: `scripts/run_wansynth_pipeline_debug.sh` and `scripts/run_wansynth_pipeline_full.sh`.
+- Wan synth dataset is present at `data/wan_synth/Wan2.1_14B_480p_16:9_Euler-step100_shift-3.0_cfg-5.0_seed-0_250K/` (tar shards).
+- Added throughput logging (samples/sec, frames/sec, peak memory) to Wan synth training scripts.
+- Debug run note: Wan synth latents are stored as **[C,T,H,W]** (e.g. [16,21,60,104]); loader now auto‑transposes to **[T,C,H,W]** and warns once. Flow interpolator training now disables deterministic algorithms to allow `grid_sample` backward.
+- Pipeline scripts now call precompute with `PYTHONPATH=.` so `src` imports resolve.
+- Precompute anchors now casts Wan inputs to model dtype (bf16) and initializes keypoint noise in model dtype to avoid dtype mismatch errors.
+
+### 2026-02-03 (PM) — Pipeline Optimizations + Calibration
+
+#### Code Changes
+- `src/data/wan_synth.py`:
+  - Added `_KeyJoinIterableDataset` for key‑based anchor joins with optional `allow_missing`.
+  - `create_wan_synth_anchor_dataloader` now accepts `join_by_key`, `max_key_buffer`, and `allow_missing`.
+- `src/train/train_interp_levels_wansynth.py`:
+  - Added CLI flags: `--anchor_join`, `--anchor_key_buffer`, `--anchor_allow_missing`.
+- `src/models/latent_flow_interpolator.py`:
+  - Vectorized `interpolate()` segment fill (removes per‑t inner loop).
+  - `load_latent_flow_interpolator` accepts `dtype` and honors `meta["model_dtype"]`.
+- `src/train/train_flow_interpolator_wansynth.py`:
+  - Added `--model_dtype` and `--log_every`.
+  - Model/latents cast to `model_dtype`; `meta` stores `model_dtype`.
+- `src/train/train_keypoints_wansynth.py` and `src/train/train_interp_levels_wansynth.py`:
+  - Explicitly cast `latents`/`text_embed`/`anchor_values` to Wan model dtype (bf16).
+  - Flow interpolator loaded with bf16; flow inputs cast to flow dtype.
+- `src/diffusion/ddpm.py`: fixed broadcasting for 4‑D tensors in `q_sample`, `predict_x0_from_eps`, and `ddim_step` (unsqueeze to match dims).
+- `scripts/run_wansynth_pipeline_*`: added `FLOW_DTYPE` default to `WAN_DTYPE`, and anchor join flags in debug/full scripts.
+
+#### Throughput Calibration — Phase‑1 (Wan2.1 + LoRA r=8, flow interp)
+Dataset: `shard-0000*.tar`, T=21, bf16, grad‑ckpt on, log_every=1.
+- **B=2**: step ≈ **6.92s** → ~**0.29 samples/s**, **~6.1 frames/s**
+- **B=4**: step ≈ **13.75s** → ~**0.29 samples/s**, **~6.1 frames/s**
+- **B=8**: step ≈ **27.3s** → ~**0.29 samples/s**, **~6.1 frames/s**
+**Observation:** throughput per sample is flat; larger batch only increases latency.
+
+#### Throughput Calibration — Phase‑2 (Wan2.1 + LoRA r=8, anchors, flow interp)
+Anchors: `data/wan_synth_anchors_calib3/` (ddim_steps=4, B=4, 20 batches); joiner with `allow_missing=1`.
+- **B=2**: step ≈ **7.44s** → ~**0.27 samples/s**, **~5.6 frames/s**
+- **B=4**: step ≈ **14.17s** → ~**0.28 samples/s**, **~5.9 frames/s**
+- **B=8**: step ≈ **28.6s** → ~**0.28 samples/s**, **~5.9 frames/s**
+**Observation:** similar flat throughput; batch size doesn’t improve samples/sec.
+
+#### Anchor Precompute Throughput (Phase‑1 outputs)
+- **DDIM 20 steps, B=4**: ~**61s/batch** (~0.066 samples/s, ~1.4 frames/s). Major bottleneck.
+- **DDIM 4 steps, B=4**: ~**9.65s/batch** (~0.41 samples/s, ~8.7 frames/s).
+- **DDIM 4 steps, B=2**: ~**5–6s/batch** (~0.35–0.40 samples/s).
+
+#### Long‑Run Calibration Attempt
+- Phase‑1 long run (B=4, steps=100, log_every=10) hit tool timeout at step ~86.
+  - Step time was stable around **13.75s**, consistent with short‑run throughput.
+
+### 2026-02-03 (PM) — TurboDiffusion Repo + Dataset Timing Notes
+- TurboDiffusion synthetic dataset latents are **[C=16, T=21, H=60, W=104]**; the Wan2.1 tokenizer uses **temporal compression factor 4**, so **T=21 latent frames corresponds to 81 pixel frames**.  
+  - Sources (local clone): `tmp_repos/TurboDiffusion/turbodiffusion/rcm/tokenizers/wan2pt1.py` (temporal factor + latent frame formula), and `tmp_repos/TurboDiffusion/turbodiffusion/rcm/datasets/build_synthetic_dataset.py` (default `--num_frames 81`).  
+  - If using the repo’s default visualization fps=16, this is ~**5.1s** per clip (assumed; fps not explicitly stored in dataset shards).  
+- **SLA training (Wan2.1 1.3B)** config: `tmp_repos/TurboDiffusion/turbodiffusion/rcm/configs/experiments/sla/wan2pt1_t2v.py`  
+  - `max_iter=100_000`, `batch_size=4`, `lr=1e-5`, `sla_topk=0.1`, `state_t=21`, `teacher_guidance=5.0`, `precision=bfloat16`.  
+  - Uses teacher ckpt; **teacher frozen** and **conditioner frozen**; **student net trained**.  
+  - See model code: `tmp_repos/TurboDiffusion/turbodiffusion/rcm/models/t2v_model_sla.py` (teacher `requires_grad_(False)`, conditioner no trainable params).  
+- **rCM distillation (Wan2.1 1.3B)** config: `tmp_repos/TurboDiffusion/turbodiffusion/rcm/configs/experiments/rcm/wan2pt1_t2v.py`  
+  - `max_iter=100_000`, `batch_size=1`, `lr=2e-6`, `student_update_freq=5`, `tangent_warmup=1000`, `state_t=20`, `max_simulation_steps_fake=4`.  
+  - Teacher/conditioner frozen; student net + optional fake‑score net trained.  
+  - See model code: `tmp_repos/TurboDiffusion/turbodiffusion/rcm/models/t2v_model_distill_rcm.py`.
+
+### 2026-02-03 (PM) — Wan2.1 Attention vs MLP Profiling (Diffusers)
+- Profiled **Wan2.1 1.3B Diffusers** forward pass on B200 using a real Wan synth sample (T=21 latent frames, bf16).  
+  - Hooked `WanAttention` and `FeedForward` modules; measured with CUDA events for one forward.  
+  - **B=1:** total ≈ **765 ms**, attention ≈ **81%**, MLP ≈ **5%**, other ≈ **14%**.  
+  - **B=2:** total ≈ **1527 ms**, attention ≈ **80%**, MLP ≈ **5.5%**, other ≈ **14%**.  
+- Conclusion: **attention dominates runtime (~80%)**, so SLA‑style sparsity is likely to yield large speedups if kernels are available.
+
+### 2026-02-03 (PM) — SageSLA Integration (Diffusers Wan2.1)
+- Added **SageSLA/SLA attention processor** for Diffusers Wan2.1: `src/models/wan_sla.py`.  
+  - Implements a `WanSLAProcessor` (per‑layer) and `apply_wan_sla()` to swap `WanAttention` processors.  
+  - Supports `attention_type={sla,sagesla}` and `sla_topk`.  
+- Wired flags into Wan synth training + precompute:  
+  - `src/train/train_keypoints_wansynth.py`  
+  - `src/train/train_interp_levels_wansynth.py`  
+  - `scripts/datasets/wan_synth/precompute_phase1_anchors.py`  
+  - Pipeline scripts: `scripts/run_wansynth_pipeline_debug.sh`, `scripts/run_wansynth_pipeline_full.sh`  
+- New CLI flags: `--wan_attn {default,sla,sagesla}` and `--sla_topk`.  
+- Decision leaning: **skip LoRA when using SLA** (so SLA’s `proj_l` parameters can train; LoRA-only would freeze them).  
+- Next: **top‑k sweep** to find quality/throughput knee (paper warns quality drops at extreme sparsity).  
+
+### 2026-02-03 (PM) — SageSLA Build Fix
+- **SageSLA build failed** with NVCC redefinition errors from `/usr/include/.../c++config.h` when using upstream `SpargeAttn`.  
+- Installed `ninja-build` and **GCC/G++ 12**, but errors persisted.  
+- **Patched local SpargeAttn** at `tmp_repos/SpargeAttn/setup.py` to **remove** `-Xcompiler -include,cassert` from `NVCC_FLAGS` (comment said it was for SM90+, but it triggered redefinition errors in this environment).  
+- Built + installed from local path with GCC 12: `pip install --no-build-isolation ./tmp_repos/SpargeAttn`  
+- Installed missing dependency `einops`; now `spas_sage_attn` loads and **`SAGESLA_ENABLED=True`** in `SLA.core`.  
+
+### 2026-02-03 (PM) — SageSLA NaN Fix + Anchor Load Robustness
+- **Root cause of NaNs**: `WanSLAProcessor._run_sla` permuted Q/K/V to `(B,H,L,D)`, but **SLA expects `(B,L,H,D)`** and internally transposes. This swapped L↔H, producing invalid block maps and NaNs for any sparsity (<1.0).  
+- **Fix**: pass Q/K/V to SLA **without permuting**. (`src/models/wan_sla.py`)  
+- **Verification**: forward pass with `sagesla` and `sla` at `topk=0.07` produces **no NaNs** on Wan2.1 diffusers model.  
+- **Anchor precompute fix**: apply SLA **before** loading checkpoints and use `strict=False` with validation so SLA keys are handled correctly; error if non‑SLA keys mismatch. (`scripts/datasets/wan_synth/precompute_phase1_anchors.py`)  
+- **Quick pipeline smoke test**: `scripts/run_wansynth_pipeline_debug.sh` with `WAN_ATTN=sagesla`, `SLA_TOPK=0.07`, 2 steps each stage, `BATCH=1` completed end‑to‑end (no NaNs).  
+- **Minor perf cleanup**: made `t_grid` contiguous in `_distance_alpha` to avoid `torch.searchsorted` non‑contiguous warning and extra copies. (`src/corruptions/video_keyframes.py`)  
+
+### 2026-02-03 (PM) — SLA Throughput Calibration (topk=0.07, no LoRA)
+- **Phase‑1 (Wan2.1 + SageSLA, B=2, steps=10)**  
+  - Step time ≈ **2.6–2.8s** (first step ~3.1s)  
+  - Throughput ≈ **0.7–0.8 samples/s**, **~15–16 frames/s** (T=21)  
+- **Phase‑2 (Wan2.1 + SageSLA, B=2, steps=10)**  
+  - Step time ≈ **2.6–2.7s** (first step ~3.2s)  
+  - Throughput ≈ **0.7–0.8 samples/s**, **~15–16 frames/s**  
+- **Anchor precompute (DDIM‑4, B=2, 2 batches)**  
+  - Warmup batch ~9.7s; steady batch ~**5–6s**  
+  - Rough throughput ≈ **0.35–0.4 samples/s** (≈7–8 fps) after warm‑up  
+
+### 2026-02-03 (PM) — Longer SLA Calibration (stable curves)
+- **Phase‑1 (Wan2.1 + SageSLA, B=2, steps=200, log_every=10)**  
+  - Avg `step_time_sec` ≈ **2.67s**, avg `samples_per_sec` ≈ **0.75**  
+  - TensorBoard: `runs/keypoints_wansynth_calib_sla_long`  
+- **Phase‑2 (Wan2.1 + SageSLA, B=2, steps=200, log_every=10)**  
+  - Avg `step_time_sec` ≈ **2.64s**, avg `samples_per_sec` ≈ **0.76**  
+  - TensorBoard: `runs/interp_levels_wansynth_calib_sla_long`  
+- **Anchor precompute (DDIM‑4, B=2, 20 batches)**  
+  - Warmup ~24s for first batch; steady state ≈ **2.38s/batch**  
+  - Throughput ≈ **0.84 samples/s**  
+
+### 2026-02-03 (PM) — Video D_phi/Selector Pipeline Order
+- **Decision**: D_phi targets will be computed on a **subsample** of the dataset (aggressive subsampling ok).  
+- **Order**: train **interpolator** → compute **teacher/student KL** (student = keyframes + interpolation) → train **D_phi** → train **selector**.  
+
+### 2026-02-03 (PM) — Interpolator Long Run (Wan synth)
+- **Run**: `src/train/train_flow_interpolator_wansynth.py`  
+  - `steps=10000`, `batch=8`, `model_dtype=bf16`, `T=21`  
+  - Data: `data/wan_synth/.../shard-*.tar`  
+  - Logs: `runs/latent_flow_interp_wansynth_long`  
+  - Ckpt: `checkpoints/latent_flow_interp_wansynth_long/ckpt_final.pt`  
+  - Wall‑time: **~5.4 min** (10k steps)  
+  - Approx throughput: **~30 steps/s** → **~240 samples/s** (B=8)  
+- Final loss: **~0.235**  
+
+### 2026-02-03 (PM) — Interpolator Eval (latent L1 vs LERP)
+- Script: `scripts/eval_flow_interpolator_wansynth.py`  
+- Data: `data/wan_synth/.../shard-0000*.tar`, `num_batches=200`, `B=8` (1600 samples)  
+- Checkpoint: `checkpoints/latent_flow_interp_wansynth_long/ckpt_final.pt`  
+- Results (latent L1):  
+  - Flow interp: **0.2432**  
+  - LERP baseline: **0.2412**  
+  - Relative improvement: **-0.8%** (LERP slightly better on pure L1)  
+  - Uncertainty correlation (Pearson): **0.696**  
+  - Low‑unc error: **0.1387** vs High‑unc error: **0.4102**  
+  - Gap buckets (flow vs lerp):  
+    - 2–3: **0.1738 vs 0.1719**  
+    - 4–6: **0.2119 vs 0.2080**  
+    - 7–10: **0.2539 vs 0.2500**  
+    - 11–20: **0.3125 vs 0.3125**  
+
+### 2026-02-03 (PM) — Interpolator Train/Val Split + Residual Refiner
+- **Change**: added residual refiner + time conditioning in `LatentFlowInterpolator`; training script now supports `--train_pattern`, `--val_pattern`, and periodic eval.  
+- **Train**: `src/train/train_flow_interpolator_wansynth.py`  
+  - Train shards: `shard-0000[0-7].tar`  
+  - Val shards: `shard-0000[8-9].tar`  
+  - `steps=10000`, `batch=8`, `model_dtype=bf16`  
+  - `residual_blocks=2`, `residual_channels=32`  
+  - Logs: `runs/latent_flow_interp_wansynth_residual`  
+  - Ckpt: `checkpoints/latent_flow_interp_wansynth_residual/ckpt_final.pt`  
+- **Eval (val)**: `scripts/eval_flow_interpolator_wansynth.py`  
+  - `num_batches=200`, `B=8` (1600 samples)  
+  - Flow L1: **0.243164**  
+  - LERP L1: **0.242188**  
+  - Relative improvement: **-0.4%** (LERP still slightly better on L1)  
+  - Uncertainty correlation (Pearson): **0.780**  
+  - Low‑unc error: **0.1206** vs High‑unc error: **0.4063**  
+  - Gap buckets (flow vs lerp):  
+    - 2–3: **0.1738 vs 0.1748**  
+    - 4–6: **0.2188 vs 0.2188**  
+    - 7–10: **0.2500 vs 0.2490**  
+    - 11–20: **0.3086 vs 0.3066**  
+
+### 2026-02-03 (PM) — Interpolator Loss/Capacity Ablations (Wan synth)
+- **Code changes**:  
+  - Added `predict_flow` / `blend_from_flow` to reuse flow in training.  
+  - Added loss knobs: endpoint consistency, flow consistency, gap‑weighted L1.  
+  - New CLI: `--endpoint_weight`, `--flow_consistency_weight`, `--gap_weight`, `--gap_gamma`.  
+
+- **Run A: capacity only (bigger net)**  
+  - `base_channels=64`, `residual_blocks=4`, `residual_channels=64`  
+  - Train shards: `shard-0000[0-7].tar`  
+  - Val shards: `shard-0000[8-9].tar`  
+  - Steps: 10k, B=8, bf16  
+  - Ckpt: `checkpoints/latent_flow_interp_wansynth_residual_cap64/ckpt_final.pt`  
+  - Eval (val, 1600 samples):  
+    - Flow L1: **0.2891**  
+    - LERP L1: **0.2432**  
+    - Relative improve: **-18.9%** (worse than LERP)  
+    - Unc corr: **0.822**  
+    - Gap buckets (flow vs lerp): 2–3 **0.2461 vs 0.1787**, 4–6 **0.2734 vs 0.2100**, 7–10 **0.2988 vs 0.2617**, 11–20 **0.3281 vs 0.3008**  
+
+- **Run B: capacity + extra losses**  
+  - Same capacity as Run A  
+  - Added `endpoint_weight=0.1`, `flow_consistency_weight=0.05`, `gap_weight=1.0`, `gap_gamma=1.0`  
+  - Ckpt: `checkpoints/latent_flow_interp_wansynth_residual_v2/ckpt_final.pt`  
+  - Eval (val, 1600 samples):  
+    - Flow L1: **0.2871**  
+    - LERP L1: **0.2471**  
+    - Relative improve: **-16.2%** (still worse than LERP)  
+    - Unc corr: **0.811**  
+    - Gap buckets (flow vs lerp): 2–3 **0.2461 vs 0.1787**, 4–6 **0.2734 vs 0.2246**, 7–10 **0.2910 vs 0.2559**, 11–20 **0.3262 vs 0.3066**  
+
+- **Takeaway**: Larger capacity and the new loss terms **degraded** latent L1 vs LERP. The smaller model (base_channels=32) remains closest to LERP.  
+
+### 2026-02-03 (PM) — Interpolator Time‑Mask + Gap Conditioning Ablations
+- **Change**: added **time‑dependent mask** and optional **gap conditioning** to latent flow interpolator.  
+  - `mask = sigmoid(mask_a + mask_b * (2*alpha - 1))`  
+  - `gap_norm` can be concatenated as an extra input channel (and fed to residual refiner).  
+- **Run A (time_mask=1, gap_cond=0, base=32)**  
+  - Ckpt: `checkpoints/latent_flow_interp_wansynth_timemask/ckpt_final.pt`  
+  - Eval (val, 1600 samples):  
+    - Flow L1: **0.2295**  
+    - LERP L1: **0.2422**  
+    - Relative improve: **+5.2%**  
+    - Unc corr: **0.812**  
+- **Run B (time_mask=1, gap_cond=1)**  
+  - Ckpt: `checkpoints/latent_flow_interp_wansynth_timegap/ckpt_final.pt`  
+  - Eval: Flow L1 **0.2314** vs LERP **0.2432** (≈ **+4.8%**)  
+- **Run C (time_mask=1, gap_cond=1, gap_weight=0.5)**  
+  - Ckpt: `checkpoints/latent_flow_interp_wansynth_timegap_gw05/ckpt_final.pt`  
+  - Eval: Flow L1 **0.2344** vs LERP **0.2461** (≈ **+4.8%**)  
+- **Run D (time_mask=1, base=48)**  
+  - Ckpt: `checkpoints/latent_flow_interp_wansynth_timemask_c48/ckpt_final.pt`  
+  - Eval: Flow L1 **0.2246** vs LERP **0.2432** (≈ **+7.6%**)  
+  - Unc corr: **0.820**  
+  - Gap buckets (flow vs lerp): 2–3 **0.1621 vs 0.1670**, 4–6 **0.2002 vs 0.2148**, 7–10 **0.2373 vs 0.2578**, 11–20 **0.2813 vs 0.3086**  
+- **Run E (time_mask=1, residual_blocks=0)**  
+  - Ckpt: `checkpoints/latent_flow_interp_wansynth_timemask_r0/ckpt_final.pt`  
+  - Eval: Flow L1 **0.2334** vs LERP **0.2402** (≈ **+2.8%**)  
+- **Run F (time_mask=1, residual_blocks=4)**  
+  - Ckpt: `checkpoints/latent_flow_interp_wansynth_timemask_rb4/ckpt_final.pt`  
+  - Eval: Flow L1 **0.2314** vs LERP **0.2441** (≈ **+5.2%**)  
+- **Takeaway**: time‑dependent mask **consistently beats LERP**; **gap conditioning did not help**. Best so far is **base_channels=48** with time‑mask only.  
+
+### 2026-02-03 (PM) — Interpolator RGB Decode Eval (Wan VAE)
+- **Script**: `scripts/eval_flow_interpolator_wansynth_rgb.py`  
+- **Data**: val shards `shard-0000[8-9].tar`, `num_batches=50`, `B=4` (200 samples)  
+- **Checkpoint**: `checkpoints/latent_flow_interp_wansynth_timemask_c48/ckpt_final.pt`  
+- **VAE**: `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` (subfolder `vae`)  
+- **Results (RGB)**:  
+  - PSNR (flow): **20.1254 dB**  
+  - PSNR (lerp): **20.5339 dB**  
+  - SSIM (flow): **0.77772**  
+  - SSIM (lerp): **0.77393**  
+  - **Δ**: PSNR **-0.41 dB** (flow worse), SSIM **+0.0038** (flow slightly better)  
+- **Note**: latent L1 improved vs LERP, but decoded PSNR is slightly worse on this subset; SSIM slightly better.  
+
+### 2026-02-03 (PM) — Interpolator Cost‑Volume + Structural Losses (Wan synth)
+- **Change**: added **low‑res cost volume** input + **structure‑biased losses**:  
+  - Cost volume: downsample 2×, radius=2, normalized dot‑product (channels=(2r+1)^2).  
+  - Losses: gradient/edge L1 + multi‑scale latent L1 (scales 2,4).  
+- **Train**: `src/train/train_flow_interpolator_wansynth.py`  
+  - Train shards: `shard-0000[0-7].tar`  
+  - Val shards: `shard-0000[8-9].tar`  
+  - `steps=10000`, `batch=8`, `bf16`  
+  - `time_mask=1`, `base_channels=48`, `residual_blocks=2`  
+  - `cost_volume=1`, `cv_radius=2`, `cv_downscale=2`, `cv_norm=1`  
+  - `edge_weight=0.1`, `ms_weight=0.1`, `ms_scales=2,4`  
+  - Logs: `runs/latent_flow_interp_wansynth_c48_cv`  
+  - Ckpt: `checkpoints/latent_flow_interp_wansynth_c48_cv/ckpt_final.pt`  
+- **Eval (val, latent L1)**:  
+  - Flow L1: **0.2227**  
+  - LERP L1: **0.2441**  
+  - Relative improve: **+8.8%** (best so far)  
+  - Gap buckets (flow vs lerp): 2–3 **0.1729 vs 0.1787**, 4–6 **0.1943 vs 0.2119**, 7–10 **0.2393 vs 0.2637**, 11–20 **0.2695 vs 0.3008**  
+- **Eval (val, RGB decode)**:  
+  - PSNR (flow): **19.9715 dB**  
+  - PSNR (lerp): **20.2620 dB**  
+  - SSIM (flow): **0.77283**  
+  - SSIM (lerp): **0.76688**  
+  - **Δ**: PSNR **-0.29 dB**, SSIM **+0.0060**  
+- **Takeaway**: latent structure improved; decoded SSIM improves slightly but PSNR still trails LERP.  
+
+### 2026-02-03 (PM) — LDMVFI Teacher Distillation (Planned)
+- **Decision**: Distill the cheap latent flow interpolator from **LDMVFI** (latent diffusion VFI) using **teacher‑generated mid‑frames**; avoid FP4 training.  
+- **Teacher repo** cloned at `tmp_repos/LDMVFI` (MIT license; pretrained weights available per README).  
+- **New code**:
+  - `src/teachers/ldmvfi_teacher.py`: wrapper to load LDMVFI, run DDIM sampling, and decode interpolated RGB frames.  
+  - `scripts/datasets/wan_synth/precompute_ldmvfi_teacher.py`: precompute LDMVFI teacher outputs, encode with Wan VAE, and store `teacher.pt` + `teacher_idx.pt` in WebDataset shards.  
+  - `src/data/wan_synth.py`: added `create_wan_synth_teacher_dataloader` to join base data with teacher shards by key.  
+  - `src/train/train_flow_interpolator_wansynth.py`: added `--teacher_pattern`, `--teacher_weight`, `--gt_weight`; training uses teacher latents when provided.  
+- **Open**: install LDMVFI deps (omegaconf, pytorch‑lightning, timm, taming‑transformers, clip) and download pretrained ckpt to actually run teacher precompute.  
+
+### 2026-02-03 (PM) — LDMVFI Teacher Distillation (Setup + Debug)
+- **Venv**: created `/.venv_ldmvfi` (separate env for LDMVFI) with deps: `omegaconf`, `pytorch-lightning==2.2.4`, `cupy-cuda12x`, `gdown` (+ taming‑transformers from git).  
+- **Checkpoint**: downloaded LDMVFI pretrained ckpt to `checkpoints/ldmvfi/ldmvfi-vqflow-f32-c256-concat_max.ckpt` (≈3.4GB).  
+- **Patches**:
+  - `src/teachers/ldmvfi_teacher.py`:  
+    - Added Lightning `rank_zero_only` compatibility shim.  
+    - Added fallback to locate `taming-transformers` in venv.  
+    - Skip `ema_scope()` on assertion failure.  
+  - `scripts/datasets/wan_synth/precompute_ldmvfi_teacher.py`:  
+    - Fixed even-gap sampling (avoid invalid randint).  
+    - Write WebDataset fields as `teacher.pth` + `teacher_idx.pth`.  
+  - `src/data/wan_synth.py`:  
+    - Teacher dataloader now maps `teacher.pth` / `teacher_idx.pth`.  
+  - `src/train/train_flow_interpolator_wansynth.py`:  
+    - Teacher dataloader uses `allow_missing=True` to avoid join buffer overflow on partial teacher shards.  
+- **Debug precompute**:  
+  - Ran `scripts/datasets/wan_synth/precompute_ldmvfi_teacher.py` with `ddim_steps=20`, `batch=1`, `max_batches=2`, `max_hw=256`.  
+  - Output: `data/wan_synth_ldmvfi_teacher_debug2/teacher-000000.tar`.  
+- **Debug train**:  
+  - `train_flow_interpolator_wansynth.py` with `--teacher_pattern data/wan_synth_ldmvfi_teacher_debug2/teacher-*.tar` ran 5 steps successfully.  
+
+### 2026-02-03 (PM) — LDMVFI Teacher Distillation (Full Precompute Settings)
+- **Confirmed settings**: `ddim_steps=30`, `max_hw=256` for LDMVFI teacher precompute on Wan2.1 synth data.  
+- **Plan**: run full teacher precompute with these settings, then train the flow interpolator with `--teacher_pattern` against the teacher latents.  
+
+### 2026-02-03 (PM) — LDMVFI Precompute Throughput Calibration + Storage Bug
+- **Calibration** (50 batches on shard-0000*, `ddim_steps=30`, `max_hw=256`, `num_workers=8`):  
+  - **B=8**: ~**1.84 s/it** → **~4.35 samples/s**  
+  - **B=16**: ~**2.59 s/it** → **~6.18 samples/s**  
+  - **B=32**: ~**4.02 s/it** → **~7.96 samples/s** (best)  
+  - **ETA @ 250k samples**: ~**8.7 hours** at B=32 (linear scaling).  
+- **Found bug**: each `teacher.pth` in calibration shards was ~6.3MB because `zt[i]` was a view into the batch storage; `torch.save` serialized the **entire batch** for every sample.  
+- **Fix**: clone per-sample tensors before write (`zt[i].contiguous().clone()`, `t_info[i].contiguous().clone()`) in `scripts/datasets/wan_synth/precompute_ldmvfi_teacher.py`.  
+- **Action**: re-run full teacher precompute after the fix (and optionally delete large calibration shards).  
+
+### 2026-02-03 (PM) — LDMVFI Teacher Precompute (5k staged)
+- **Started** staged teacher precompute to avoid full 250k upfront.  
+- Settings: `ddim_steps=30`, `max_hw=256`, `batch=32`, `num_workers=8`, `max_batches=157` (~5,024 samples).  
+- Output: `data/wan_synth_ldmvfi_teacher_5k_b32`, log: `logs/ldmvfi_teacher_5k_b32.log`.  
+
+### 2026-02-03 (PM) — Training Curves as PNGs
+- Added `scripts/plot_tensorboard_scalars.py` to export TensorBoard scalars into PNGs (default output: `<log_dir>/plots/`).  
+
+### 2026-02-03 (PM) — Flow Interpolator Training (LDMVFI 5k)
+- **Run started**: LDMVFI‑distilled flow interpolator on 5k teacher set.  
+- Train cmd: `train_flow_interpolator_wansynth.py`  
+- Settings: `steps=5000`, `batch=64`, `model_dtype=bf16`, `time_mask=1`, `gap_cond=1`, `cost_volume=1`, `cv_radius=2`, `cv_downscale=2`.  
+- Data: `train_pattern=shard-000[0-1]*.tar` (first ~20 shards), `val_pattern=shard-0096*.tar` (held‑out).  
+- Outputs: `runs/latent_flow_interp_ldmvfi_5k_b32`, `checkpoints/latent_flow_interp_ldmvfi_5k_b32`.  
+- Post‑run: auto‑export PNG curves + latent & RGB eval logs.  
+
+### 2026-02-03 (PM) — LDMVFI 5k Run (Results)
+- **Teacher dataset**: regenerated as **self‑contained** shards (includes `latent.pth`, `embed.pth`, `prompt.txt`, `teacher.pth`, `teacher_idx.pth`) to avoid key‑join issues.  
+- Size: **~41 GB** for 5k samples.  
+- **Training** (GPU): 5,000 steps completed successfully.  
+- **Eval (val, latent L1 vs GT)**:  
+  - `mean L1 (flow)` **0.5078**  
+  - `mean L1 (lerp)` **0.2334**  
+  - **Result**: flow is **much worse** than lerp on GT.  
+- **Diagnosis**: model **fits teacher** but teacher is **far from GT**.  
+  - L1 vs teacher ≈ **0.167**  
+  - L1 vs GT ≈ **0.535**  
+  → LDMVFI teacher outputs are **not aligned** with Wan synth GT latents.  
+- **Implication**: LDMVFI is not a good teacher for Wan2.1 synth latents (domain/scale mismatch). Need a different teacher or distillation target.  
+
+### 2026-02-03 (PM) — Cleanup + Pivot Discussion
+- **Deleted** the 5k self‑contained teacher dataset (`data/wan_synth_ldmvfi_teacher_5k_b32`, ~41 GB).  
+- **Consensus**: latent interpolation likely suffers from **geometry mismatch** (latent space not Euclidean), per discussion of non‑Euclidean shape space / geodesics in the ML thread.  
+- **Potential next directions**:  
+  - Train a **cheap bridge residual** (LERP + tiny residual) directly on **GT mid‑latents**, optionally with curvature/acceleration penalties.  
+  - Consider **latent straightening** (learn an invertible linear map so LERP approximates geodesics).  
+
+### 2026-02-03 (PM) — Teacher Key Order Issue (Fix)
+- **Issue**: training failed immediately (`StopIteration`) because teacher shards were generated with `num_workers=8`, causing key order to diverge from base dataset.  
+- **Symptom**: `_KeyJoinIterableDataset` overflowed buffer (`max_buffer=2000`) when trying to match keys (teacher keys far out of order).  
+- **Fix**: re‑precompute the 5k teacher set with **`num_workers=0`** to preserve sequential order (deleted old unordered shards).  
+- **New run**: `logs/ldmvfi_teacher_5k_b32_ordered.log`, output `data/wan_synth_ldmvfi_teacher_5k_b32`.  
+
+### 2026-02-03 (PM) — Shard Ordering Bug (Root Cause)
+- **Root cause**: `glob.glob()` returned shards in filesystem order (not sorted), so dataloaders started at ~`shard-0096x` (keys ≈ 247k).  
+- **Symptom**: teacher and base streams were aligned but started near the end, causing key‑join mismatch with any expectation of low‑index keys.  
+- **Fix**: sort shard lists in `create_wan_synth_dataloader`, `create_wan_synth_anchor_dataloader`, and `create_wan_synth_teacher_dataloader`.  

@@ -110,7 +110,7 @@ def _distance_alpha(idx: torch.Tensor, T: int) -> torch.Tensor:
     B, K = idx.shape
     device = idx.device
     idx = idx.contiguous()
-    t_grid = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+    t_grid = torch.arange(T, device=device).unsqueeze(0).expand(B, T).contiguous()
     seg = torch.searchsorted(idx, t_grid, right=True) - 1
     seg = seg.clamp(0, K - 2)
     left_idx = idx.gather(1, seg)
@@ -134,6 +134,8 @@ def build_video_interp_level_batch(
     anchor_noise_frac: float = 0.25,
     student_replace_prob: float = 0.5,
     student_noise_std: float = 0.02,
+    anchor_values: Optional[torch.Tensor] = None,
+    anchor_idx: Optional[torch.Tensor] = None,
     conf_anchor: float = 0.95,
     conf_student: float = 0.5,
     conf_endpoints: float = 1.0,
@@ -229,6 +231,8 @@ def build_video_interp_adjacent_batch(
     anchor_noise_frac: float = 0.25,
     student_replace_prob: float = 0.5,
     student_noise_std: float = 0.02,
+    anchor_values: Optional[torch.Tensor] = None,
+    anchor_idx: Optional[torch.Tensor] = None,
     conf_anchor: float = 0.95,
     conf_student: float = 0.5,
     conf_endpoints: float = 1.0,
@@ -341,6 +345,8 @@ def build_video_token_interp_level_batch(
     masks_levels: Optional[torch.Tensor] = None,
     idx_levels: Optional[List[torch.Tensor]] = None,
     s_idx: Optional[torch.Tensor] = None,
+    anchor_values: Optional[torch.Tensor] = None,
+    anchor_idx: Optional[torch.Tensor] = None,
     corrupt_mode: str = "gauss",
     corrupt_sigma: float = 0.02,
     anchor_noise_frac: float = 0.25,
@@ -357,6 +363,9 @@ def build_video_token_interp_level_batch(
     flow_warper: Optional["FlowWarpInterpolator"] = None,
     patch_size: Optional[int] = None,
     spatial_shape: Optional[Tuple[int, int]] = None,
+    uncertainty_mode: str = "none",
+    uncertainty_weight: float = 1.0,
+    uncertainty_power: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], torch.Tensor]:
     """Interpolation corruption for tokenized video latents.
 
@@ -403,8 +412,54 @@ def build_video_token_interp_level_batch(
             if clamp_endpoints:
                 replace_mask = replace_mask & ~(idx == 0) & ~(idx == (T - 1))
             replace_mask_rep = replace_mask.repeat_interleave(N, dim=0)
-            student_noise = torch.randn_like(vals) * float(student_noise_std)
-            vals = torch.where(replace_mask_rep.unsqueeze(-1), vals + student_noise, vals)
+            anchor_vals_rep = None
+            if anchor_values is not None:
+                if anchor_values.dim() != 4:
+                    raise ValueError("anchor_values must be [B,T,N,D] or [B,K,N,D]")
+                if anchor_values.shape[:3] == z0_tokens.shape[:3]:
+                    anchor_full = anchor_values[sel]
+                    anchor_flat = anchor_full.permute(0, 2, 1, 3).reshape(b_sel * N, T, D)
+                    anchor_vals_rep = anchor_flat.gather(
+                        1, idx_rep.unsqueeze(-1).expand(-1, idx_rep.shape[1], D)
+                    )
+                elif anchor_values.shape[2] == N:
+                    anchor_vals = anchor_values[sel]
+                    if anchor_idx is not None:
+                        anchor_idx_sel = anchor_idx[sel]
+                        if anchor_idx_sel.shape[1] != anchor_values.shape[1]:
+                            raise ValueError("anchor_idx shape mismatch for anchor_values")
+                        lookup = torch.full((b_sel, T), -1, device=device, dtype=torch.long)
+                        pos_grid = torch.arange(anchor_idx_sel.shape[1], device=device).view(1, -1).expand(b_sel, -1)
+                        lookup.scatter_(1, anchor_idx_sel, pos_grid)
+                        pos = lookup.gather(1, idx)
+                        valid = pos >= 0
+                        pos = pos.clamp(min=0)
+                        anchor_vals_sel = anchor_vals.gather(
+                            1, pos.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D)
+                        )
+                        anchor_vals_rep = anchor_vals_sel.permute(0, 2, 1, 3).reshape(b_sel * N, idx.shape[1], D)
+                        if not torch.all(valid):
+                            valid_rep = valid.repeat_interleave(N, dim=0)
+                            replace_mask_rep = replace_mask_rep & valid_rep.unsqueeze(1)
+                    elif anchor_values.shape[1] == idx.shape[1]:
+                        anchor_vals_rep = anchor_vals.permute(0, 2, 1, 3).reshape(b_sel * N, idx.shape[1], D)
+                    else:
+                        raise ValueError("anchor_values/anchor_idx mismatch for token anchors")
+                else:
+                    raise ValueError("anchor_values shape mismatch for token anchors")
+                if anchor_idx is not None and anchor_values.shape[:3] == z0_tokens.shape[:3]:
+                    anchor_idx_sel = anchor_idx[sel]
+                    if anchor_idx_sel.shape != idx.shape:
+                        raise ValueError("anchor_idx shape mismatch")
+                    match = (anchor_idx_sel == idx).all(dim=1)
+                    if not torch.all(match):
+                        match_rep = match.repeat_interleave(N, dim=0)
+                        replace_mask_rep = replace_mask_rep & match_rep.unsqueeze(1)
+            if anchor_vals_rep is not None:
+                vals = torch.where(replace_mask_rep.unsqueeze(-1), anchor_vals_rep, vals)
+            else:
+                student_noise = torch.randn_like(vals) * float(student_noise_std)
+                vals = torch.where(replace_mask_rep.unsqueeze(-1), vals + student_noise, vals)
 
         if interp_mode == "flow":
             if not _FLOW_AVAILABLE or flow_warper is None:
@@ -413,7 +468,14 @@ def build_video_token_interp_level_batch(
                 raise ValueError("flow interp requires patch_size and spatial_shape")
             latents_sel = unpatchify_tokens(z0_tokens[sel], patch_size, spatial_shape)
             latents_sel = _apply_anchor_noise_latents(latents_sel, idx, replace_mask, student_noise_std)
+            flow_dtype = next(flow_warper.parameters()).dtype
+            latents_sel = latents_sel.to(dtype=flow_dtype)
             zs_lat, conf_flow = flow_warper.interpolate(latents_sel, idx)
+            uncertainty = (1.0 - conf_flow).clamp(0.0, 1.0)
+            if uncertainty_power != 1.0:
+                uncertainty = uncertainty.pow(float(uncertainty_power))
+            if uncertainty_weight != 1.0:
+                uncertainty = (uncertainty * float(uncertainty_weight)).clamp(0.0, 1.0)
             conf_flow = _apply_anchor_conf_map(
                 conf_flow,
                 idx,
@@ -436,8 +498,14 @@ def build_video_token_interp_level_batch(
                         torch.ones_like(anchor_mask, dtype=zs_lat.dtype),
                     )
                     noise = noise * scale[:, :, None, None, None]
-                zs_lat = zs_lat + noise
+                if uncertainty_mode == "replace":
+                    zs_lat = zs_lat * (1.0 - uncertainty.unsqueeze(2)) + noise * uncertainty.unsqueeze(2)
+                elif uncertainty_mode == "add":
+                    zs_lat = zs_lat + noise * uncertainty.unsqueeze(2)
+                else:
+                    zs_lat = zs_lat + noise
             zs, _ = patchify_latents(zs_lat, patch_size)
+            zs = zs.to(dtype=z_interp.dtype)
             z_interp[sel] = zs
             mask_t = masks_levels[sel, s]
             mask_s[sel] = mask_t.unsqueeze(-1).expand(-1, -1, N)
@@ -488,6 +556,8 @@ def build_video_token_interp_adjacent_batch(
     masks_levels: Optional[torch.Tensor] = None,
     idx_levels: Optional[List[torch.Tensor]] = None,
     s_idx: Optional[torch.Tensor] = None,
+    anchor_values: Optional[torch.Tensor] = None,
+    anchor_idx: Optional[torch.Tensor] = None,
     corrupt_mode: str = "gauss",
     corrupt_sigma: float = 0.02,
     anchor_noise_frac: float = 0.25,
@@ -504,6 +574,9 @@ def build_video_token_interp_adjacent_batch(
     flow_warper: Optional["FlowWarpInterpolator"] = None,
     patch_size: Optional[int] = None,
     spatial_shape: Optional[Tuple[int, int]] = None,
+    uncertainty_mode: str = "none",
+    uncertainty_weight: float = 1.0,
+    uncertainty_power: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], torch.Tensor, torch.Tensor]:
     if z0_tokens.dim() != 4:
         raise ValueError("z0_tokens must have shape [B,T,N,D]")
@@ -553,10 +626,82 @@ def build_video_token_interp_adjacent_batch(
                 replace_mask_p = replace_mask_p & ~(idx_p == 0) & ~(idx_p == (T - 1))
             replace_mask_rep = replace_mask.repeat_interleave(N, dim=0)
             replace_mask_p_rep = replace_mask_p.repeat_interleave(N, dim=0)
-            student_noise = torch.randn_like(vals) * float(student_noise_std)
-            student_noise_p = torch.randn_like(vals_p) * float(student_noise_std)
-            vals = torch.where(replace_mask_rep.unsqueeze(-1), vals + student_noise, vals)
-            vals_p = torch.where(replace_mask_p_rep.unsqueeze(-1), vals_p + student_noise_p, vals_p)
+            anchor_vals_rep = None
+            anchor_vals_rep_p = None
+            if anchor_values is not None:
+                if anchor_values.dim() != 4:
+                    raise ValueError("anchor_values must be [B,T,N,D] or [B,K,N,D]")
+                if anchor_values.shape[:3] == z0_tokens.shape[:3]:
+                    anchor_full = anchor_values[sel]
+                    anchor_flat = anchor_full.permute(0, 2, 1, 3).reshape(b_sel * N, T, D)
+                    anchor_vals_rep = anchor_flat.gather(
+                        1, idx_rep.unsqueeze(-1).expand(-1, idx_rep.shape[1], D)
+                    )
+                    anchor_vals_rep_p = anchor_flat.gather(
+                        1, idx_p_rep.unsqueeze(-1).expand(-1, idx_p_rep.shape[1], D)
+                    )
+                elif anchor_values.shape[2] == N:
+                    anchor_vals = anchor_values[sel]
+                    if anchor_idx is not None:
+                        anchor_idx_sel = anchor_idx[sel]
+                        if anchor_idx_sel.shape[1] != anchor_values.shape[1]:
+                            raise ValueError("anchor_idx shape mismatch for anchor_values")
+                        lookup = torch.full((b_sel, T), -1, device=device, dtype=torch.long)
+                        pos_grid = torch.arange(anchor_idx_sel.shape[1], device=device).view(1, -1).expand(b_sel, -1)
+                        lookup.scatter_(1, anchor_idx_sel, pos_grid)
+                        pos = lookup.gather(1, idx)
+                        pos_p = lookup.gather(1, idx_p)
+                        valid = pos >= 0
+                        valid_p = pos_p >= 0
+                        pos = pos.clamp(min=0)
+                        pos_p = pos_p.clamp(min=0)
+                        anchor_vals_sel = anchor_vals.gather(
+                            1, pos.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D)
+                        )
+                        anchor_vals_sel_p = anchor_vals.gather(
+                            1, pos_p.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D)
+                        )
+                        anchor_vals_rep = anchor_vals_sel.permute(0, 2, 1, 3).reshape(b_sel * N, idx.shape[1], D)
+                        anchor_vals_rep_p = anchor_vals_sel_p.permute(0, 2, 1, 3).reshape(
+                            b_sel * N, idx_p.shape[1], D
+                        )
+                        if not torch.all(valid):
+                            valid_rep = valid.repeat_interleave(N, dim=0)
+                            replace_mask_rep = replace_mask_rep & valid_rep.unsqueeze(1)
+                        if not torch.all(valid_p):
+                            valid_rep_p = valid_p.repeat_interleave(N, dim=0)
+                            replace_mask_p_rep = replace_mask_p_rep & valid_rep_p.unsqueeze(1)
+                    elif anchor_values.shape[1] == idx.shape[1]:
+                        anchor_vals_rep = anchor_vals.permute(0, 2, 1, 3).reshape(b_sel * N, idx.shape[1], D)
+                        if idx_p.shape[1] == idx.shape[1]:
+                            anchor_vals_rep_p = anchor_vals_rep
+                        elif anchor_values.shape[1] == idx_p.shape[1]:
+                            anchor_vals_rep_p = anchor_vals.permute(0, 2, 1, 3).reshape(
+                                b_sel * N, idx_p.shape[1], D
+                            )
+                    elif anchor_values.shape[1] == idx_p.shape[1]:
+                        anchor_vals_rep_p = anchor_vals.permute(0, 2, 1, 3).reshape(b_sel * N, idx_p.shape[1], D)
+                    else:
+                        raise ValueError("anchor_values/anchor_idx mismatch for token anchors")
+                else:
+                    raise ValueError("anchor_values shape mismatch for token anchors")
+                if anchor_idx is not None and anchor_values.shape[:3] == z0_tokens.shape[:3]:
+                    anchor_idx_sel = anchor_idx[sel]
+                    if anchor_idx_sel.shape != idx.shape:
+                        raise ValueError("anchor_idx shape mismatch")
+                    match = (anchor_idx_sel == idx).all(dim=1)
+                    if not torch.all(match):
+                        match_rep = match.repeat_interleave(N, dim=0)
+                        replace_mask_rep = replace_mask_rep & match_rep.unsqueeze(1)
+                        replace_mask_p_rep = replace_mask_p_rep & match_rep.unsqueeze(1)
+            if anchor_vals_rep is not None and anchor_vals_rep_p is not None:
+                vals = torch.where(replace_mask_rep.unsqueeze(-1), anchor_vals_rep, vals)
+                vals_p = torch.where(replace_mask_p_rep.unsqueeze(-1), anchor_vals_rep_p, vals_p)
+            else:
+                student_noise = torch.randn_like(vals) * float(student_noise_std)
+                student_noise_p = torch.randn_like(vals_p) * float(student_noise_std)
+                vals = torch.where(replace_mask_rep.unsqueeze(-1), vals + student_noise, vals)
+                vals_p = torch.where(replace_mask_p_rep.unsqueeze(-1), vals_p + student_noise_p, vals_p)
 
         if interp_mode == "flow":
             if not _FLOW_AVAILABLE or flow_warper is None:
@@ -566,8 +711,19 @@ def build_video_token_interp_adjacent_batch(
             latents_sel = unpatchify_tokens(z0_tokens[sel], patch_size, spatial_shape)
             latents_sel_s = _apply_anchor_noise_latents(latents_sel, idx, replace_mask, student_noise_std)
             latents_sel_p = _apply_anchor_noise_latents(latents_sel, idx_p, replace_mask_p, student_noise_std)
+            flow_dtype = next(flow_warper.parameters()).dtype
+            latents_sel_s = latents_sel_s.to(dtype=flow_dtype)
+            latents_sel_p = latents_sel_p.to(dtype=flow_dtype)
             zs_lat, conf_flow = flow_warper.interpolate(latents_sel_s, idx)
             zp_lat, conf_flow_p = flow_warper.interpolate(latents_sel_p, idx_p)
+            uncertainty = (1.0 - conf_flow).clamp(0.0, 1.0)
+            uncertainty_p = (1.0 - conf_flow_p).clamp(0.0, 1.0)
+            if uncertainty_power != 1.0:
+                uncertainty = uncertainty.pow(float(uncertainty_power))
+                uncertainty_p = uncertainty_p.pow(float(uncertainty_power))
+            if uncertainty_weight != 1.0:
+                uncertainty = (uncertainty * float(uncertainty_weight)).clamp(0.0, 1.0)
+                uncertainty_p = (uncertainty_p * float(uncertainty_weight)).clamp(0.0, 1.0)
             conf_flow = _apply_anchor_conf_map(
                 conf_flow,
                 idx,
@@ -609,10 +765,19 @@ def build_video_token_interp_adjacent_batch(
                     )
                     noise = noise * scale[:, :, None, None, None]
                     noise_p = noise_p * scale_p[:, :, None, None, None]
-                zs_lat = zs_lat + noise
-                zp_lat = zp_lat + noise_p
+                if uncertainty_mode == "replace":
+                    zs_lat = zs_lat * (1.0 - uncertainty.unsqueeze(2)) + noise * uncertainty.unsqueeze(2)
+                    zp_lat = zp_lat * (1.0 - uncertainty_p.unsqueeze(2)) + noise_p * uncertainty_p.unsqueeze(2)
+                elif uncertainty_mode == "add":
+                    zs_lat = zs_lat + noise * uncertainty.unsqueeze(2)
+                    zp_lat = zp_lat + noise_p * uncertainty_p.unsqueeze(2)
+                else:
+                    zs_lat = zs_lat + noise
+                    zp_lat = zp_lat + noise_p
             zs, _ = patchify_latents(zs_lat, patch_size)
             zp, _ = patchify_latents(zp_lat, patch_size)
+            zs = zs.to(dtype=z_s.dtype)
+            zp = zp.to(dtype=z_prev.dtype)
             z_s[sel] = zs
             z_prev[sel] = zp
             mask_t = masks_levels[sel, s]
