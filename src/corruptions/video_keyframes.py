@@ -460,12 +460,19 @@ def build_video_token_interp_level_batch(
                 raise ValueError(f"{interp_mode} interp requested but warper is None")
             if patch_size is None or spatial_shape is None:
                 raise ValueError("flow interp requires patch_size and spatial_shape")
-            latents_sel = unpatchify_tokens(z0_tokens[sel], patch_size, spatial_shape)
-            latents_sel = _apply_anchor_noise_latents(latents_sel, idx, replace_mask, student_noise_std)
+            z0_sel_tokens = z0_tokens[sel]
+            z0_flat_repl = z0_sel_tokens.permute(0, 2, 1, 3).reshape(b_sel * N, T, D).clone()
+            z0_flat_repl.scatter_(
+                1,
+                idx_rep.unsqueeze(-1).expand(-1, idx_rep.shape[1], D),
+                vals,
+            )
+            z0_sel_tokens = z0_flat_repl.view(b_sel, N, T, D).permute(0, 2, 1, 3)
+            latents_sel = unpatchify_tokens(z0_sel_tokens, patch_size, spatial_shape)
             try:
                 flow_dtype = next(warper.parameters()).dtype
             except StopIteration:
-                flow_dtype = latents_sel.dtype
+                flow_dtype = latents_sel_s.dtype
             latents_sel = latents_sel.to(dtype=flow_dtype)
             zs_lat, conf_flow = warper.interpolate(latents_sel, idx)
             uncertainty = (1.0 - conf_flow).clamp(0.0, 1.0)
@@ -706,9 +713,24 @@ def build_video_token_interp_adjacent_batch(
                 raise ValueError(f"{interp_mode} interp requested but warper is None")
             if patch_size is None or spatial_shape is None:
                 raise ValueError("flow interp requires patch_size and spatial_shape")
-            latents_sel = unpatchify_tokens(z0_tokens[sel], patch_size, spatial_shape)
-            latents_sel_s = _apply_anchor_noise_latents(latents_sel, idx, replace_mask, student_noise_std)
-            latents_sel_p = _apply_anchor_noise_latents(latents_sel, idx_p, replace_mask_p, student_noise_std)
+            z0_sel_tokens = z0_tokens[sel]
+            z0_flat = z0_sel_tokens.permute(0, 2, 1, 3).reshape(b_sel * N, T, D).clone()
+            z0_flat_s = z0_flat.clone()
+            z0_flat_p = z0_flat.clone()
+            z0_flat_s.scatter_(
+                1,
+                idx_rep.unsqueeze(-1).expand(-1, idx_rep.shape[1], D),
+                vals,
+            )
+            z0_flat_p.scatter_(
+                1,
+                idx_p_rep.unsqueeze(-1).expand(-1, idx_p_rep.shape[1], D),
+                vals_p,
+            )
+            z0_sel_tokens_s = z0_flat_s.view(b_sel, N, T, D).permute(0, 2, 1, 3)
+            z0_sel_tokens_p = z0_flat_p.view(b_sel, N, T, D).permute(0, 2, 1, 3)
+            latents_sel_s = unpatchify_tokens(z0_sel_tokens_s, patch_size, spatial_shape)
+            latents_sel_p = unpatchify_tokens(z0_sel_tokens_p, patch_size, spatial_shape)
             try:
                 flow_dtype = next(warper.parameters()).dtype
             except StopIteration:

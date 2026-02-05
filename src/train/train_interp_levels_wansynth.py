@@ -171,6 +171,7 @@ def main() -> None:
     text_embed0 = text_embed0.to(device)
     tokens0, spatial_shape0 = patchify_latents(latents0, args.patch_size)
     B0, T0, N0, D0 = tokens0.shape
+    C0 = latents0.shape[2]
     if T0 != args.T:
         raise ValueError(f"T mismatch: batch={T0} args={args.T}")
     cond_encoder = TextConditionEncoder(text_dim=text_embed0.shape[-1], d_cond=args.d_cond).to(device)

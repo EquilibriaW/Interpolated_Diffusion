@@ -162,6 +162,9 @@ class SinkhornWarpInterpolator(nn.Module):
         B, Hp, Wp, _ = f0.shape
         f0_map = f0.permute(0, 3, 1, 2)
         f1_map = f1.permute(0, 3, 1, 2)
+        # Use a low-channel score map for global SE(2) to keep memory bounded.
+        f0_score = f0_map.mean(dim=1, keepdim=True)
+        f1_score = f1_map.mean(dim=1, keepdim=True)
 
         theta_all, dx_all, dy_all = self._get_se2_candidates(device=device, dtype=f0.dtype)
         num_cand = int(theta_all.numel())
@@ -194,13 +197,13 @@ class SinkhornWarpInterpolator(nn.Module):
             mat[:, :, 1, 2] = ty
 
             mat = mat.view(B * csz, 2, 3)
-            f1_rep = f1_map.unsqueeze(1).expand(B, csz, -1, -1, -1).reshape(B * csz, -1, Hp, Wp)
+            f1_rep = f1_score.unsqueeze(1).expand(B, csz, -1, -1, -1).reshape(B * csz, 1, Hp, Wp)
             grid = F.affine_grid(mat, size=f1_rep.shape, align_corners=True)
             f1_aligned = F.grid_sample(
                 f1_rep, grid, mode="bilinear", padding_mode="zeros", align_corners=True
-            ).view(B, csz, -1, Hp, Wp)
+            ).view(B, csz, 1, Hp, Wp)
 
-            score = (f1_aligned * f0_map.unsqueeze(1)).mean(dim=(2, 3, 4))
+            score = (f1_aligned * f0_score.unsqueeze(1)).mean(dim=(2, 3, 4))
             score_chunk, idx_chunk = score.max(dim=1)
             better = score_chunk > best_score
             best_score = torch.where(better, score_chunk, best_score)
@@ -440,21 +443,14 @@ class SinkhornWarpInterpolator(nn.Module):
         feats = feats.view(B, T, hp, wp, -1)
 
         pair_meta = []
+        idx_sorted = []
         for b in range(B):
             idx_b = idx[b].clone()
             idx_b, _ = torch.sort(idx_b)
+            idx_sorted.append(idx_b)
             anchors = latents[b, idx_b]
             out[b, idx_b] = anchors
             conf[b, idx_b] = 1.0
-            for k in range(idx_b.shape[0] - 1):
-                t0 = int(idx_b[k].item())
-                t1 = int(idx_b[k + 1].item())
-                if t1 <= t0:
-                    continue
-                gap = t1 - t0
-                if gap <= 1:
-                    continue
-                pair_meta.append((b, t0, t1))
 
             first = int(idx_b[0].item())
             last = int(idx_b[-1].item())
@@ -465,33 +461,47 @@ class SinkhornWarpInterpolator(nn.Module):
                 out[b, last + 1 :] = anchors[-1].unsqueeze(0).expand(T - last - 1, -1, -1, -1)
                 conf[b, last + 1 :] = conf[b, last : last + 1]
 
-        if not pair_meta:
+        idx_sorted = torch.stack(idx_sorted, dim=0)
+        t0 = idx_sorted[:, :-1]
+        t1 = idx_sorted[:, 1:]
+        gap = t1 - t0
+        pair_mask = gap > 1
+        if torch.any(pair_mask):
+            pair_b, pair_k = torch.nonzero(pair_mask, as_tuple=True)
+            pair_t0 = t0[pair_b, pair_k]
+            pair_t1 = t1[pair_b, pair_k]
+        else:
+            pair_b = pair_k = pair_t0 = pair_t1 = None
+
+        if pair_b is None or pair_b.numel() == 0:
             return out, conf
 
-        f0_list = []
-        f1_list = []
-        for b, t0, t1 in pair_meta:
-            f0_list.append(feats[b, t0])
-            f1_list.append(feats[b, t1])
-        f0 = torch.stack(f0_list, dim=0)
-        f1 = torch.stack(f1_list, dim=0)
+        f0 = feats[pair_b, pair_t0]
+        f1 = feats[pair_b, pair_t1]
 
-        flow01_tok, conf_tok = self._compute_flow_from_feats_batch(f0, f1)
-        flow10_tok, _ = self._compute_flow_from_feats_batch(f1, f0)
+        flow01_tok, conf01_tok = self._compute_flow_from_feats_batch(f0, f1)
+        flow10_tok, conf10_tok = self._compute_flow_from_feats_batch(f1, f0)
 
         flow01_tok = flow01_tok.permute(0, 3, 1, 2)  # [P,2,Hp,Wp]
         flow10_tok = flow10_tok.permute(0, 3, 1, 2)
         flow01 = F.interpolate(flow01_tok, size=(H, W), mode="bilinear", align_corners=True) * float(self.patch_size)
         flow10 = F.interpolate(flow10_tok, size=(H, W), mode="bilinear", align_corners=True) * float(self.patch_size)
-        conf_lat = F.interpolate(conf_tok.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=True)
-        conf_lat = conf_lat.clamp(0.0, 1.0)
+        conf01_lat = F.interpolate(conf01_tok.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=True)
+        conf10_lat = F.interpolate(conf10_tok.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=True)
+        conf01_lat = conf01_lat.clamp(0.0, 1.0)
+        conf10_lat = conf10_lat.clamp(0.0, 1.0)
 
-        for p_idx, (b, t0, t1) in enumerate(pair_meta):
+        for p_idx in range(pair_b.numel()):
+            b = int(pair_b[p_idx].item())
+            t0 = int(pair_t0[p_idx].item())
+            t1 = int(pair_t1[p_idx].item())
             z0 = latents[b : b + 1, t0]
             z1 = latents[b : b + 1, t1]
             flow01_p = flow01[p_idx : p_idx + 1]
             flow10_p = flow10[p_idx : p_idx + 1]
-            conf_p = conf_lat[p_idx : p_idx + 1]
+            conf01_p = conf01_lat[p_idx : p_idx + 1]
+            conf10_p = conf10_lat[p_idx : p_idx + 1]
+            conf_mix = torch.minimum(conf01_p, conf10_p)
 
             gap = t1 - t0
             steps = gap - 1
@@ -501,16 +511,17 @@ class SinkhornWarpInterpolator(nn.Module):
             z1_rep = z1.expand(steps, -1, -1, -1)
             flow01_rep = flow01_p.expand(steps, -1, -1, -1) * alpha
             flow10_rep = flow10_p.expand(steps, -1, -1, -1) * (1.0 - alpha)
-            conf_rep = conf_p.expand(steps, -1, -1, -1)
+            conf01_rep = conf01_p.expand(steps, -1, -1, -1)
+            conf10_rep = conf10_p.expand(steps, -1, -1, -1)
 
             z0_w = _warp(z0_rep, -flow01_rep)
             z1_w = _warp(z1_rep, -flow10_rep)
-            w0 = (1.0 - alpha) * conf_rep
-            w1 = alpha * conf_rep
+            w0 = (1.0 - alpha) * conf01_rep
+            w1 = alpha * conf10_rep
             denom = w0 + w1 + 1e-6
             z_t = (w0 * z0_w + w1 * z1_w) / denom
             out[b, t0 + 1 : t1] = z_t
-            conf[b, t0 + 1 : t1] = conf_p[0, 0]
+            conf[b, t0 + 1 : t1] = conf_mix[0, 0]
         return out, conf
 
 
