@@ -518,8 +518,11 @@ class SinkhornWarpInterpolator(nn.Module):
             z1_w = _warp(z1_rep, -flow10_rep)
             w0 = (1.0 - alpha) * conf01_rep
             w1 = alpha * conf10_rep
-            denom = w0 + w1 + 1e-6
-            z_t = (w0 * z0_w + w1 * z1_w) / denom
+            denom = w0 + w1
+            z_mix = (w0 * z0_w + w1 * z1_w) / denom.clamp_min(1e-6)
+            z_lin = (1.0 - alpha) * z0_w + alpha * z1_w
+            mask = denom > 1e-6
+            z_t = torch.where(mask, z_mix, z_lin)
             out[b, t0 + 1 : t1] = z_t
             conf[b, t0 + 1 : t1] = conf_mix[0, 0]
         return out, conf
