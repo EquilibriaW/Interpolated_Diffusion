@@ -27,6 +27,8 @@ def _flow_to_grid(flow: torch.Tensor) -> torch.Tensor:
 
 
 def _warp(x: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
+    if flow.dtype != x.dtype:
+        flow = flow.to(dtype=x.dtype)
     grid = _flow_to_grid(flow)
     return F.grid_sample(x, grid, mode="bilinear", padding_mode="border", align_corners=True)
 
