@@ -58,6 +58,7 @@ class SinkhornWarpInterpolator(nn.Module):
         win_size: int = 5,
         angles_deg: Optional[Iterable[float]] = None,
         shift_range: int = 4,
+        se2_chunk: int = 64,
         sinkhorn_iters: int = 20,
         sinkhorn_tau: float = 0.05,
         dustbin_logit: float = -2.0,
@@ -73,11 +74,13 @@ class SinkhornWarpInterpolator(nn.Module):
         angles = [float(a) * math.pi / 180.0 for a in angles_deg]
         self.register_buffer("angles", torch.tensor(angles, dtype=torch.float32), persistent=False)
         self.shift_range = int(shift_range)
+        self.se2_chunk = int(se2_chunk)
         self.sinkhorn_iters = int(sinkhorn_iters)
         self.sinkhorn_tau = float(sinkhorn_tau)
         self.dustbin_logit = float(dustbin_logit)
         self.d_match = int(d_match)
         self.straightener = straightener
+        self._se2_cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         if self.straightener is not None:
             self.straightener.eval()
             for p in self.straightener.parameters():
@@ -99,6 +102,22 @@ class SinkhornWarpInterpolator(nn.Module):
         tokens = F.normalize(tokens, dim=-1, eps=1e-6)
         feats = tokens.view(B, hp, wp, -1)
         return feats, hp, wp
+
+    def _get_se2_candidates(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = (device, dtype)
+        cached = self._se2_cache.get(key)
+        if cached is not None:
+            return cached
+        angles = self.angles.to(device=device, dtype=dtype)
+        shifts = torch.arange(-self.shift_range, self.shift_range + 1, device=device, dtype=angles.dtype)
+        theta_grid, dy_grid, dx_grid = torch.meshgrid(angles, shifts, shifts, indexing="ij")
+        theta = theta_grid.reshape(-1)
+        dx = dx_grid.reshape(-1).to(torch.long)
+        dy = dy_grid.reshape(-1).to(torch.long)
+        self._se2_cache[key] = (theta, dx, dy)
+        return theta, dx, dy
 
     def _apply_se2(self, feats: torch.Tensor, theta: float, dx: int, dy: int) -> torch.Tensor:
         # feats: [B,Hp,Wp,D]
@@ -140,24 +159,56 @@ class SinkhornWarpInterpolator(nn.Module):
     def _estimate_global_se2_batch(self, f0: torch.Tensor, f1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # f0/f1: [B,Hp,Wp,D]
         device = f0.device
-        B = f0.shape[0]
+        B, Hp, Wp, _ = f0.shape
+        f0_map = f0.permute(0, 3, 1, 2)
+        f1_map = f1.permute(0, 3, 1, 2)
+
+        theta_all, dx_all, dy_all = self._get_se2_candidates(device=device, dtype=f0.dtype)
+        num_cand = int(theta_all.numel())
         best_score = torch.full((B,), -float("inf"), device=device, dtype=f0.dtype)
-        best_theta = torch.zeros((B,), device=device, dtype=f0.dtype)
-        best_dx = torch.zeros((B,), device=device, dtype=torch.long)
-        best_dy = torch.zeros((B,), device=device, dtype=torch.long)
-        for theta in self.angles.tolist():
-            theta_t = torch.full((B,), float(theta), device=device, dtype=f0.dtype)
-            for dy in range(-self.shift_range, self.shift_range + 1):
-                dy_t = torch.full((B,), int(dy), device=device, dtype=torch.long)
-                for dx in range(-self.shift_range, self.shift_range + 1):
-                    dx_t = torch.full((B,), int(dx), device=device, dtype=torch.long)
-                    f1_aligned = self._apply_se2(f1, theta, dx, dy)
-                    score = (f0 * f1_aligned).mean(dim=(1, 2, 3))
-                    mask = score > best_score
-                    best_score = torch.where(mask, score, best_score)
-                    best_theta = torch.where(mask, theta_t, best_theta)
-                    best_dx = torch.where(mask, dx_t, best_dx)
-                    best_dy = torch.where(mask, dy_t, best_dy)
+        best_idx = torch.zeros((B,), device=device, dtype=torch.long)
+
+        chunk = max(1, int(self.se2_chunk))
+        for start in range(0, num_cand, chunk):
+            end = min(num_cand, start + chunk)
+            theta = theta_all[start:end]
+            dx = dx_all[start:end]
+            dy = dy_all[start:end]
+            csz = int(theta.numel())
+
+            theta_bc = theta.view(1, csz).expand(B, csz)
+            dx_bc = dx.view(1, csz).expand(B, csz)
+            dy_bc = dy.view(1, csz).expand(B, csz)
+
+            cos_t = torch.cos(theta_bc)
+            sin_t = torch.sin(theta_bc)
+            tx = torch.zeros_like(theta_bc) if Wp <= 1 else 2.0 * dx_bc.to(theta_bc.dtype) / float(Wp - 1)
+            ty = torch.zeros_like(theta_bc) if Hp <= 1 else 2.0 * dy_bc.to(theta_bc.dtype) / float(Hp - 1)
+
+            mat = torch.zeros((B, csz, 2, 3), device=device, dtype=f0.dtype)
+            mat[:, :, 0, 0] = cos_t
+            mat[:, :, 0, 1] = -sin_t
+            mat[:, :, 0, 2] = tx
+            mat[:, :, 1, 0] = sin_t
+            mat[:, :, 1, 1] = cos_t
+            mat[:, :, 1, 2] = ty
+
+            mat = mat.view(B * csz, 2, 3)
+            f1_rep = f1_map.unsqueeze(1).expand(B, csz, -1, -1, -1).reshape(B * csz, -1, Hp, Wp)
+            grid = F.affine_grid(mat, size=f1_rep.shape, align_corners=True)
+            f1_aligned = F.grid_sample(
+                f1_rep, grid, mode="bilinear", padding_mode="zeros", align_corners=True
+            ).view(B, csz, -1, Hp, Wp)
+
+            score = (f1_aligned * f0_map.unsqueeze(1)).mean(dim=(2, 3, 4))
+            score_chunk, idx_chunk = score.max(dim=1)
+            better = score_chunk > best_score
+            best_score = torch.where(better, score_chunk, best_score)
+            best_idx = torch.where(better, idx_chunk + start, best_idx)
+
+        best_theta = theta_all[best_idx]
+        best_dx = dx_all[best_idx]
+        best_dy = dy_all[best_idx]
         return best_theta, best_dx, best_dy
 
     def _local_sinkhorn_delta(self, f0: torch.Tensor, f1: torch.Tensor, hp: int, wp: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -205,42 +256,107 @@ class SinkhornWarpInterpolator(nn.Module):
         delta = torch.zeros((B, hp, wp, 2), device=f0.device, dtype=torch.float32)
         conf = torch.zeros((B, hp, wp), device=f0.device, dtype=torch.float32)
         win = self.win_size
-        for y0 in range(0, hp, win):
-            for x0 in range(0, wp, win):
-                h = min(win, hp - y0)
-                w = min(win, wp - x0)
-                if h <= 0 or w <= 0:
-                    continue
-                x = f0[:, y0 : y0 + h, x0 : x0 + w].reshape(B, h * w, -1)
-                y = f1[:, y0 : y0 + h, x0 : x0 + w].reshape(B, h * w, -1)
-                n = x.shape[1]
-                if n == 0:
-                    continue
-                logits = torch.bmm(x, y.transpose(1, 2)) / math.sqrt(max(1.0, float(x.shape[2])))
-                logits = logits / max(self.sinkhorn_tau, 1e-6)
-                logp = torch.full(
-                    (B, n + 1, n + 1),
-                    self.dustbin_logit,
-                    device=logits.device,
-                    dtype=logits.dtype,
-                )
-                logp[:, :n, :n] = logits
-                logp = _sinkhorn_log_batch(logp, self.sinkhorn_iters)
-                p = torch.exp(logp)
-                p_xy = p[:, :n, :n]
-                mass = p_xy.sum(dim=2, keepdim=True).clamp_min(1e-8)
-                yy, xx = torch.meshgrid(
-                    torch.arange(h, device=logits.device),
-                    torch.arange(w, device=logits.device),
-                    indexing="ij",
-                )
-                coords = torch.stack([xx, yy], dim=-1).view(n, 2).float()
-                coords = coords.unsqueeze(0).expand(B, -1, -1)
-                q = torch.bmm(p_xy, coords) / mass
-                delta_block = (q - coords).view(B, h, w, 2)
-                conf_block = (1.0 - p[:, :n, n]).view(B, h, w)
-                delta[:, y0 : y0 + h, x0 : x0 + w] = delta_block
-                conf[:, y0 : y0 + h, x0 : x0 + w] = conf_block
+
+        def process_block(y0: int, x0: int, h: int, w: int) -> None:
+            if h <= 0 or w <= 0:
+                return
+            x = f0[:, y0 : y0 + h, x0 : x0 + w].reshape(B, h * w, -1)
+            y = f1[:, y0 : y0 + h, x0 : x0 + w].reshape(B, h * w, -1)
+            n = x.shape[1]
+            if n == 0:
+                return
+            logits = torch.bmm(x, y.transpose(1, 2)) / math.sqrt(max(1.0, float(x.shape[2])))
+            logits = logits / max(self.sinkhorn_tau, 1e-6)
+            logp = torch.full(
+                (B, n + 1, n + 1),
+                self.dustbin_logit,
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            logp[:, :n, :n] = logits
+            logp = _sinkhorn_log_batch(logp, self.sinkhorn_iters)
+            p = torch.exp(logp)
+            p_xy = p[:, :n, :n]
+            mass = p_xy.sum(dim=2, keepdim=True).clamp_min(1e-8)
+            yy, xx = torch.meshgrid(
+                torch.arange(h, device=logits.device),
+                torch.arange(w, device=logits.device),
+                indexing="ij",
+            )
+            coords = torch.stack([xx, yy], dim=-1).view(n, 2).float()
+            coords = coords.unsqueeze(0).expand(B, -1, -1)
+            q = torch.bmm(p_xy, coords) / mass
+            delta_block = (q - coords).view(B, h, w, 2)
+            conf_block = (1.0 - p[:, :n, n]).view(B, h, w)
+            delta[:, y0 : y0 + h, x0 : x0 + w] = delta_block
+            conf[:, y0 : y0 + h, x0 : x0 + w] = conf_block
+
+        nH = hp // win
+        nW = wp // win
+
+        if nH > 0 and nW > 0:
+            h_main = nH * win
+            w_main = nW * win
+            f0_main = f0[:, :h_main, :w_main]
+            f1_main = f1[:, :h_main, :w_main]
+            D = f0_main.shape[-1]
+
+            f0_blk = (
+                f0_main.view(B, nH, win, nW, win, D)
+                .permute(0, 1, 3, 2, 4, 5)
+                .reshape(B * nH * nW, win * win, D)
+            )
+            f1_blk = (
+                f1_main.view(B, nH, win, nW, win, D)
+                .permute(0, 1, 3, 2, 4, 5)
+                .reshape(B * nH * nW, win * win, D)
+            )
+
+            logits = torch.bmm(f0_blk, f1_blk.transpose(1, 2)) / math.sqrt(max(1.0, float(D)))
+            logits = logits / max(self.sinkhorn_tau, 1e-6)
+            logp = torch.full(
+                (B * nH * nW, win * win + 1, win * win + 1),
+                self.dustbin_logit,
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            logp[:, : win * win, : win * win] = logits
+            logp = _sinkhorn_log_batch(logp, self.sinkhorn_iters)
+            p = torch.exp(logp)
+            p_xy = p[:, : win * win, : win * win]
+            mass = p_xy.sum(dim=2, keepdim=True).clamp_min(1e-8)
+            yy, xx = torch.meshgrid(
+                torch.arange(win, device=logits.device),
+                torch.arange(win, device=logits.device),
+                indexing="ij",
+            )
+            coords = torch.stack([xx, yy], dim=-1).view(win * win, 2).float()
+            coords = coords.unsqueeze(0).expand(B * nH * nW, -1, -1)
+            q = torch.bmm(p_xy, coords) / mass
+            delta_blk = (q - coords).view(B, nH, nW, win, win, 2)
+            conf_blk = (1.0 - p[:, : win * win, win * win]).view(B, nH, nW, win, win)
+
+            delta_blk = (
+                delta_blk.permute(0, 1, 3, 2, 4, 5)
+                .reshape(B, h_main, w_main, 2)
+            )
+            conf_blk = conf_blk.permute(0, 1, 3, 2, 4).reshape(B, h_main, w_main)
+            delta[:, :h_main, :w_main] = delta_blk
+            conf[:, :h_main, :w_main] = conf_blk
+
+        rem_h = hp - nH * win
+        rem_w = wp - nW * win
+        if rem_w > 0 and nH > 0:
+            x0 = nW * win
+            for y0 in range(0, nH * win, win):
+                process_block(y0, x0, win, rem_w)
+        if rem_h > 0 and nW > 0:
+            y0 = nH * win
+            for x0 in range(0, nW * win, win):
+                process_block(y0, x0, rem_h, win)
+        if rem_h > 0 and rem_w > 0:
+            process_block(nH * win, nW * win, rem_h, rem_w)
+
         return delta, conf
 
     def _compose_flow(
