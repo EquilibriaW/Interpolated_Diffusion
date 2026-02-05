@@ -8,14 +8,6 @@ from .keyframes import build_nested_masks_batch, interpolate_from_indices
 from ..models.video_interpolator import TinyTemporalInterpolator
 from ..utils.video_tokens import patchify_latents, unpatchify_tokens
 
-try:  # optional dependency for flow-based interpolation
-    from ..models.flow_warp import FlowWarpInterpolator
-
-    _FLOW_AVAILABLE = True
-except Exception:  # pragma: no cover - optional
-    FlowWarpInterpolator = None
-    _FLOW_AVAILABLE = False
-
 
 def _smooth_latents(z: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
     # z: [B,T,D] -> [B*D,1,T] conv1d
@@ -360,7 +352,8 @@ def build_video_token_interp_level_batch(
     interp_mode: str = "linear",
     interp_model: Optional[TinyTemporalInterpolator] = None,
     smooth_kernel: Optional[torch.Tensor] = None,
-    flow_warper: Optional["FlowWarpInterpolator"] = None,
+    flow_warper: Optional[object] = None,
+    sinkhorn_warper: Optional[object] = None,
     patch_size: Optional[int] = None,
     spatial_shape: Optional[Tuple[int, int]] = None,
     uncertainty_mode: str = "none",
@@ -461,16 +454,20 @@ def build_video_token_interp_level_batch(
                 student_noise = torch.randn_like(vals) * float(student_noise_std)
                 vals = torch.where(replace_mask_rep.unsqueeze(-1), vals + student_noise, vals)
 
-        if interp_mode == "flow":
-            if not _FLOW_AVAILABLE or flow_warper is None:
-                raise ValueError("flow interp requested but flow_warper unavailable")
+        if interp_mode in ("flow", "sinkhorn"):
+            warper = flow_warper if interp_mode == "flow" else sinkhorn_warper
+            if warper is None:
+                raise ValueError(f"{interp_mode} interp requested but warper is None")
             if patch_size is None or spatial_shape is None:
                 raise ValueError("flow interp requires patch_size and spatial_shape")
             latents_sel = unpatchify_tokens(z0_tokens[sel], patch_size, spatial_shape)
             latents_sel = _apply_anchor_noise_latents(latents_sel, idx, replace_mask, student_noise_std)
-            flow_dtype = next(flow_warper.parameters()).dtype
+            try:
+                flow_dtype = next(warper.parameters()).dtype
+            except StopIteration:
+                flow_dtype = latents_sel.dtype
             latents_sel = latents_sel.to(dtype=flow_dtype)
-            zs_lat, conf_flow = flow_warper.interpolate(latents_sel, idx)
+            zs_lat, conf_flow = warper.interpolate(latents_sel, idx)
             uncertainty = (1.0 - conf_flow).clamp(0.0, 1.0)
             if uncertainty_power != 1.0:
                 uncertainty = uncertainty.pow(float(uncertainty_power))
@@ -571,7 +568,7 @@ def build_video_token_interp_adjacent_batch(
     interp_mode: str = "linear",
     interp_model: Optional[TinyTemporalInterpolator] = None,
     smooth_kernel: Optional[torch.Tensor] = None,
-    flow_warper: Optional["FlowWarpInterpolator"] = None,
+    flow_warper: Optional[object] = None,
     patch_size: Optional[int] = None,
     spatial_shape: Optional[Tuple[int, int]] = None,
     uncertainty_mode: str = "none",
@@ -703,19 +700,23 @@ def build_video_token_interp_adjacent_batch(
                 vals = torch.where(replace_mask_rep.unsqueeze(-1), vals + student_noise, vals)
                 vals_p = torch.where(replace_mask_p_rep.unsqueeze(-1), vals_p + student_noise_p, vals_p)
 
-        if interp_mode == "flow":
-            if not _FLOW_AVAILABLE or flow_warper is None:
-                raise ValueError("flow interp requested but flow_warper unavailable")
+        if interp_mode in ("flow", "sinkhorn"):
+            warper = flow_warper if interp_mode == "flow" else sinkhorn_warper
+            if warper is None:
+                raise ValueError(f"{interp_mode} interp requested but warper is None")
             if patch_size is None or spatial_shape is None:
                 raise ValueError("flow interp requires patch_size and spatial_shape")
             latents_sel = unpatchify_tokens(z0_tokens[sel], patch_size, spatial_shape)
             latents_sel_s = _apply_anchor_noise_latents(latents_sel, idx, replace_mask, student_noise_std)
             latents_sel_p = _apply_anchor_noise_latents(latents_sel, idx_p, replace_mask_p, student_noise_std)
-            flow_dtype = next(flow_warper.parameters()).dtype
+            try:
+                flow_dtype = next(warper.parameters()).dtype
+            except StopIteration:
+                flow_dtype = latents_sel.dtype
             latents_sel_s = latents_sel_s.to(dtype=flow_dtype)
             latents_sel_p = latents_sel_p.to(dtype=flow_dtype)
-            zs_lat, conf_flow = flow_warper.interpolate(latents_sel_s, idx)
-            zp_lat, conf_flow_p = flow_warper.interpolate(latents_sel_p, idx_p)
+            zs_lat, conf_flow = warper.interpolate(latents_sel_s, idx)
+            zp_lat, conf_flow_p = warper.interpolate(latents_sel_p, idx_p)
             uncertainty = (1.0 - conf_flow).clamp(0.0, 1.0)
             uncertainty_p = (1.0 - conf_flow_p).clamp(0.0, 1.0)
             if uncertainty_power != 1.0:

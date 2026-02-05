@@ -55,9 +55,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wan_attn", type=str, default="default", choices=["default", "sla", "sagesla"])
     p.add_argument("--sla_topk", type=float, default=0.1)
     p.add_argument("--grad_ckpt", type=int, default=1)
-    p.add_argument("--video_interp_mode", type=str, default="smooth", choices=["linear", "smooth", "flow"])
+    p.add_argument("--video_interp_mode", type=str, default="smooth", choices=["linear", "smooth", "flow", "sinkhorn"])
     p.add_argument("--video_interp_smooth_kernel", type=str, default="0.25,0.5,0.25")
     p.add_argument("--flow_interp_ckpt", type=str, default="")
+    p.add_argument("--sinkhorn_win", type=int, default=5)
+    p.add_argument("--sinkhorn_angles", type=str, default="-10,-5,0,5,10")
+    p.add_argument("--sinkhorn_shift", type=int, default=4)
+    p.add_argument("--sinkhorn_iters", type=int, default=20)
+    p.add_argument("--sinkhorn_tau", type=float, default=0.05)
+    p.add_argument("--sinkhorn_dustbin", type=float, default=-2.0)
+    p.add_argument("--sinkhorn_d_match", type=int, default=0)
+    p.add_argument("--sinkhorn_straightener_ckpt", type=str, default="")
+    p.add_argument("--sinkhorn_straightener_dtype", type=str, default="")
     p.add_argument("--ckpt_dir", type=str, default="checkpoints/keypoints_wansynth")
     p.add_argument("--log_dir", type=str, default="runs/keypoints_wansynth")
     p.add_argument("--save_every", type=int, default=2000)
@@ -111,6 +120,7 @@ def main() -> None:
     cond_encoder = TextConditionEncoder(text_dim=text_embed0.shape[-1], d_cond=args.d_cond).to(device)
     smooth_kernel = None
     flow_warper = None
+    sinkhorn_warper = None
     if args.video_interp_mode == "smooth":
         smooth_kernel = torch.tensor([float(x) for x in args.video_interp_smooth_kernel.split(",")], dtype=torch.float32)
     elif args.video_interp_mode == "flow":
@@ -119,7 +129,30 @@ def main() -> None:
         from src.models.latent_flow_interpolator import load_latent_flow_interpolator
         flow_dtype = resolve_dtype(args.wan_dtype) or get_autocast_dtype()
         flow_warper, _ = load_latent_flow_interpolator(args.flow_interp_ckpt, device=device, dtype=flow_dtype)
+    elif args.video_interp_mode == "sinkhorn":
+        from src.models.sinkhorn_warp import SinkhornWarpInterpolator
+        from src.models.latent_straightener import load_latent_straightener
+
+        straightener = None
+        if args.sinkhorn_straightener_ckpt:
+            s_dtype = resolve_dtype(args.sinkhorn_straightener_dtype) or get_autocast_dtype()
+            straightener, _ = load_latent_straightener(args.sinkhorn_straightener_ckpt, device=device, dtype=s_dtype)
+        angles = [float(x) for x in args.sinkhorn_angles.split(",") if x.strip()]
+        sinkhorn_warper = SinkhornWarpInterpolator(
+            in_channels=C0,
+            patch_size=args.patch_size,
+            win_size=args.sinkhorn_win,
+            angles_deg=angles,
+            shift_range=args.sinkhorn_shift,
+            sinkhorn_iters=args.sinkhorn_iters,
+            sinkhorn_tau=args.sinkhorn_tau,
+            dustbin_logit=args.sinkhorn_dustbin,
+            d_match=args.sinkhorn_d_match,
+            straightener=straightener,
+        ).to(device=device, dtype=get_autocast_dtype())
+
     use_wan = bool(args.use_wan)
+
     if use_wan:
         wan_dtype = resolve_dtype(args.wan_dtype)
         model = load_wan_transformer(
@@ -225,16 +258,20 @@ def main() -> None:
 
         model.train()
         if use_wan:
-            if args.video_interp_mode == "flow":
-                if flow_warper is None:
-                    raise ValueError("flow interpolator requested but not loaded")
+            if args.video_interp_mode in ("flow", "sinkhorn"):
+                warper = flow_warper if args.video_interp_mode == "flow" else sinkhorn_warper
+                if warper is None:
+                    raise ValueError(f"{args.video_interp_mode} interpolator requested but not loaded")
                 z_seq = torch.zeros((B, T, N, D), device=device, dtype=z_t.dtype)
                 z_seq.scatter_(1, idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D), z_t)
                 latents_seq = unpatchify_tokens(z_seq, args.patch_size, spatial_shape)
-                flow_dtype = next(flow_warper.parameters()).dtype
+                try:
+                    flow_dtype = next(warper.parameters()).dtype
+                except StopIteration:
+                    flow_dtype = latents_seq.dtype
                 latents_seq_dtype = latents_seq.dtype
                 latents_seq = latents_seq.to(dtype=flow_dtype)
-                latents_interp, _ = flow_warper.interpolate(latents_seq, idx)
+                latents_interp, _ = warper.interpolate(latents_seq, idx)
                 latents_interp = latents_interp.to(dtype=latents_seq_dtype)
                 latents_t = latents_interp.permute(0, 2, 1, 3, 4)
             else:
@@ -304,6 +341,15 @@ def main() -> None:
                 "sla_topk": float(args.sla_topk),
                 "video_interp_mode": args.video_interp_mode,
                 "flow_interp_ckpt": args.flow_interp_ckpt,
+                "sinkhorn_win": args.sinkhorn_win,
+                "sinkhorn_angles": args.sinkhorn_angles,
+                "sinkhorn_shift": args.sinkhorn_shift,
+                "sinkhorn_iters": args.sinkhorn_iters,
+                "sinkhorn_tau": args.sinkhorn_tau,
+                "sinkhorn_dustbin": args.sinkhorn_dustbin,
+                "sinkhorn_d_match": args.sinkhorn_d_match,
+                "sinkhorn_straightener_ckpt": args.sinkhorn_straightener_ckpt,
+                "sinkhorn_straightener_dtype": args.sinkhorn_straightener_dtype,
                 "lora_rank": int(args.lora_rank),
                 "lora_alpha": float(args.lora_alpha),
                 "lora_dropout": float(args.lora_dropout),
@@ -334,6 +380,15 @@ def main() -> None:
         "sla_topk": float(args.sla_topk),
         "video_interp_mode": args.video_interp_mode,
         "flow_interp_ckpt": args.flow_interp_ckpt,
+        "sinkhorn_win": args.sinkhorn_win,
+        "sinkhorn_angles": args.sinkhorn_angles,
+        "sinkhorn_shift": args.sinkhorn_shift,
+        "sinkhorn_iters": args.sinkhorn_iters,
+        "sinkhorn_tau": args.sinkhorn_tau,
+        "sinkhorn_dustbin": args.sinkhorn_dustbin,
+        "sinkhorn_d_match": args.sinkhorn_d_match,
+        "sinkhorn_straightener_ckpt": args.sinkhorn_straightener_ckpt,
+        "sinkhorn_straightener_dtype": args.sinkhorn_straightener_dtype,
         "lora_rank": int(args.lora_rank),
         "lora_alpha": float(args.lora_alpha),
         "lora_dropout": float(args.lora_dropout),

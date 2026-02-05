@@ -71,11 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--corrupt_anchor_frac", type=float, default=0.25)
     p.add_argument("--student_replace_prob", type=float, default=0.5)
     p.add_argument("--student_noise_std", type=float, default=0.02)
-    p.add_argument("--video_interp_mode", type=str, default="linear", choices=["linear", "smooth", "learned", "flow"])
+    p.add_argument("--video_interp_mode", type=str, default="linear", choices=["linear", "smooth", "learned"])
     p.add_argument("--video_interp_ckpt", type=str, default="")
     p.add_argument("--video_interp_smooth_kernel", type=str, default="0.25,0.5,0.25")
-    p.add_argument("--flow_model", type=str, default="raft_large", choices=["raft_large", "raft_small"])
-    p.add_argument("--flow_conf_sigma", type=float, default=1.0)
     p.add_argument("--text_model", type=str, default="openai/clip-vit-base-patch32")
     p.add_argument("--vae_model", type=str, default="stabilityai/sd-vae-ft-mse")
     p.add_argument("--vae_scale", type=float, default=0.18215)
@@ -183,7 +181,7 @@ def main() -> None:
     cond_encoder = TextConditionEncoder(text_dim=text_dim, d_cond=args.d_cond).to(device)
 
     vae = None
-    if args.video_interp_mode == "flow" or not use_cache:
+    if not use_cache:
         vae = FrameAutoencoderKL(
             model_name=args.vae_model,
             device=device,
@@ -194,7 +192,6 @@ def main() -> None:
         )
 
     video_interp_model = None
-    flow_warper = None
     smooth_kernel = None
     if args.video_interp_mode == "smooth":
         smooth_kernel = torch.tensor([float(x) for x in args.video_interp_smooth_kernel.split(",")], dtype=torch.float32)
@@ -207,18 +204,6 @@ def main() -> None:
         video_interp_model.load_state_dict(state)
         video_interp_model.to(device)
         video_interp_model.eval()
-    elif args.video_interp_mode == "flow":
-        from src.models.flow_warp import FlowWarpInterpolator, RAFTFlowEstimator
-
-        flow_variant = "large" if args.flow_model == "raft_large" else "small"
-        flow_estimator = RAFTFlowEstimator(variant=flow_variant, device=device)
-        flow_warper = FlowWarpInterpolator(
-            flow_estimator=flow_estimator,
-            vae=vae,
-            frame_size=args.frame_size,
-            latent_downsample=args.latent_downsample,
-            conf_sigma=args.flow_conf_sigma,
-        )
 
     mask_channels = (2 if args.stage2_mode == "adj" else 1) + (1 if args.anchor_conf else 0)
     model = VideoTokenInterpLevelDenoiser(
@@ -321,7 +306,6 @@ def main() -> None:
                 interp_mode=args.video_interp_mode,
                 interp_model=video_interp_model,
                 smooth_kernel=smooth_kernel,
-                flow_warper=flow_warper,
                 patch_size=args.patch_size,
                 spatial_shape=spatial_shape,
             )
@@ -357,7 +341,6 @@ def main() -> None:
                 interp_mode=args.video_interp_mode,
                 interp_model=video_interp_model,
                 smooth_kernel=smooth_kernel,
-                flow_warper=flow_warper,
                 patch_size=args.patch_size,
                 spatial_shape=spatial_shape,
             )

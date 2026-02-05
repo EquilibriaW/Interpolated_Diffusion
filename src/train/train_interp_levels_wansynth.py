@@ -61,9 +61,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--corrupt_anchor_frac", type=float, default=0.25)
     p.add_argument("--student_replace_prob", type=float, default=0.5)
     p.add_argument("--student_noise_std", type=float, default=0.02)
-    p.add_argument("--video_interp_mode", type=str, default="smooth", choices=["linear", "smooth", "learned", "flow"])
+    p.add_argument("--video_interp_mode", type=str, default="smooth", choices=["linear", "smooth", "learned", "flow", "sinkhorn"])
     p.add_argument("--video_interp_ckpt", type=str, default="")
     p.add_argument("--flow_interp_ckpt", type=str, default="")
+    p.add_argument("--sinkhorn_win", type=int, default=5)
+    p.add_argument("--sinkhorn_angles", type=str, default="-10,-5,0,5,10")
+    p.add_argument("--sinkhorn_shift", type=int, default=4)
+    p.add_argument("--sinkhorn_iters", type=int, default=20)
+    p.add_argument("--sinkhorn_tau", type=float, default=0.05)
+    p.add_argument("--sinkhorn_dustbin", type=float, default=-2.0)
+    p.add_argument("--sinkhorn_d_match", type=int, default=0)
+    p.add_argument("--sinkhorn_straightener_ckpt", type=str, default="")
+    p.add_argument("--sinkhorn_straightener_dtype", type=str, default="")
     p.add_argument("--flow_uncertainty_mode", type=str, default="replace", choices=["none", "add", "replace"])
     p.add_argument("--flow_uncertainty_weight", type=float, default=1.0)
     p.add_argument("--flow_uncertainty_power", type=float, default=1.0)
@@ -168,6 +177,7 @@ def main() -> None:
 
     video_interp_model = None
     flow_warper = None
+    sinkhorn_warper = None
     smooth_kernel = None
     if args.video_interp_mode == "smooth":
         smooth_kernel = torch.tensor([float(x) for x in args.video_interp_smooth_kernel.split(",")], dtype=torch.float32)
@@ -188,6 +198,27 @@ def main() -> None:
         from src.models.latent_flow_interpolator import load_latent_flow_interpolator
         flow_dtype = resolve_dtype(args.wan_dtype) or get_autocast_dtype()
         flow_warper, _ = load_latent_flow_interpolator(args.flow_interp_ckpt, device=device, dtype=flow_dtype)
+    elif args.video_interp_mode == "sinkhorn":
+        from src.models.sinkhorn_warp import SinkhornWarpInterpolator
+        from src.models.latent_straightener import load_latent_straightener
+
+        straightener = None
+        if args.sinkhorn_straightener_ckpt:
+            s_dtype = resolve_dtype(args.sinkhorn_straightener_dtype) or get_autocast_dtype()
+            straightener, _ = load_latent_straightener(args.sinkhorn_straightener_ckpt, device=device, dtype=s_dtype)
+        angles = [float(x) for x in args.sinkhorn_angles.split(",") if x.strip()]
+        sinkhorn_warper = SinkhornWarpInterpolator(
+            in_channels=C0,
+            patch_size=args.patch_size,
+            win_size=args.sinkhorn_win,
+            angles_deg=angles,
+            shift_range=args.sinkhorn_shift,
+            sinkhorn_iters=args.sinkhorn_iters,
+            sinkhorn_tau=args.sinkhorn_tau,
+            dustbin_logit=args.sinkhorn_dustbin,
+            d_match=args.sinkhorn_d_match,
+            straightener=straightener,
+        ).to(device=device, dtype=get_autocast_dtype())
 
     mask_channels = (2 if args.stage2_mode == "adj" else 1) + (1 if args.anchor_conf else 0)
     use_wan = bool(args.use_wan)
@@ -323,6 +354,7 @@ def main() -> None:
                 interp_model=video_interp_model,
                 smooth_kernel=smooth_kernel,
                 flow_warper=flow_warper,
+                sinkhorn_warper=sinkhorn_warper,
                 patch_size=args.patch_size,
                 spatial_shape=spatial_shape,
                 uncertainty_mode=args.flow_uncertainty_mode,
@@ -364,6 +396,7 @@ def main() -> None:
                 interp_model=video_interp_model,
                 smooth_kernel=smooth_kernel,
                 flow_warper=flow_warper,
+                sinkhorn_warper=sinkhorn_warper,
                 patch_size=args.patch_size,
                 spatial_shape=spatial_shape,
                 uncertainty_mode=args.flow_uncertainty_mode,
@@ -459,6 +492,15 @@ def main() -> None:
                 "video_interp_mode": args.video_interp_mode,
                 "video_interp_ckpt": args.video_interp_ckpt,
                 "flow_interp_ckpt": args.flow_interp_ckpt,
+                "sinkhorn_win": args.sinkhorn_win,
+                "sinkhorn_angles": args.sinkhorn_angles,
+                "sinkhorn_shift": args.sinkhorn_shift,
+                "sinkhorn_iters": args.sinkhorn_iters,
+                "sinkhorn_tau": args.sinkhorn_tau,
+                "sinkhorn_dustbin": args.sinkhorn_dustbin,
+                "sinkhorn_d_match": args.sinkhorn_d_match,
+                "sinkhorn_straightener_ckpt": args.sinkhorn_straightener_ckpt,
+                "sinkhorn_straightener_dtype": args.sinkhorn_straightener_dtype,
                 "flow_uncertainty_mode": args.flow_uncertainty_mode,
                 "flow_uncertainty_weight": float(args.flow_uncertainty_weight),
                 "flow_uncertainty_power": float(args.flow_uncertainty_power),
@@ -496,6 +538,15 @@ def main() -> None:
         "video_interp_mode": args.video_interp_mode,
         "video_interp_ckpt": args.video_interp_ckpt,
         "flow_interp_ckpt": args.flow_interp_ckpt,
+        "sinkhorn_win": args.sinkhorn_win,
+        "sinkhorn_angles": args.sinkhorn_angles,
+        "sinkhorn_shift": args.sinkhorn_shift,
+        "sinkhorn_iters": args.sinkhorn_iters,
+        "sinkhorn_tau": args.sinkhorn_tau,
+        "sinkhorn_dustbin": args.sinkhorn_dustbin,
+        "sinkhorn_d_match": args.sinkhorn_d_match,
+        "sinkhorn_straightener_ckpt": args.sinkhorn_straightener_ckpt,
+        "sinkhorn_straightener_dtype": args.sinkhorn_straightener_dtype,
         "flow_uncertainty_mode": args.flow_uncertainty_mode,
         "flow_uncertainty_weight": float(args.flow_uncertainty_weight),
         "flow_uncertainty_power": float(args.flow_uncertainty_power),

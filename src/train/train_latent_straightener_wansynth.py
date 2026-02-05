@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pin_memory", type=int, default=1)
     p.add_argument("--prefetch_to_gpu", type=int, default=1)
     p.add_argument("--compile", type=int, default=0)
+    p.add_argument("--resampled", type=int, default=1)
     return p
 
 
@@ -165,6 +166,8 @@ def _eval_model(
     prefetch_factor: int,
     persistent_workers: bool,
     pin_memory: bool,
+    resampled: bool,
+    seed: int,
 ) -> dict:
     model_was_training = model.training
     model.eval()
@@ -178,6 +181,8 @@ def _eval_model(
         pin_memory=pin_memory,
         shuffle=True,
         shardshuffle=True,
+        resampled=resampled,
+        seed=seed,
     )
     it = iter(loader)
     gen = torch.Generator(device=device)
@@ -262,6 +267,8 @@ def main() -> None:
         pin_memory=bool(args.pin_memory),
         shuffle=True,
         shardshuffle=True,
+        resampled=bool(args.resampled),
+        seed=args.seed,
     )
     it = iter(loader)
 
@@ -406,6 +413,8 @@ def main() -> None:
                 prefetch_factor=args.prefetch_factor,
                 persistent_workers=bool(args.persistent_workers),
                 pin_memory=bool(args.pin_memory),
+                resampled=bool(args.resampled),
+                seed=args.seed,
             )
             writer.add_scalar("val/lerp_l1", metrics["val_lerp_l1"], step)
             writer.add_scalar("val/straight_l1", metrics["val_straight_l1"], step)

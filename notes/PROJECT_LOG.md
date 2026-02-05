@@ -279,17 +279,11 @@ Include: date, command or script used, dataset/checkpoint paths, key settings, a
 - Updated `data/LSMDC/download_videos.sh` and `para_phrases_download.sh` to download annotations into `data/LSMDC/task1` and videos into `data/LSMDC/videos/`.
   - Download now preserves per‑movie subfolders (`wget -x -nH --cut-dirs=3`) instead of a flat directory.
 
-## 2026-02-01 (Switch to DiDeMo / HF)
 
 ### Decisions / Requests
-- Switch from LSMDC to **DiDeMo** (HF dataset) for text‑conditioned video generation.
-- Store videos under `data/didemo/videos/` and use existing `train_data.json`/`val_data.json`/`test_data.json`.
 - Prefer **fixed 5s clips**; if segment length differs, we will clip (center/random) to 5s and sample a fixed number of frames (time‑normalize).
 
 ### Implementation Updates
-- Added `scripts/datasets/didemo/download_videos_hf.py` to download DiDeMo mp4 tar parts from HuggingFace and extract into `data/didemo/videos/`.
-- Added `scripts/datasets/didemo/setup_didemo_hf.sh` to run metadata fetch + HF download in one step.
-- Updated `scripts/datasets/didemo/README.md` with HF instructions.
 - `src/data/video_io.resolve_video_path` now also tries swapping extensions (e.g., metadata `.avi` → `.mp4`) to match HF files.
 
 ### Wan2.1 Training References (Self-Forcing / TurboDiffusion)
@@ -312,11 +306,8 @@ Include: date, command or script used, dataset/checkpoint paths, key settings, a
   - `scripts/datasets/wan_synth/download_wan_synth.py`
   - `scripts/datasets/wan_synth/README.md`
 
-## 2026-02-02 (DiDeMo layout + Wan synth size)
 
 ### Implementation Updates
-- Added `scripts/datasets/didemo/extract_and_flatten_hf.sh` and `scripts/datasets/didemo/fix_video_folder_layout.sh` to flatten HF tar extraction and move `data/didemo/videos/video` → `data/didemo/video`.
-- DiDeMo counts (after flatten): `data/didemo/video/train` = 8395, `data/didemo/video/test` = 1004.
 - Added ignore rules for dataset/large artifacts: `data/LSMDC/`, `data/wan_synth/`, `tmp_repos/`, `notes/*.tgz`.
 
 ### Notes / Issues
@@ -385,7 +376,6 @@ This is inspired by **cold/soft diffusion**: corruption is not necessarily Gauss
 5) Conditioning: text prompt + clip length (and later segment difficulty tokens).
 
 ### Key Datasets
-- **DiDeMo**: HF video tar parts; flattened to `data/didemo/video/{train,test}` (8395/1004). Used for text‑conditioned baseline experiments.
 - **Wan2.1 synthetic**: webdataset shards with `*.latent.pt`, `*.embed.pt`, `*.prompt.txt`. Large (≈2.1TB for 250K). Use shard subset.
 
 ### Open Questions (Video)
@@ -433,7 +423,6 @@ This is inspired by **cold/soft diffusion**: corruption is not necessarily Gauss
 - Use **D_phi‑derived difficulty features immediately** for pipeline debugging (not deferred).
 - Potential objective mismatch between selector (teacher‑KL) and refiner loss is **flagged only**, not assumed.
 - Phase‑2 corruption should **replace anchors with actual Phase‑1 outputs** (not Gaussian noise). This should match the true anchor error distribution.
-- Interpolation for video should be **latent‑space only** to meet inference compute goals (no decode/flow/RAFT at inference).
 - Phase‑2 training will use **Phase‑1 outputs with replacement probability p** (anchor replacement is stochastic). Phase‑1 is **frozen** during Phase‑2 training. Phase‑1 outputs for Phase‑2 are **precomputed** (cached).
 - Wan2.1 backbone should be instantiated at **full size** (≈1.3B/“1.4B”), **no layer reduction** or slim configs.
 - Interpolator design direction: **one‑pass, deterministic latent‑space motion‑compensated warp + blend** (no iterative VFI).  

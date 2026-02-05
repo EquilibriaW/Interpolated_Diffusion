@@ -127,13 +127,18 @@ def _build_wan_synth_ops(
     shuffle_buffer: int,
     return_keys: bool,
     rename_map: Optional[dict],
+    resampled: bool = False,
+    seed: int = 0,
 ):
     _require_webdataset()
     import webdataset as wds
 
-    ops = [wds.SimpleShardList(shards)]
-    if shardshuffle:
-        ops.append(wds.shuffle(1000))
+    if resampled:
+        ops = [wds.ResampledShards(shards, seed=int(seed), deterministic=True)]
+    else:
+        ops = [wds.SimpleShardList(shards)]
+        if shardshuffle:
+            ops.append(wds.shuffle(1000))
     ops.extend([wds.split_by_node, wds.split_by_worker, wds.tarfile_to_samples()])
     if shuffle:
         buffer = max(1, int(shuffle_buffer))
@@ -158,6 +163,8 @@ def create_wan_synth_dataloader(
     shuffle: bool = True,
     shardshuffle: bool = True,
     return_keys: bool = False,
+    resampled: bool = False,
+    seed: int = 0,
 ) -> DataLoader:
     """WebDataset loader for TurboDiffusion synthetic Wan2.1 latents."""
     _require_webdataset()
@@ -166,6 +173,9 @@ def create_wan_synth_dataloader(
     shards = sorted(glob.glob(tar_path_pattern))
     if not shards:
         raise FileNotFoundError(f"No files found with pattern '{tar_path_pattern}'")
+
+    if persistent_workers and not resampled:
+        raise ValueError("persistent_workers=True requires resampled=True for WebDataset to avoid iterator deadlocks.")
 
     ops = _build_wan_synth_ops(
         shards,
@@ -178,6 +188,8 @@ def create_wan_synth_dataloader(
             "text_embed": "embed.pt;embed.pth",
             "text": "prompt.txt",
         },
+        resampled=resampled,
+        seed=seed,
     )
     ops.append(wds.batched(batch_size, partial=False, collation_fn=_dict_collation_fn))
     dataset = wds.DataPipeline(*ops)
@@ -209,6 +221,8 @@ def create_wan_synth_anchor_dataloader(
     join_by_key: bool = True,
     max_key_buffer: int = 2000,
     allow_missing: bool = False,
+    resampled: bool = False,
+    seed: int = 0,
 ) -> DataLoader:
     """WebDataset loader for Wan2.1 latents paired with precomputed anchors."""
     _require_webdataset()
@@ -221,6 +235,9 @@ def create_wan_synth_anchor_dataloader(
     if not anchor_shards:
         raise FileNotFoundError(f"No files found with pattern '{anchor_path_pattern}'")
 
+    if persistent_workers and not resampled:
+        raise ValueError("persistent_workers=True requires resampled=True for WebDataset to avoid iterator deadlocks.")
+
     base_ops = _build_wan_synth_ops(
         shards,
         shuffle=False,
@@ -232,6 +249,8 @@ def create_wan_synth_anchor_dataloader(
             "text_embed": "embed.pt;embed.pth",
             "text": "prompt.txt",
         },
+        resampled=resampled,
+        seed=seed,
     )
     anchor_ops = _build_wan_synth_ops(
         anchor_shards,
@@ -240,6 +259,8 @@ def create_wan_synth_anchor_dataloader(
         shuffle_buffer=shuffle_buffer,
         return_keys=True,
         rename_map={"anchor": "anchor.pth", "anchor_idx": "anchor_idx.pth"},
+        resampled=resampled,
+        seed=seed,
     )
     base = wds.DataPipeline(*base_ops)
     anchors = wds.DataPipeline(*anchor_ops)
@@ -292,6 +313,8 @@ def create_wan_synth_teacher_dataloader(
     join_by_key: bool = True,
     max_key_buffer: int = 2000,
     allow_missing: bool = False,
+    resampled: bool = False,
+    seed: int = 0,
 ) -> DataLoader:
     """WebDataset loader for Wan2.1 latents paired with LDMVFI teacher outputs."""
     _require_webdataset()
@@ -304,6 +327,9 @@ def create_wan_synth_teacher_dataloader(
     if not teacher_shards:
         raise FileNotFoundError(f"No files found with pattern '{teacher_path_pattern}'")
 
+    if persistent_workers and not resampled:
+        raise ValueError("persistent_workers=True requires resampled=True for WebDataset to avoid iterator deadlocks.")
+
     base_ops = _build_wan_synth_ops(
         shards,
         shuffle=False,
@@ -315,6 +341,8 @@ def create_wan_synth_teacher_dataloader(
             "text_embed": "embed.pt;embed.pth",
             "text": "prompt.txt",
         },
+        resampled=resampled,
+        seed=seed,
     )
     teacher_ops = _build_wan_synth_ops(
         teacher_shards,
@@ -323,6 +351,8 @@ def create_wan_synth_teacher_dataloader(
         shuffle_buffer=shuffle_buffer,
         return_keys=True,
         rename_map={"teacher": "teacher.pth", "teacher_idx": "teacher_idx.pth"},
+        resampled=resampled,
+        seed=seed,
     )
     base = wds.DataPipeline(*base_ops)
     teacher = wds.DataPipeline(*teacher_ops)

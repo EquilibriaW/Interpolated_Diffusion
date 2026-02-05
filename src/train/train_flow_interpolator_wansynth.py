@@ -74,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--compile", type=int, default=0)
     p.add_argument("--straightener_ckpt", type=str, default="")
     p.add_argument("--straightener_dtype", type=str, default="")
+    p.add_argument("--resampled", type=int, default=1)
     return p
 
 
@@ -155,6 +156,8 @@ def _eval_model(
     prefetch_factor: int,
     persistent_workers: bool,
     pin_memory: bool,
+    resampled: bool,
+    seed: int,
     straightener=None,
 ) -> dict:
     model_was_training = model.training
@@ -169,6 +172,8 @@ def _eval_model(
         pin_memory=pin_memory,
         shuffle=True,
         shardshuffle=True,
+        resampled=resampled,
+        seed=seed,
     )
     it = iter(loader)
     gen = torch.Generator(device=device)
@@ -311,6 +316,8 @@ def main() -> None:
             shuffle=True,
             join_by_key=True,
             allow_missing=True,
+            resampled=bool(args.resampled),
+            seed=args.seed,
         )
     else:
         loader = create_wan_synth_dataloader(
@@ -323,6 +330,8 @@ def main() -> None:
             pin_memory=bool(args.pin_memory),
             shuffle=True,
             shardshuffle=True,
+            resampled=bool(args.resampled),
+            seed=args.seed,
         )
     it = iter(loader)
 
@@ -608,6 +617,8 @@ def main() -> None:
                 prefetch_factor=args.prefetch_factor,
                 persistent_workers=bool(args.persistent_workers),
                 pin_memory=bool(args.pin_memory),
+                resampled=bool(args.resampled),
+                seed=args.seed,
                 straightener=straightener,
             )
             writer.add_scalar("val/l1", metrics["val_l1"], step)
