@@ -2,11 +2,13 @@ __pycache__/
 *.pyc
 .DS_Store
 .venv/
+.venv_ldmvfi/
 .pytest_cache/
 
 checkpoints/
 outputs/
 runs/
+logs/
 cache/
 .cache/
 .d4rl/
@@ -21,6 +23,8 @@ data/didemo_cache/
 data/LSMDC/
 data/lsmdc/
 data/wan_synth/
+data/wan_synth_anchors*/
+data/wan_synth_ldmvfi*/
 tmp_repos/
 
 notes/*.tgz

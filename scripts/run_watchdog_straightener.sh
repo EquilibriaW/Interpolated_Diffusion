@@ -19,7 +19,7 @@ CMD="python -u -m src.train.train_latent_straightener_wansynth \
   --num_workers 4 \
   --persistent_workers 1 \
   --resampled 1 \
-  |& tee logs/latent_straightener_optD_h448_b5_10k.log"
+  |& tee -a logs/latent_straightener_optD_h448_b5_10k.log"
 
 FALLBACK_CMD="python -u -m src.train.train_latent_straightener_wansynth \
   --data_pattern 'data/wan_synth/Wan2.1_14B_480p_16:9_Euler-step100_shift-3.0_cfg-5.0_seed-0_250K/shard-0000*.tar' \
@@ -39,7 +39,7 @@ FALLBACK_CMD="python -u -m src.train.train_latent_straightener_wansynth \
   --num_workers 0 \
   --persistent_workers 0 \
   --resampled 1 \
-  |& tee logs/latent_straightener_optD_h448_b5_10k.log"
+  |& tee -a logs/latent_straightener_optD_h448_b5_10k.log"
 
 python -u scripts/watchdog_train.py \
   --tmux-session straightener_h448_b5_10k \
@@ -50,4 +50,5 @@ python -u scripts/watchdog_train.py \
   --stall-minutes 10 \
   --check-every 60 \
   --ram-max-frac 0.90 \
+  --stop-when-done 1 \
   --use-fallback-after 1

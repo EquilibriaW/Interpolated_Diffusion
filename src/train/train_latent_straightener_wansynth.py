@@ -181,6 +181,8 @@ def _eval_model(
         pin_memory=pin_memory,
         shuffle=True,
         shardshuffle=True,
+        keep_text_embed=False,
+        keep_text=False,
         resampled=resampled,
         seed=seed,
     )
@@ -192,7 +194,8 @@ def _eval_model(
     err_straight_all = []
     err_recon_all = []
     err_lin_all = []
-    for _ in range(num_batches):
+    log_every = max(1, int(num_batches // 10))
+    for i in range(num_batches):
         try:
             batch_data = next(it)
         except StopIteration:
@@ -228,6 +231,9 @@ def _eval_model(
         err_straight_all.append(err_straight.detach().cpu())
         err_recon_all.append(err_recon.detach().cpu())
         err_lin_all.append(err_lin.detach().cpu())
+
+        if (i + 1) % log_every == 0 or (i + 1) == num_batches:
+            print(f"[eval] batch {i + 1}/{num_batches}", flush=True)
 
     err_lerp = torch.cat(err_lerp_all, dim=0)
     err_straight = torch.cat(err_straight_all, dim=0)
@@ -267,6 +273,8 @@ def main() -> None:
         pin_memory=bool(args.pin_memory),
         shuffle=True,
         shardshuffle=True,
+        keep_text_embed=False,
+        keep_text=False,
         resampled=bool(args.resampled),
         seed=args.seed,
     )

@@ -67,6 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sinkhorn_win", type=int, default=5)
     p.add_argument("--sinkhorn_angles", type=str, default="-10,-5,0,5,10")
     p.add_argument("--sinkhorn_shift", type=int, default=4)
+    p.add_argument("--sinkhorn_global_mode", type=str, default="phasecorr", choices=["se2", "phasecorr", "none"])
+    p.add_argument("--sinkhorn_warp_space", type=str, default="s", choices=["z", "s"])
     p.add_argument("--sinkhorn_iters", type=int, default=20)
     p.add_argument("--sinkhorn_tau", type=float, default=0.05)
     p.add_argument("--sinkhorn_dustbin", type=float, default=-2.0)
@@ -212,6 +214,7 @@ def main() -> None:
             in_channels=C0,
             patch_size=args.patch_size,
             win_size=args.sinkhorn_win,
+            global_mode=args.sinkhorn_global_mode,
             angles_deg=angles,
             shift_range=args.sinkhorn_shift,
             sinkhorn_iters=args.sinkhorn_iters,
@@ -219,6 +222,7 @@ def main() -> None:
             dustbin_logit=args.sinkhorn_dustbin,
             d_match=args.sinkhorn_d_match,
             straightener=straightener,
+            warp_space=args.sinkhorn_warp_space,
         ).to(device=device, dtype=get_autocast_dtype())
 
     mask_channels = (2 if args.stage2_mode == "adj" else 1) + (1 if args.anchor_conf else 0)
@@ -496,6 +500,8 @@ def main() -> None:
                 "sinkhorn_win": args.sinkhorn_win,
                 "sinkhorn_angles": args.sinkhorn_angles,
                 "sinkhorn_shift": args.sinkhorn_shift,
+                "sinkhorn_global_mode": args.sinkhorn_global_mode,
+                "sinkhorn_warp_space": args.sinkhorn_warp_space,
                 "sinkhorn_iters": args.sinkhorn_iters,
                 "sinkhorn_tau": args.sinkhorn_tau,
                 "sinkhorn_dustbin": args.sinkhorn_dustbin,
@@ -542,6 +548,8 @@ def main() -> None:
         "sinkhorn_win": args.sinkhorn_win,
         "sinkhorn_angles": args.sinkhorn_angles,
         "sinkhorn_shift": args.sinkhorn_shift,
+        "sinkhorn_global_mode": args.sinkhorn_global_mode,
+        "sinkhorn_warp_space": args.sinkhorn_warp_space,
         "sinkhorn_iters": args.sinkhorn_iters,
         "sinkhorn_tau": args.sinkhorn_tau,
         "sinkhorn_dustbin": args.sinkhorn_dustbin,

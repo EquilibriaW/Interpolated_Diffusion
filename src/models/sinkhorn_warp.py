@@ -56,6 +56,7 @@ class SinkhornWarpInterpolator(nn.Module):
         in_channels: int,
         patch_size: int = 4,
         win_size: int = 5,
+        global_mode: str = "se2",
         angles_deg: Optional[Iterable[float]] = None,
         shift_range: int = 4,
         se2_chunk: int = 64,
@@ -64,14 +65,20 @@ class SinkhornWarpInterpolator(nn.Module):
         dustbin_logit: float = -2.0,
         d_match: int = 0,
         straightener: Optional[nn.Module] = None,
+        warp_space: str = "z",
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
         self.patch_size = int(patch_size)
         self.win_size = int(win_size)
+        self.global_mode = str(global_mode)
+        if self.global_mode not in ("se2", "phasecorr", "none"):
+            raise ValueError(f"global_mode must be one of se2/phasecorr/none, got {self.global_mode}")
         if angles_deg is None:
             angles_deg = (-10.0, -5.0, 0.0, 5.0, 10.0)
         angles = [float(a) * math.pi / 180.0 for a in angles_deg]
+        # Keep a python copy to avoid device sync (tolist()) during phase correlation search.
+        self._angles_list = list(angles)
         self.register_buffer("angles", torch.tensor(angles, dtype=torch.float32), persistent=False)
         self.shift_range = int(shift_range)
         self.se2_chunk = int(se2_chunk)
@@ -80,15 +87,20 @@ class SinkhornWarpInterpolator(nn.Module):
         self.dustbin_logit = float(dustbin_logit)
         self.d_match = int(d_match)
         self.straightener = straightener
+        self.warp_space = str(warp_space)
+        if self.warp_space not in ("z", "s"):
+            raise ValueError(f"warp_space must be 'z' or 's', got {self.warp_space}")
+        if self.warp_space == "s" and self.straightener is None:
+            raise ValueError("warp_space='s' requires a straightener")
         self._se2_cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         if self.straightener is not None:
             self.straightener.eval()
             for p in self.straightener.parameters():
                 p.requires_grad_(False)
 
-    def _token_features(self, z: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
+    def _token_features(self, z: torch.Tensor, *, assume_straightened: bool = False) -> Tuple[torch.Tensor, int, int]:
         # z: [B,C,H,W]
-        if self.straightener is not None:
+        if self.straightener is not None and not assume_straightened:
             with torch.no_grad():
                 z = self.straightener.encode(z)
         tokens, (hp, wp) = patchify_latents(z.unsqueeze(1), self.patch_size)
@@ -212,6 +224,51 @@ class SinkhornWarpInterpolator(nn.Module):
         best_theta = theta_all[best_idx]
         best_dx = dx_all[best_idx]
         best_dy = dy_all[best_idx]
+        return best_theta, best_dx, best_dy
+
+    def _phasecorr_shift_batch(
+        self, f0: torch.Tensor, f1: torch.Tensor, *, return_peak: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        # f0/f1: [B,Hp,Wp], returns dx/dy in token units (float)
+        B, Hp, Wp = f0.shape
+        f0 = f0 - f0.mean(dim=(1, 2), keepdim=True)
+        f1 = f1 - f1.mean(dim=(1, 2), keepdim=True)
+        F0 = torch.fft.rfft2(f0)
+        F1 = torch.fft.rfft2(f1)
+        R = F0 * torch.conj(F1)
+        R = R / (R.abs() + 1e-6)
+        corr = torch.fft.irfft2(R, s=(Hp, Wp))
+        corr_flat = corr.view(B, -1)
+        peak, idx = corr_flat.max(dim=-1)
+        dy = (idx // Wp).to(torch.long)
+        dx = (idx % Wp).to(torch.long)
+        dy = torch.where(dy > Hp // 2, dy - Hp, dy)
+        dx = torch.where(dx > Wp // 2, dx - Wp, dx)
+        if return_peak:
+            return dx.to(dtype=f0.dtype), dy.to(dtype=f0.dtype), peak.to(dtype=f0.dtype)
+        return dx.to(dtype=f0.dtype), dy.to(dtype=f0.dtype), None
+
+    def _phasecorr_se2_batch(
+        self, f0_score: torch.Tensor, f1_score: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # f0_score/f1_score: [B,Hp,Wp] (single-channel score maps)
+        B, Hp, Wp = f0_score.shape
+        best_score = torch.full((B,), -float("inf"), device=f0_score.device, dtype=f0_score.dtype)
+        best_theta = torch.zeros((B,), device=f0_score.device, dtype=f0_score.dtype)
+        best_dx = torch.zeros((B,), device=f0_score.device, dtype=f0_score.dtype)
+        best_dy = torch.zeros((B,), device=f0_score.device, dtype=f0_score.dtype)
+
+        for angle in self._angles_list:
+            theta = torch.full((B,), float(angle), device=f0_score.device, dtype=f0_score.dtype)
+            zeros = torch.zeros_like(theta)
+            f1_rot = self._apply_se2_per_sample(f1_score.unsqueeze(-1), theta, zeros, zeros).squeeze(-1)
+            dx, dy, peak = self._phasecorr_shift_batch(f0_score, f1_rot, return_peak=True)
+            better = peak > best_score
+            best_score = torch.where(better, peak, best_score)
+            best_theta = torch.where(better, theta, best_theta)
+            best_dx = torch.where(better, dx, best_dx)
+            best_dy = torch.where(better, dy, best_dy)
+
         return best_theta, best_dx, best_dy
 
     def _local_sinkhorn_delta(self, f0: torch.Tensor, f1: torch.Tensor, hp: int, wp: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -421,7 +478,16 @@ class SinkhornWarpInterpolator(nn.Module):
     def _compute_flow_from_feats_batch(self, f0: torch.Tensor, f1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # f0/f1: [B,Hp,Wp,D]
         hp, wp = f0.shape[1], f0.shape[2]
-        theta, dx, dy = self._estimate_global_se2_batch(f0, f1)
+        if self.global_mode == "se2":
+            theta, dx, dy = self._estimate_global_se2_batch(f0, f1)
+        elif self.global_mode == "phasecorr":
+            f0_score = f0.mean(dim=-1)
+            f1_score = f1.mean(dim=-1)
+            theta, dx, dy = self._phasecorr_se2_batch(f0_score, f1_score)
+        else:
+            theta = torch.zeros((f0.shape[0],), device=f0.device, dtype=f0.dtype)
+            dx = torch.zeros_like(theta)
+            dy = torch.zeros_like(theta)
         f1_aligned = self._apply_se2_per_sample(f1, theta, dx, dy)
         delta, conf = self._local_sinkhorn_delta_batch(f0, f1_aligned, hp, wp)
         flow_tok = self._compose_flow_batch(delta, theta, dx, dy, hp, wp)
@@ -437,10 +503,22 @@ class SinkhornWarpInterpolator(nn.Module):
             raise ValueError("idx must be [B,K]")
         out = torch.zeros_like(latents)
         conf = torch.zeros((B, T, H, W), device=latents.device, dtype=latents.dtype)
-        # precompute token features for all frames
+        # Precompute token features for all frames. Matching is always done in straightened space
+        # (if available), while warping can happen in either z-space or s-space.
         latents_flat = latents.reshape(B * T, latents.shape[2], H, W)
-        feats, hp, wp = self._token_features(latents_flat)
+        s_latents_flat = None
+        if self.straightener is not None:
+            with torch.no_grad():
+                s_latents_flat = self.straightener.encode(latents_flat)
+            feats, hp, wp = self._token_features(s_latents_flat, assume_straightened=True)
+        else:
+            feats, hp, wp = self._token_features(latents_flat, assume_straightened=True)
         feats = feats.view(B, T, hp, wp, -1)
+        s_latents = None
+        if self.warp_space == "s":
+            # warp_space='s' requires straightener by construction.
+            assert s_latents_flat is not None
+            s_latents = s_latents_flat.view(B, T, latents.shape[2], H, W)
 
         pair_meta = []
         idx_sorted = []
@@ -507,22 +585,41 @@ class SinkhornWarpInterpolator(nn.Module):
             steps = gap - 1
             alpha = torch.linspace(1, steps, steps, device=latents.device, dtype=latents.dtype) / float(gap)
             alpha = alpha.view(-1, 1, 1, 1)
-            z0_rep = z0.expand(steps, -1, -1, -1)
-            z1_rep = z1.expand(steps, -1, -1, -1)
+            if self.warp_space == "s":
+                assert s_latents is not None
+                s0 = s_latents[b : b + 1, t0]
+                s1 = s_latents[b : b + 1, t1]
+                s0_rep = s0.expand(steps, -1, -1, -1)
+                s1_rep = s1.expand(steps, -1, -1, -1)
+            else:
+                z0_rep = z0.expand(steps, -1, -1, -1)
+                z1_rep = z1.expand(steps, -1, -1, -1)
             flow01_rep = flow01_p.expand(steps, -1, -1, -1) * alpha
             flow10_rep = flow10_p.expand(steps, -1, -1, -1) * (1.0 - alpha)
             conf01_rep = conf01_p.expand(steps, -1, -1, -1)
             conf10_rep = conf10_p.expand(steps, -1, -1, -1)
 
-            z0_w = _warp(z0_rep, -flow01_rep)
-            z1_w = _warp(z1_rep, -flow10_rep)
+            if self.warp_space == "s":
+                s0_w = _warp(s0_rep, -flow01_rep)
+                s1_w = _warp(s1_rep, -flow10_rep)
+            else:
+                z0_w = _warp(z0_rep, -flow01_rep)
+                z1_w = _warp(z1_rep, -flow10_rep)
             w0 = (1.0 - alpha) * conf01_rep
             w1 = alpha * conf10_rep
             denom = w0 + w1
-            z_mix = (w0 * z0_w + w1 * z1_w) / denom.clamp_min(1e-6)
-            z_lin = (1.0 - alpha) * z0_w + alpha * z1_w
-            mask = denom > 1e-6
-            z_t = torch.where(mask, z_mix, z_lin)
+            if self.warp_space == "s":
+                s_mix = (w0 * s0_w + w1 * s1_w) / denom.clamp_min(1e-6)
+                s_lin = (1.0 - alpha) * s0_w + alpha * s1_w
+                mask = denom > 1e-6
+                s_t = torch.where(mask, s_mix, s_lin)
+                with torch.no_grad():
+                    z_t = self.straightener.decode(s_t.to(dtype=s0_w.dtype))
+            else:
+                z_mix = (w0 * z0_w + w1 * z1_w) / denom.clamp_min(1e-6)
+                z_lin = (1.0 - alpha) * z0_w + alpha * z1_w
+                mask = denom > 1e-6
+                z_t = torch.where(mask, z_mix, z_lin)
             out[b, t0 + 1 : t1] = z_t
             conf[b, t0 + 1 : t1] = conf_mix[0, 0]
         return out, conf

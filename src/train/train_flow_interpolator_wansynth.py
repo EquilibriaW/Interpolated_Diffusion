@@ -172,6 +172,8 @@ def _eval_model(
         pin_memory=pin_memory,
         shuffle=True,
         shardshuffle=True,
+        keep_text_embed=False,
+        keep_text=False,
         resampled=resampled,
         seed=seed,
     )
@@ -316,6 +318,8 @@ def main() -> None:
             shuffle=True,
             join_by_key=True,
             allow_missing=True,
+            keep_text_embed=False,
+            keep_text=False,
             resampled=bool(args.resampled),
             seed=args.seed,
         )
@@ -330,6 +334,8 @@ def main() -> None:
             pin_memory=bool(args.pin_memory),
             shuffle=True,
             shardshuffle=True,
+            keep_text_embed=False,
+            keep_text=False,
             resampled=bool(args.resampled),
             seed=args.seed,
         )

@@ -126,6 +126,8 @@ def _build_wan_synth_ops(
     shardshuffle: bool,
     shuffle_buffer: int,
     return_keys: bool,
+    keep_text_embed: bool,
+    keep_text: bool,
     rename_map: Optional[dict],
     resampled: bool = False,
     seed: int = 0,
@@ -140,6 +142,21 @@ def _build_wan_synth_ops(
         if shardshuffle:
             ops.append(wds.shuffle(1000))
     ops.extend([wds.split_by_node, wds.split_by_worker, wds.tarfile_to_samples()])
+
+    # Drop unneeded fields before shuffling/decoding to keep memory bounded.
+    drop_keys = set()
+    if not keep_text_embed:
+        drop_keys.update({"embed.pt", "embed.pth"})
+    if not keep_text:
+        drop_keys.update({"prompt.txt"})
+    if drop_keys:
+
+        def _drop(sample: dict) -> dict:
+            for k in drop_keys:
+                sample.pop(k, None)
+            return sample
+
+        ops.append(wds.map(_drop))
     if shuffle:
         buffer = max(1, int(shuffle_buffer))
         ops.append(wds.shuffle(buffer))
@@ -163,6 +180,8 @@ def create_wan_synth_dataloader(
     shuffle: bool = True,
     shardshuffle: bool = True,
     return_keys: bool = False,
+    keep_text_embed: bool = True,
+    keep_text: bool = True,
     resampled: bool = False,
     seed: int = 0,
 ) -> DataLoader:
@@ -183,10 +202,12 @@ def create_wan_synth_dataloader(
         shardshuffle=shardshuffle,
         shuffle_buffer=shuffle_buffer,
         return_keys=return_keys,
+        keep_text_embed=keep_text_embed,
+        keep_text=keep_text,
         rename_map={
             "latents": "latent.pt;latent.pth",
-            "text_embed": "embed.pt;embed.pth",
-            "text": "prompt.txt",
+            **({"text_embed": "embed.pt;embed.pth"} if keep_text_embed else {}),
+            **({"text": "prompt.txt"} if keep_text else {}),
         },
         resampled=resampled,
         seed=seed,
@@ -221,6 +242,8 @@ def create_wan_synth_anchor_dataloader(
     join_by_key: bool = True,
     max_key_buffer: int = 2000,
     allow_missing: bool = False,
+    keep_text_embed: bool = True,
+    keep_text: bool = True,
     resampled: bool = False,
     seed: int = 0,
 ) -> DataLoader:
@@ -244,10 +267,12 @@ def create_wan_synth_anchor_dataloader(
         shardshuffle=False,
         shuffle_buffer=shuffle_buffer,
         return_keys=True,
+        keep_text_embed=keep_text_embed,
+        keep_text=keep_text,
         rename_map={
             "latents": "latent.pt;latent.pth",
-            "text_embed": "embed.pt;embed.pth",
-            "text": "prompt.txt",
+            **({"text_embed": "embed.pt;embed.pth"} if keep_text_embed else {}),
+            **({"text": "prompt.txt"} if keep_text else {}),
         },
         resampled=resampled,
         seed=seed,
@@ -258,6 +283,8 @@ def create_wan_synth_anchor_dataloader(
         shardshuffle=False,
         shuffle_buffer=shuffle_buffer,
         return_keys=True,
+        keep_text_embed=False,
+        keep_text=False,
         rename_map={"anchor": "anchor.pth", "anchor_idx": "anchor_idx.pth"},
         resampled=resampled,
         seed=seed,
@@ -313,6 +340,8 @@ def create_wan_synth_teacher_dataloader(
     join_by_key: bool = True,
     max_key_buffer: int = 2000,
     allow_missing: bool = False,
+    keep_text_embed: bool = True,
+    keep_text: bool = True,
     resampled: bool = False,
     seed: int = 0,
 ) -> DataLoader:
@@ -336,10 +365,12 @@ def create_wan_synth_teacher_dataloader(
         shardshuffle=False,
         shuffle_buffer=shuffle_buffer,
         return_keys=True,
+        keep_text_embed=keep_text_embed,
+        keep_text=keep_text,
         rename_map={
             "latents": "latent.pt;latent.pth",
-            "text_embed": "embed.pt;embed.pth",
-            "text": "prompt.txt",
+            **({"text_embed": "embed.pt;embed.pth"} if keep_text_embed else {}),
+            **({"text": "prompt.txt"} if keep_text else {}),
         },
         resampled=resampled,
         seed=seed,
@@ -350,6 +381,8 @@ def create_wan_synth_teacher_dataloader(
         shardshuffle=False,
         shuffle_buffer=shuffle_buffer,
         return_keys=True,
+        keep_text_embed=False,
+        keep_text=False,
         rename_map={"teacher": "teacher.pth", "teacher_idx": "teacher_idx.pth"},
         resampled=resampled,
         seed=seed,
