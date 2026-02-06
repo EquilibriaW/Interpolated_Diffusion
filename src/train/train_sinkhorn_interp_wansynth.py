@@ -49,6 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sinkhorn_angles", type=str, default="-10,-5,0,5,10")
     p.add_argument("--sinkhorn_shift", type=int, default=4)
     p.add_argument("--sinkhorn_global_mode", type=str, default="phasecorr", choices=["se2", "phasecorr", "none"])
+    p.add_argument(
+        "--sinkhorn_phasecorr_mode",
+        type=str,
+        default="multi",
+        choices=["mean", "multi"],
+        help="When using --sinkhorn_global_mode=phasecorr, run phase correlation on a mean score-map or multi-channel features.",
+    )
     p.add_argument("--sinkhorn_iters", type=int, default=20)
     p.add_argument("--sinkhorn_tau", type=float, default=0.05)
     p.add_argument("--sinkhorn_dustbin", type=float, default=-2.0)
@@ -424,6 +431,7 @@ def main() -> None:
         win_size=args.sinkhorn_win,
         win_stride=args.sinkhorn_stride,
         global_mode=args.sinkhorn_global_mode,
+        phasecorr_mode=str(args.sinkhorn_phasecorr_mode),
         angles_deg=angles,
         shift_range=args.sinkhorn_shift,
         sinkhorn_iters=args.sinkhorn_iters,
@@ -651,9 +659,12 @@ def main() -> None:
                 # Global alignment diagnostics (non-differentiable); useful to detect “always zero” motion.
                 try:
                     if args.sinkhorn_global_mode == "phasecorr":
-                        f0_score = f0.mean(dim=-1).detach()
-                        f1_score = f1.mean(dim=-1).detach()
-                        theta_dbg, dx_dbg, dy_dbg = matcher._phasecorr_se2_batch(f0_score, f1_score)
+                        if getattr(matcher, "phasecorr_mode", "mean") == "multi":
+                            theta_dbg, dx_dbg, dy_dbg = matcher._phasecorr_se2_multi_batch(f0.detach(), f1.detach())
+                        else:
+                            f0_score = f0.mean(dim=-1).detach()
+                            f1_score = f1.mean(dim=-1).detach()
+                            theta_dbg, dx_dbg, dy_dbg = matcher._phasecorr_se2_batch(f0_score, f1_score)
                     elif args.sinkhorn_global_mode == "se2":
                         theta_dbg, dx_dbg, dy_dbg = matcher._estimate_global_se2_batch(f0.detach(), f1.detach())
                     else:
@@ -738,6 +749,7 @@ def main() -> None:
                 "sinkhorn_angles": args.sinkhorn_angles,
                 "sinkhorn_shift": args.sinkhorn_shift,
                 "sinkhorn_global_mode": args.sinkhorn_global_mode,
+                "sinkhorn_phasecorr_mode": str(args.sinkhorn_phasecorr_mode),
                 "sinkhorn_iters": args.sinkhorn_iters,
                 "sinkhorn_tau": float(args.sinkhorn_tau),
                 "sinkhorn_dustbin": float(args.sinkhorn_dustbin),
@@ -777,6 +789,7 @@ def main() -> None:
         "sinkhorn_angles": args.sinkhorn_angles,
         "sinkhorn_shift": args.sinkhorn_shift,
         "sinkhorn_global_mode": args.sinkhorn_global_mode,
+        "sinkhorn_phasecorr_mode": str(args.sinkhorn_phasecorr_mode),
         "sinkhorn_iters": args.sinkhorn_iters,
         "sinkhorn_tau": float(args.sinkhorn_tau),
         "sinkhorn_dustbin": float(args.sinkhorn_dustbin),

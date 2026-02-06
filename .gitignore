@@ -26,6 +26,7 @@ data/wan_synth/
 data/wan_synth_anchors*/
 data/wan_synth_ldmvfi*/
 tmp_repos/
+tmp_sinkhorn_outliers*/
 
 notes/*.tgz
 
