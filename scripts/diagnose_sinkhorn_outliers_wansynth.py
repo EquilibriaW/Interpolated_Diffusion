@@ -42,6 +42,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["", "token", "latent"],
         help="Override phasecorr level used by matcher (for analyzing older checkpoints).",
     )
+    p.add_argument(
+        "--scale_flow_by_conf",
+        type=int,
+        default=0,
+        help=(
+            "If set, scale the warping flow by the confidence map before warping (flow *= conf). "
+            "This tests whether catastrophic outliers are caused by applying large, low-confidence warps."
+        ),
+    )
     p.add_argument("--topk", type=int, default=12)
     p.add_argument("--out_dir", type=str, default="tmp_sinkhorn_outliers")
     p.add_argument("--save_tensors", type=int, default=1)
@@ -272,11 +281,17 @@ def main() -> None:
                 0.0, 1.0
             )
 
+            flow01_eff = flow01
+            flow10_eff = flow10
+            if bool(args.scale_flow_by_conf):
+                flow01_eff = flow01_eff * conf01
+                flow10_eff = flow10_eff * conf10
+
             if args.warp_space == "s":
-                s0_w = _warp_fp32(s0, -flow01 * alpha4)
-                s1_w = _warp_fp32(s1, -flow10 * (1.0 - alpha4))
-                conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
-                conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+                s0_w = _warp_fp32(s0, -flow01_eff * alpha4)
+                s1_w = _warp_fp32(s1, -flow10_eff * (1.0 - alpha4))
+                conf0_w = _warp_fp32(conf01, -flow01_eff * alpha4)
+                conf1_w = _warp_fp32(conf10, -flow10_eff * (1.0 - alpha4))
                 w0 = (1.0 - alpha4) * conf0_w
                 w1 = alpha4 * conf1_w
                 denom = w0 + w1
@@ -285,10 +300,10 @@ def main() -> None:
                 s_hat = torch.where(denom > 1e-6, s_mix, s_lin)
                 z_hat = model.decode(s_hat.to(dtype=s0.dtype))
             else:
-                z0_w = _warp_fp32(z0, -flow01 * alpha4)
-                z1_w = _warp_fp32(z1, -flow10 * (1.0 - alpha4))
-                conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
-                conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+                z0_w = _warp_fp32(z0, -flow01_eff * alpha4)
+                z1_w = _warp_fp32(z1, -flow10_eff * (1.0 - alpha4))
+                conf0_w = _warp_fp32(conf01, -flow01_eff * alpha4)
+                conf1_w = _warp_fp32(conf10, -flow10_eff * (1.0 - alpha4))
                 w0 = (1.0 - alpha4) * conf0_w
                 w1 = alpha4 * conf1_w
                 denom = w0 + w1
@@ -440,11 +455,18 @@ def main() -> None:
             conf10 = F.interpolate(conf10_tok.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=True).clamp(
                 0.0, 1.0
             )
+
+            flow01_eff = flow01
+            flow10_eff = flow10
+            if bool(args.scale_flow_by_conf):
+                flow01_eff = flow01_eff * conf01
+                flow10_eff = flow10_eff * conf10
+
             if args.warp_space == "s":
-                s0_w = _warp_fp32(s0, -flow01 * alpha4)
-                s1_w = _warp_fp32(s1, -flow10 * (1.0 - alpha4))
-                conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
-                conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+                s0_w = _warp_fp32(s0, -flow01_eff * alpha4)
+                s1_w = _warp_fp32(s1, -flow10_eff * (1.0 - alpha4))
+                conf0_w = _warp_fp32(conf01, -flow01_eff * alpha4)
+                conf1_w = _warp_fp32(conf10, -flow10_eff * (1.0 - alpha4))
                 w0 = (1.0 - alpha4) * conf0_w
                 w1 = alpha4 * conf1_w
                 denom = w0 + w1
@@ -453,10 +475,10 @@ def main() -> None:
                 s_hat = torch.where(denom > 1e-6, s_mix, s_lin)
                 z_hat = model.decode(s_hat.to(dtype=s0.dtype))
             else:
-                z0_w = _warp_fp32(z0, -flow01 * alpha4)
-                z1_w = _warp_fp32(z1, -flow10 * (1.0 - alpha4))
-                conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
-                conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+                z0_w = _warp_fp32(z0, -flow01_eff * alpha4)
+                z1_w = _warp_fp32(z1, -flow10_eff * (1.0 - alpha4))
+                conf0_w = _warp_fp32(conf01, -flow01_eff * alpha4)
+                conf1_w = _warp_fp32(conf10, -flow10_eff * (1.0 - alpha4))
                 w0 = (1.0 - alpha4) * conf0_w
                 w1 = alpha4 * conf1_w
                 denom = w0 + w1
