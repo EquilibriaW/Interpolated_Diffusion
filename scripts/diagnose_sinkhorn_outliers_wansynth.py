@@ -296,8 +296,8 @@ def main() -> None:
                 w1 = alpha4 * conf1_w
                 denom = w0 + w1
                 s_mix = (w0 * s0_w + w1 * s1_w) / denom.clamp_min(1e-6)
-                s_lin = (1.0 - alpha4) * s0_w + alpha4 * s1_w
-                s_hat = torch.where(denom > 1e-6, s_mix, s_lin)
+                s_lerp = (1.0 - alpha4.to(dtype=s0.dtype)) * s0 + alpha4.to(dtype=s0.dtype) * s1
+                s_hat = torch.where(denom > 1e-6, s_mix, s_lerp)
                 z_hat = model.decode(s_hat.to(dtype=s0.dtype))
             else:
                 z0_w = _warp_fp32(z0, -flow01_eff * alpha4)
@@ -308,8 +308,8 @@ def main() -> None:
                 w1 = alpha4 * conf1_w
                 denom = w0 + w1
                 z_mix = (w0 * z0_w + w1 * z1_w) / denom.clamp_min(1e-6)
-                z_lin = (1.0 - alpha4) * z0_w + alpha4 * z1_w
-                z_hat = torch.where(denom > 1e-6, z_mix, z_lin)
+                z_lerp = (1.0 - alpha4) * z0 + alpha4 * z1
+                z_hat = torch.where(denom > 1e-6, z_mix, z_lerp)
 
         # Baselines.
         z_lerp = z0.float() * (1.0 - alpha4) + z1.float() * alpha4
@@ -471,8 +471,8 @@ def main() -> None:
                 w1 = alpha4 * conf1_w
                 denom = w0 + w1
                 s_mix = (w0 * s0_w + w1 * s1_w) / denom.clamp_min(1e-6)
-                s_lin = (1.0 - alpha4) * s0_w + alpha4 * s1_w
-                s_hat = torch.where(denom > 1e-6, s_mix, s_lin)
+                s_lerp = (1.0 - alpha4.to(dtype=s0.dtype)) * s0 + alpha4.to(dtype=s0.dtype) * s1
+                s_hat = torch.where(denom > 1e-6, s_mix, s_lerp)
                 z_hat = model.decode(s_hat.to(dtype=s0.dtype))
             else:
                 z0_w = _warp_fp32(z0, -flow01_eff * alpha4)
@@ -483,8 +483,8 @@ def main() -> None:
                 w1 = alpha4 * conf1_w
                 denom = w0 + w1
                 z_mix = (w0 * z0_w + w1 * z1_w) / denom.clamp_min(1e-6)
-                z_lin = (1.0 - alpha4) * z0_w + alpha4 * z1_w
-                z_hat = torch.where(denom > 1e-6, z_mix, z_lin)
+                z_lerp = (1.0 - alpha4) * z0 + alpha4 * z1
+                z_hat = torch.where(denom > 1e-6, z_mix, z_lerp)
 
         z_lerp = z0.float() * (1.0 - alpha4) + z1.float() * alpha4
         s_lerp = (1.0 - alpha4.to(dtype=s0.dtype)) * s0 + alpha4.to(dtype=s0.dtype) * s1

@@ -563,8 +563,9 @@ def main() -> None:
                 w1 = alpha4 * conf1_w
                 denom = w0 + w1
                 s_mix = (w0 * s0_w + w1 * s1_w) / denom.clamp_min(1e-6)
-                s_lin = (1.0 - alpha4) * s0_w + alpha4 * s1_w
-                s_t = torch.where(denom > 1e-6, s_mix, s_lin)
+                # If confidence is near-zero, do not apply the warp at all; fall back to unwarped LERP.
+                s_lerp = (1.0 - alpha4) * s0 + alpha4 * s1
+                s_t = torch.where(denom > 1e-6, s_mix, s_lerp)
             else:
                 # Warp and blend in original latent space; straightener only affects correspondences.
                 z0_w = _warp_fp32(z0, -flow01 * alpha4)
@@ -575,8 +576,9 @@ def main() -> None:
                 w1 = alpha4 * conf1_w
                 denom = w0 + w1
                 z_mix = (w0 * z0_w + w1 * z1_w) / denom.clamp_min(1e-6)
-                z_lin = (1.0 - alpha4) * z0_w + alpha4 * z1_w
-                z_hat = torch.where(denom > 1e-6, z_mix, z_lin)
+                # If confidence is near-zero, do not apply the warp at all; fall back to unwarped LERP.
+                z_lerp = (1.0 - alpha4) * z0 + alpha4 * z1
+                z_hat = torch.where(denom > 1e-6, z_mix, z_lerp)
 
         with torch.cuda.amp.autocast(dtype=autocast_dtype):
             if args.warp_space == "s":

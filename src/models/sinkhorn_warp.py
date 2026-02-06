@@ -1003,16 +1003,19 @@ class SinkhornWarpInterpolator(nn.Module):
             denom = w0 + w1
             if self.warp_space == "s":
                 s_mix = (w0 * s0_w + w1 * s1_w) / denom.clamp_min(1e-6)
-                s_lin = (1.0 - alpha) * s0_w + alpha * s1_w
                 mask = denom > 1e-6
-                s_t = torch.where(mask, s_mix, s_lin)
+                # If confidence is near-zero, do not apply the warp at all; fall back to unwarped LERP.
+                # Using warped endpoints here can create catastrophic errors when the estimated flow is invalid.
+                s_lerp = (1.0 - alpha) * s0_rep + alpha * s1_rep
+                s_t = torch.where(mask, s_mix, s_lerp)
                 with torch.no_grad():
                     z_t = self.straightener.decode(s_t.to(dtype=s0_w.dtype))
             else:
                 z_mix = (w0 * z0_w + w1 * z1_w) / denom.clamp_min(1e-6)
-                z_lin = (1.0 - alpha) * z0_w + alpha * z1_w
                 mask = denom > 1e-6
-                z_t = torch.where(mask, z_mix, z_lin)
+                # If confidence is near-zero, do not apply the warp at all; fall back to unwarped LERP.
+                z_lerp = (1.0 - alpha) * z0_rep + alpha * z1_rep
+                z_t = torch.where(mask, z_mix, z_lerp)
             out[b, t0 + 1 : t1] = z_t
             conf_step = torch.minimum(conf0_w, conf1_w)
             conf[b, t0 + 1 : t1] = conf_step[:, 0]
