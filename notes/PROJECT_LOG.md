@@ -809,3 +809,42 @@ Anchors: `data/wan_synth_anchors_calib3/` (ddim_steps=4, B=4, 20 batches); joine
 - **Root cause**: `glob.glob()` returned shards in filesystem order (not sorted), so dataloaders started at ~`shard-0096x` (keys ≈ 247k).  
 - **Symptom**: teacher and base streams were aligned but started near the end, causing key‑join mismatch with any expectation of low‑index keys.  
 - **Fix**: sort shard lists in `create_wan_synth_dataloader`, `create_wan_synth_anchor_dataloader`, and `create_wan_synth_teacher_dataloader`.  
+
+## 2026-02-06
+
+### Sinkhorn Warper — PhaseCorr Robustness + Outlier Diagnostics
+- **Context**: sinkhorn correspondence interpolator showed heavy-tail failures (some samples much worse than LERP), likely from bad global alignment and then applying large warps despite low confidence.
+- **Code**:
+  - `src/models/sinkhorn_warp.py`:
+    - `phasecorr_mode=multi`: multi-channel phase correlation (sum cross-power across channels) instead of mean score-map.
+    - `phasecorr_level=latent`: compute global (rotation + shift) via phasecorr on full latent maps `[C=16,H=60,W=104]`, then convert pixel shift to token units using `align_corners` scaling.
+  - `scripts/diagnose_sinkhorn_outliers_wansynth.py`: outlier scanner (rank by `sinkhorn_mse - lerp_mse`) and dump summary stats.
+- **Commits**:
+  - `f5e45f5`: multi-channel phasecorr + outlier diagnostic.
+  - `bf97233`: latent-level phasecorr option (global shift on 60x104 maps).
+  - `7d39ff1`: diagnostic option `--scale_flow_by_conf` (see below).
+
+### Sinkhorn Pipeline Training (Freeze Straightener, Train Matcher Only)
+- **Script**: `src/train/train_sinkhorn_interp_wansynth.py`
+- **Run**: `runs/sinkhorn_interp_optD_pcmulti_latent_w5_s3_r1_d64_b128_2k_warpz`
+- **Ckpt**: `checkpoints/sinkhorn_interp_optD_pcmulti_latent_w5_s3_r1_d64_b128_2k_warpz/ckpt_final.pt`
+- **Settings**:
+  - Init straightener: `checkpoints/latent_straightener_optD_h448_b5_10k/ckpt_final.pt`
+  - `freeze_straightener=1` (only trains matcher: token projection + tau + dustbin)
+  - Global: `sinkhorn_global_mode=phasecorr`, `sinkhorn_phasecorr_mode=multi`, `sinkhorn_phasecorr_level=latent`
+  - Local: `win=5`, `stride=3`, `d_match=64`, `proj_mode=linear`, `learn_tau=1`, `learn_dustbin=1`
+  - Priors: `spatial_gamma=0.5`, `spatial_radius=1`, `fb_sigma=0.5`
+  - `warp_space=z`
+- **Val @ step=1500**:
+  - `sinkhorn_mse=0.164625`
+  - `lerp_mse=0.165021`
+  - `straight_lerp_mse=0.154459` (still much better; straightener is doing most of the work here)
+
+### Outlier Diagnosis (Why Tail Failures Persist)
+- **Scan (val shards, 30 batches x 64 = 1920 samples)**, ckpt above, `phasecorr_mode=multi`, `phasecorr_level=latent`:
+  - Worst cases still have **large global shifts** and **conf ~ 0**, yet the pipeline still applies large warps, producing very high MSE.
+- **Evidence that “warp despite conf=0” is the direct cause**:
+  - Re-run outlier scan with `--scale_flow_by_conf 1` (flow multiplied by confidence before warping):
+    - Worst `delta_vs_lerp` dropped from **~+0.76** to **~+0.42** on the same 1920-sample scan.
+  - Interpretation: confidence is correctly flagging unreliable correspondences, but we were not using it to suppress the warp itself (only for blending).
+  - Next: decide whether to incorporate confidence gating into the actual interpolator (and how to avoid degenerate “conf -> 0” collapse during training).
