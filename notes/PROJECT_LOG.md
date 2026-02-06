@@ -238,6 +238,7 @@ Include: date, command or script used, dataset/checkpoint paths, key settings, a
   - Updated cost definition in D_phi training to scale with interior length (sum over interior frames).
   - Early re-trains with additive cost still produced degenerate DP labels (e.g. `[0, 1, 2, 20]` for `K=4`) and remained essentially prompt-independent.
   - Conclusion: the current eps-diff target is dominated by gap/time terms (and/or too weakly prompt-dependent) to produce meaningful prompt-adaptive keyframe DP labels; needs a rethink (target definition, features, or training objective) before investing in long D_phi/selector runs.
+  - Added `--target_mode {teacher_eps,latent_mse}` to allow a cheap latent-space target; initial latent-MSE run still produced near-degenerate DP paths (mostly `[0, 13/14, 19, 20]` for `K=4`), indicating weak prompt dependence even for direct interpolation error.
 
 ## 2026-02-04
 

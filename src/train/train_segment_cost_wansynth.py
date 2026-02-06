@@ -47,6 +47,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--straightener_ckpt", type=str, default="")
     p.add_argument("--straightener_dtype", type=str, default="")
 
+    # Segment cost target.
+    p.add_argument(
+        "--target_mode",
+        type=str,
+        default="teacher_eps",
+        choices=["teacher_eps", "latent_mse"],
+        help="Target for segment cost. teacher_eps = MSE between teacher/student eps predictions; "
+        "latent_mse = MSE between student-interpolated latents and ground-truth latents.",
+    )
+
     # Teacher model (frozen).
     p.add_argument("--wan_repo", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
     p.add_argument("--wan_subfolder", type=str, default="transformer")
@@ -165,6 +175,26 @@ def _build_student_latents_lerp(latents: torch.Tensor, t0: torch.Tensor, t1: tor
 
 
 @torch.no_grad()
+def _compute_student_latent_mse_cost(
+    latents: torch.Tensor,
+    student_latents: torch.Tensor,
+    *,
+    t0: torch.Tensor,
+    t1: torch.Tensor,
+) -> torch.Tensor:
+    # latents/student_latents: [B,T,C,H,W]
+    B, T, C, H, W = latents.shape
+    diff = (student_latents.float() - latents.float()).pow(2)  # [B,T,C,H,W]
+    t_grid = torch.arange(T, device=latents.device).view(1, T)
+    interior = (t_grid > t0.view(B, 1)) & (t_grid < t1.view(B, 1))
+    mask = interior.view(B, T, 1, 1, 1).to(dtype=diff.dtype)
+    diff = diff * mask
+    # Additive across time: sum over interior frames, normalized by per-frame spatial/channel dims.
+    denom = float(C * H * W)
+    return diff.sum(dim=(1, 2, 3, 4)) / denom
+
+
+@torch.no_grad()
 def _compute_teacher_student_cost(
     teacher,
     latents: torch.Tensor,
@@ -261,17 +291,20 @@ def _eval(
         else:
             student_latents = _build_student_latents_lerp(latents, t0, t1)
         t_noise = t_candidates[torch.multinomial(t_probs, B, replacement=True, generator=gen)]
-        cost = _compute_teacher_student_cost(
-            teacher,
-            latents,
-            student_latents,
-            text_embed,
-            t_noise,
-            schedule,
-            t0=t0,
-            t1=t1,
-            autocast_dtype=autocast_dtype,
-        )
+        if args.target_mode == "latent_mse":
+            cost = _compute_student_latent_mse_cost(latents, student_latents, t0=t0, t1=t1)
+        else:
+            cost = _compute_teacher_student_cost(
+                teacher,
+                latents,
+                student_latents,
+                text_embed,
+                t_noise,
+                schedule,
+                t0=t0,
+                t1=t1,
+                autocast_dtype=autocast_dtype,
+            )
         denomT = float(max(1, args.T - 1))
         t_norm = t_noise.float() / float(max(1, int(args.N_train) - 1))
         seg_feat = torch.stack(
@@ -333,15 +366,17 @@ def main() -> None:
 
     # Frozen teacher.
     wan_dtype = resolve_dtype(args.wan_dtype)
-    teacher = load_wan_transformer(args.wan_repo, subfolder=args.wan_subfolder, torch_dtype=wan_dtype, device=device)
-    if args.wan_attn != "default":
-        from src.models.wan_sla import apply_wan_sla
+    teacher = None
+    if args.target_mode == "teacher_eps":
+        teacher = load_wan_transformer(args.wan_repo, subfolder=args.wan_subfolder, torch_dtype=wan_dtype, device=device)
+        if args.wan_attn != "default":
+            from src.models.wan_sla import apply_wan_sla
 
-        use_bf16 = wan_dtype == torch.bfloat16 if wan_dtype is not None else True
-        apply_wan_sla(teacher, topk=float(args.sla_topk), attention_type=str(args.wan_attn), use_bf16=use_bf16)
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
+            use_bf16 = wan_dtype == torch.bfloat16 if wan_dtype is not None else True
+            apply_wan_sla(teacher, topk=float(args.sla_topk), attention_type=str(args.wan_attn), use_bf16=use_bf16)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
 
     # Optional straightener for straight-LERP interpolation.
     straightener = None
@@ -406,17 +441,22 @@ def main() -> None:
 
         # Sample diffusion step from the SNR-weighted distribution.
         t_noise = t_idx[torch.multinomial(t_probs, B, replacement=True)]
-        cost = _compute_teacher_student_cost(
-            teacher,
-            latents,
-            student_latents,
-            text_embed,
-            t_noise,
-            sched,
-            t0=t0,
-            t1=t1,
-            autocast_dtype=autocast_dtype,
-        )
+        if args.target_mode == "latent_mse":
+            cost = _compute_student_latent_mse_cost(latents, student_latents, t0=t0, t1=t1)
+        else:
+            if teacher is None:
+                raise RuntimeError("target_mode=teacher_eps requires a teacher model")
+            cost = _compute_teacher_student_cost(
+                teacher,
+                latents,
+                student_latents,
+                text_embed,
+                t_noise,
+                sched,
+                t0=t0,
+                t1=t1,
+                autocast_dtype=autocast_dtype,
+            )
 
         denomT = float(max(1, args.T - 1))
         t_norm = t_noise.float() / float(max(1, int(args.N_train) - 1))
@@ -470,6 +510,7 @@ def main() -> None:
                 "T": int(args.T),
                 "interp_mode": str(args.interp_mode),
                 "cost_mode": "sum_over_interior_frames",
+                "target_mode": str(args.target_mode),
                 "straightener_ckpt": args.straightener_ckpt,
                 "straightener_meta": straightener_meta,
                 "wan_repo": args.wan_repo,
@@ -500,6 +541,7 @@ def main() -> None:
         "T": int(args.T),
         "interp_mode": str(args.interp_mode),
         "cost_mode": "sum_over_interior_frames",
+        "target_mode": str(args.target_mode),
         "straightener_ckpt": args.straightener_ckpt,
         "straightener_meta": straightener_meta,
         "wan_repo": args.wan_repo,
