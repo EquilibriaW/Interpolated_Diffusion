@@ -168,7 +168,14 @@ def _load_joint(
     for p in model.parameters():
         p.requires_grad_(False)
 
-    angles = [float(x) for x in str(meta.get("sinkhorn_angles", "-10,-5,0,5,10")).split(",") if x.strip()]
+    angles_meta = meta.get("sinkhorn_angles", "-10,-5,0,5,10")
+    if isinstance(angles_meta, (list, tuple)):
+        angles = [float(x) for x in angles_meta]
+    else:
+        s = str(angles_meta).strip()
+        if s.startswith("[") and s.endswith("]"):
+            s = s[1:-1]
+        angles = [float(x) for x in s.split(",") if str(x).strip()]
     phasecorr_mode = str(meta.get("sinkhorn_phasecorr_mode", "mean"))
     if phasecorr_mode_override:
         phasecorr_mode = str(phasecorr_mode_override)

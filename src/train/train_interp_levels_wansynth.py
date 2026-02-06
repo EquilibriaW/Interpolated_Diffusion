@@ -66,7 +66,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--flow_interp_ckpt", type=str, default="")
     p.add_argument("--sinkhorn_win", type=int, default=5)
     p.add_argument("--sinkhorn_stride", type=int, default=0)
-    p.add_argument("--sinkhorn_angles", type=str, default="-10,-5,0,5,10")
+    # Accept negative values without requiring the `--arg=-10` style by using a numeric
+    # argument list (argparse treats negative numbers as values for numeric types).
+    p.add_argument("--sinkhorn_angles", type=float, nargs="+", default=[-10.0, -5.0, 0.0, 5.0, 10.0])
     p.add_argument("--sinkhorn_shift", type=int, default=4)
     p.add_argument("--sinkhorn_global_mode", type=str, default="phasecorr", choices=["se2", "phasecorr", "none"])
     p.add_argument(
@@ -200,6 +202,8 @@ def main() -> None:
     flow_warper = None
     sinkhorn_warper = None
     smooth_kernel = None
+    sinkhorn_angles = [float(x) for x in args.sinkhorn_angles]
+    sinkhorn_angles_str = ",".join(str(a) for a in sinkhorn_angles)
     if args.video_interp_mode == "smooth":
         smooth_kernel = torch.tensor([float(x) for x in args.video_interp_smooth_kernel.split(",")], dtype=torch.float32)
     elif args.video_interp_mode == "learned":
@@ -227,7 +231,7 @@ def main() -> None:
         if args.sinkhorn_straightener_ckpt:
             s_dtype = resolve_dtype(args.sinkhorn_straightener_dtype) or get_autocast_dtype()
             straightener, _ = load_latent_straightener(args.sinkhorn_straightener_ckpt, device=device, dtype=s_dtype)
-        angles = [float(x) for x in args.sinkhorn_angles.split(",") if x.strip()]
+        angles = sinkhorn_angles
         sinkhorn_warper = SinkhornWarpInterpolator(
             in_channels=C0,
             patch_size=args.patch_size,
@@ -523,7 +527,7 @@ def main() -> None:
                 "flow_interp_ckpt": args.flow_interp_ckpt,
                 "sinkhorn_win": args.sinkhorn_win,
                 "sinkhorn_stride": int(args.sinkhorn_stride),
-                "sinkhorn_angles": args.sinkhorn_angles,
+                "sinkhorn_angles": sinkhorn_angles_str,
                 "sinkhorn_shift": args.sinkhorn_shift,
                 "sinkhorn_global_mode": args.sinkhorn_global_mode,
                 "sinkhorn_phasecorr_mode": str(args.sinkhorn_phasecorr_mode),
@@ -577,7 +581,7 @@ def main() -> None:
         "flow_interp_ckpt": args.flow_interp_ckpt,
         "sinkhorn_win": args.sinkhorn_win,
         "sinkhorn_stride": int(args.sinkhorn_stride),
-        "sinkhorn_angles": args.sinkhorn_angles,
+        "sinkhorn_angles": sinkhorn_angles_str,
         "sinkhorn_shift": args.sinkhorn_shift,
         "sinkhorn_global_mode": args.sinkhorn_global_mode,
         "sinkhorn_phasecorr_mode": str(args.sinkhorn_phasecorr_mode),

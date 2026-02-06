@@ -46,7 +46,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Sinkhorn matcher hyperparams.
     p.add_argument("--sinkhorn_win", type=int, default=5)
     p.add_argument("--sinkhorn_stride", type=int, default=0, help="Token-window stride (0 uses sinkhorn_win)")
-    p.add_argument("--sinkhorn_angles", type=str, default="-10,-5,0,5,10")
+    # Accept negative values without requiring the `--arg=-10` style by using a numeric
+    # argument list (argparse treats negative numbers as values for numeric types).
+    p.add_argument("--sinkhorn_angles", type=float, nargs="+", default=[-10.0, -5.0, 0.0, 5.0, 10.0])
     p.add_argument("--sinkhorn_shift", type=int, default=4)
     p.add_argument("--sinkhorn_global_mode", type=str, default="phasecorr", choices=["se2", "phasecorr", "none"])
     p.add_argument(
@@ -339,10 +341,13 @@ def _eval_model(
 
         if warp_space == "s":
             # Warp and blend in straightened space; decode back to z.
-            s0_w = _warp_fp32(s0, -flow01 * alpha4)
-            s1_w = _warp_fp32(s1, -flow10 * (1.0 - alpha4))
-            conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
-            conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+            # Confidence shrinkage: if correspondence is uncertain, expected motion should be small.
+            flow01_eff = flow01 * conf01
+            flow10_eff = flow10 * conf10
+            s0_w = _warp_fp32(s0, -flow01_eff * alpha4)
+            s1_w = _warp_fp32(s1, -flow10_eff * (1.0 - alpha4))
+            conf0_w = _warp_fp32(conf01, -flow01_eff * alpha4)
+            conf1_w = _warp_fp32(conf10, -flow10_eff * (1.0 - alpha4))
             w0 = (1.0 - alpha4) * conf0_w
             w1 = alpha4 * conf1_w
             denom = w0 + w1
@@ -354,10 +359,12 @@ def _eval_model(
                 z_straight = model.decode(s_lerp)
         else:
             # Warp and blend in original latent space; straightener only affects correspondences.
-            z0_w = _warp_fp32(z0, -flow01 * alpha4)
-            z1_w = _warp_fp32(z1, -flow10 * (1.0 - alpha4))
-            conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
-            conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+            flow01_eff = flow01 * conf01
+            flow10_eff = flow10 * conf10
+            z0_w = _warp_fp32(z0, -flow01_eff * alpha4)
+            z1_w = _warp_fp32(z1, -flow10_eff * (1.0 - alpha4))
+            conf0_w = _warp_fp32(conf01, -flow01_eff * alpha4)
+            conf1_w = _warp_fp32(conf10, -flow10_eff * (1.0 - alpha4))
             w0 = (1.0 - alpha4) * conf0_w
             w1 = alpha4 * conf1_w
             denom = w0 + w1
@@ -444,7 +451,8 @@ def main() -> None:
         for p in model.parameters():
             p.requires_grad_(False)
 
-    angles = [float(x) for x in str(args.sinkhorn_angles).split(",") if x.strip()]
+    angles = [float(x) for x in args.sinkhorn_angles]
+    angles_str = ",".join(str(a) for a in angles)
     matcher = SinkhornWarpInterpolator(
         in_channels=C0,
         patch_size=args.patch_size,
@@ -566,12 +574,16 @@ def main() -> None:
             conf01 = F.interpolate(conf01_tok.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=True).clamp(0.0, 1.0)
             conf10 = F.interpolate(conf10_tok.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=True).clamp(0.0, 1.0)
 
+            # Confidence shrinkage: if correspondence is uncertain, expected motion should be small.
+            flow01_eff = flow01 * conf01
+            flow10_eff = flow10 * conf10
+
             if args.warp_space == "s":
                 # Warp and blend in straightened space; decode back to z.
-                s0_w = _warp_fp32(s0, -flow01 * alpha4)
-                s1_w = _warp_fp32(s1, -flow10 * (1.0 - alpha4))
-                conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
-                conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+                s0_w = _warp_fp32(s0, -flow01_eff * alpha4)
+                s1_w = _warp_fp32(s1, -flow10_eff * (1.0 - alpha4))
+                conf0_w = _warp_fp32(conf01, -flow01_eff * alpha4)
+                conf1_w = _warp_fp32(conf10, -flow10_eff * (1.0 - alpha4))
                 w0 = (1.0 - alpha4) * conf0_w
                 w1 = alpha4 * conf1_w
                 denom = w0 + w1
@@ -581,10 +593,10 @@ def main() -> None:
                 s_t = torch.where(denom > 1e-6, s_mix, s_lerp)
             else:
                 # Warp and blend in original latent space; straightener only affects correspondences.
-                z0_w = _warp_fp32(z0, -flow01 * alpha4)
-                z1_w = _warp_fp32(z1, -flow10 * (1.0 - alpha4))
-                conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
-                conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+                z0_w = _warp_fp32(z0, -flow01_eff * alpha4)
+                z1_w = _warp_fp32(z1, -flow10_eff * (1.0 - alpha4))
+                conf0_w = _warp_fp32(conf01, -flow01_eff * alpha4)
+                conf1_w = _warp_fp32(conf10, -flow10_eff * (1.0 - alpha4))
                 w0 = (1.0 - alpha4) * conf0_w
                 w1 = alpha4 * conf1_w
                 denom = w0 + w1
@@ -766,7 +778,7 @@ def main() -> None:
                 "lin_weight": float(args.lin_weight),
                 "sinkhorn_win": args.sinkhorn_win,
                 "sinkhorn_stride": int(args.sinkhorn_stride),
-                "sinkhorn_angles": args.sinkhorn_angles,
+                "sinkhorn_angles": angles_str,
                 "sinkhorn_shift": args.sinkhorn_shift,
                 "sinkhorn_global_mode": args.sinkhorn_global_mode,
                 "sinkhorn_phasecorr_mode": str(args.sinkhorn_phasecorr_mode),
@@ -825,7 +837,7 @@ def main() -> None:
         "lin_weight": float(args.lin_weight),
         "sinkhorn_win": args.sinkhorn_win,
         "sinkhorn_stride": int(args.sinkhorn_stride),
-        "sinkhorn_angles": args.sinkhorn_angles,
+        "sinkhorn_angles": angles_str,
         "sinkhorn_shift": args.sinkhorn_shift,
         "sinkhorn_global_mode": args.sinkhorn_global_mode,
         "sinkhorn_phasecorr_mode": str(args.sinkhorn_phasecorr_mode),

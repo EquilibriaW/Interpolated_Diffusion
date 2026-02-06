@@ -87,10 +87,15 @@ class _TokenTransformerStraightener(nn.Module):
         self.use_residual = bool(use_residual)
 
         self.in_proj: nn.Module | None = None
-        self.out_proj: nn.Module | None = None
         if self.d_model != self.token_dim:
             self.in_proj = nn.Linear(self.token_dim, self.d_model, bias=False)
-            self.out_proj = nn.Linear(self.d_model, self.token_dim, bias=False)
+
+        # Always use an output projection as a "delta head" so the module behaves
+        # consistently when d_model == token_dim.
+        #
+        # We zero-init to start near-identity when use_residual=True.
+        self.out_proj = nn.Linear(self.d_model, self.token_dim, bias=False)
+        nn.init.zeros_(self.out_proj.weight)
 
         self.tr = TransformerEncoder(
             d_model=self.d_model,
@@ -113,8 +118,7 @@ class _TokenTransformerStraightener(nn.Module):
         pos = _sincos_2d_pos_embed(hp, wp, self.d_model, device=h.device, dtype=h.dtype)
         h = h + pos
         h = self.tr(h)
-        if self.out_proj is not None:
-            h = self.out_proj(h)
+        h = self.out_proj(h)
 
         # Interpret transformer output as a delta in token space, then unpatchify.
         delta = unpatchify_tokens(h.unsqueeze(1), self.patch_size, (hp, wp))[:, 0]  # [B,C,H,W]

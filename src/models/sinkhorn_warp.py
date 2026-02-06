@@ -489,12 +489,12 @@ class SinkhornWarpInterpolator(nn.Module):
             dx_pix = -(cos_t * dx_s - sin_t * dy_s)
             dy_pix = -(sin_t * dx_s + cos_t * dy_s)
 
-            # Convert pixel translation into token-grid translation in a way that matches align_corners=True.
-            # affine_grid translation is scaled by (size-1), so use that ratio rather than dx/patch_size.
-            sx = 0.0 if (wp <= 1 or W <= 1) else float(wp - 1) / float(W - 1)
-            sy = 0.0 if (hp <= 1 or H <= 1) else float(hp - 1) / float(H - 1)
-            dx_tok = dx_pix * sx
-            dy_tok = dy_pix * sy
+            # Convert pixel translation into token-grid units.
+            # Tokens live on a patch grid (stride = patch_size), so 1 token step corresponds to patch_size pixels.
+            # Using (wp-1)/(W-1) here would be inconsistent with later token->pixel scaling by patch_size.
+            ps = float(self.patch_size)
+            dx_tok = dx_pix / ps
+            dy_tok = dy_pix / ps
 
             better = peak > best_score
             best_score = torch.where(better, peak.to(dtype=torch.float32), best_score)
@@ -973,6 +973,12 @@ class SinkhornWarpInterpolator(nn.Module):
             steps = gap - 1
             alpha = torch.linspace(1, steps, steps, device=latents.device, dtype=latents.dtype) / float(gap)
             alpha = alpha.view(-1, 1, 1, 1)
+
+            # Apply confidence shrinkage to the displacement before warping.
+            # This matches the semantics of the dustbin: if a token is likely unmatched, its expected motion is small
+            # (mixture between "move" and "stay"). Empirically this also prevents catastrophic warps.
+            flow01_eff = flow01_p * conf01_p
+            flow10_eff = flow10_p * conf10_p
             if self.warp_space == "s":
                 assert s_latents is not None
                 s0 = s_latents[b : b + 1, t0]
@@ -982,8 +988,8 @@ class SinkhornWarpInterpolator(nn.Module):
             else:
                 z0_rep = z0.expand(steps, -1, -1, -1)
                 z1_rep = z1.expand(steps, -1, -1, -1)
-            flow01_rep = flow01_p.expand(steps, -1, -1, -1) * alpha
-            flow10_rep = flow10_p.expand(steps, -1, -1, -1) * (1.0 - alpha)
+            flow01_rep = flow01_eff.expand(steps, -1, -1, -1) * alpha
+            flow10_rep = flow10_eff.expand(steps, -1, -1, -1) * (1.0 - alpha)
             conf01_rep = conf01_p.expand(steps, -1, -1, -1)
             conf10_rep = conf10_p.expand(steps, -1, -1, -1)
 
