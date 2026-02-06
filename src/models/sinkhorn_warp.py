@@ -59,6 +59,7 @@ class SinkhornWarpInterpolator(nn.Module):
         win_stride: int = 0,
         global_mode: str = "se2",
         phasecorr_mode: str = "mean",
+        phasecorr_level: str = "token",
         angles_deg: Optional[Iterable[float]] = None,
         shift_range: int = 4,
         se2_chunk: int = 64,
@@ -89,6 +90,9 @@ class SinkhornWarpInterpolator(nn.Module):
         self.phasecorr_mode = str(phasecorr_mode)
         if self.phasecorr_mode not in ("mean", "multi"):
             raise ValueError(f"phasecorr_mode must be 'mean' or 'multi', got {self.phasecorr_mode}")
+        self.phasecorr_level = str(phasecorr_level)
+        if self.phasecorr_level not in ("token", "latent"):
+            raise ValueError(f"phasecorr_level must be 'token' or 'latent', got {self.phasecorr_level}")
         if angles_deg is None:
             angles_deg = (-10.0, -5.0, 0.0, 5.0, 10.0)
         angles = [float(a) * math.pi / 180.0 for a in angles_deg]
@@ -258,6 +262,31 @@ class SinkhornWarpInterpolator(nn.Module):
         warped = F.grid_sample(feat_map, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
         return warped.permute(0, 2, 3, 1)
 
+    def _apply_se2_map_per_sample(
+        self, x: torch.Tensor, theta: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor
+    ) -> torch.Tensor:
+        # x: [B,C,H,W], theta/dx/dy: [B] where dx/dy are in pixel units for the HxW map.
+        if x.dim() != 4:
+            raise ValueError("_apply_se2_map_per_sample expects [B,C,H,W]")
+        B, _, H, W = x.shape
+        x = x.float()
+        theta = theta.to(device=x.device, dtype=torch.float32)
+        dx = dx.to(device=x.device, dtype=torch.float32)
+        dy = dy.to(device=x.device, dtype=torch.float32)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+        tx = torch.zeros_like(theta) if W <= 1 else 2.0 * dx / float(W - 1)
+        ty = torch.zeros_like(theta) if H <= 1 else 2.0 * dy / float(H - 1)
+        mat = torch.zeros((B, 2, 3), device=x.device, dtype=torch.float32)
+        mat[:, 0, 0] = cos_t
+        mat[:, 0, 1] = -sin_t
+        mat[:, 0, 2] = tx
+        mat[:, 1, 0] = sin_t
+        mat[:, 1, 1] = cos_t
+        mat[:, 1, 2] = ty
+        grid = F.affine_grid(mat, size=x.shape, align_corners=True)
+        return F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+
     def _estimate_global_se2_batch(self, f0: torch.Tensor, f1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # f0/f1: [B,Hp,Wp,D]
         device = f0.device
@@ -426,6 +455,54 @@ class SinkhornWarpInterpolator(nn.Module):
             best_dy = torch.where(better, dy.to(dtype=torch.float32), best_dy)
 
         return best_theta.to(dtype=f0.dtype), best_dx.to(dtype=f0.dtype), best_dy.to(dtype=f0.dtype)
+
+    def _phasecorr_se2_latent_batch(
+        self, s0: torch.Tensor, s1: torch.Tensor, hp: int, wp: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # s0/s1: [B,C,H,W] straightened (or raw) latent maps at full spatial resolution.
+        if s0.dim() != 4 or s1.dim() != 4:
+            raise ValueError("phasecorr_se2_latent expects s0/s1 as [B,C,H,W]")
+        if s0.shape != s1.shape:
+            raise ValueError("phasecorr_se2_latent expects s0 and s1 to have same shape")
+        B, C, H, W = s0.shape
+        s0_f = s0.float()
+        s1_f = s1.float()
+
+        best_score = torch.full((B,), -float("inf"), device=s0.device, dtype=torch.float32)
+        best_theta = torch.zeros((B,), device=s0.device, dtype=torch.float32)
+        best_dx_tok = torch.zeros((B,), device=s0.device, dtype=torch.float32)
+        best_dy_tok = torch.zeros((B,), device=s0.device, dtype=torch.float32)
+
+        for angle in self._angles_list:
+            theta = torch.full((B,), float(angle), device=s0.device, dtype=torch.float32)
+            zeros = torch.zeros_like(theta)
+            s1_rot = self._apply_se2_map_per_sample(s1_f, theta, zeros, zeros)
+            if self.phasecorr_mode == "multi":
+                dx_s, dy_s, peak = self._phasecorr_shift_multi_batch(s0_f, s1_rot, return_peak=True)
+            else:
+                dx_s, dy_s, peak = self._phasecorr_shift_batch(
+                    s0_f.mean(dim=1), s1_rot.mean(dim=1), return_peak=True
+                )
+            cos_t = torch.cos(theta)
+            sin_t = torch.sin(theta)
+            # Convert roll-shift `s` into affine translation `t = -R s` in pixel units.
+            dx_pix = -(cos_t * dx_s - sin_t * dy_s)
+            dy_pix = -(sin_t * dx_s + cos_t * dy_s)
+
+            # Convert pixel translation into token-grid translation in a way that matches align_corners=True.
+            # affine_grid translation is scaled by (size-1), so use that ratio rather than dx/patch_size.
+            sx = 0.0 if (wp <= 1 or W <= 1) else float(wp - 1) / float(W - 1)
+            sy = 0.0 if (hp <= 1 or H <= 1) else float(hp - 1) / float(H - 1)
+            dx_tok = dx_pix * sx
+            dy_tok = dy_pix * sy
+
+            better = peak > best_score
+            best_score = torch.where(better, peak.to(dtype=torch.float32), best_score)
+            best_theta = torch.where(better, theta, best_theta)
+            best_dx_tok = torch.where(better, dx_tok.to(dtype=torch.float32), best_dx_tok)
+            best_dy_tok = torch.where(better, dy_tok.to(dtype=torch.float32), best_dy_tok)
+
+        return best_theta.to(dtype=s0.dtype), best_dx_tok.to(dtype=s0.dtype), best_dy_tok.to(dtype=s0.dtype)
 
     def _local_sinkhorn_delta(self, f0: torch.Tensor, f1: torch.Tensor, hp: int, wp: int) -> Tuple[torch.Tensor, torch.Tensor]:
         # f0/f1: [1,Hp,Wp,D]
@@ -728,18 +805,23 @@ class SinkhornWarpInterpolator(nn.Module):
         flow = q - coords
         return flow
 
-    def _compute_flow_from_feats_batch(self, f0: torch.Tensor, f1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _compute_flow_from_feats_batch(
+        self, f0: torch.Tensor, f1: torch.Tensor, *, s0: torch.Tensor | None = None, s1: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # f0/f1: [B,Hp,Wp,D]
         hp, wp = f0.shape[1], f0.shape[2]
         if self.global_mode == "se2":
             theta, dx, dy = self._estimate_global_se2_batch(f0, f1)
         elif self.global_mode == "phasecorr":
-            if self.phasecorr_mode == "multi":
-                theta, dx, dy = self._phasecorr_se2_multi_batch(f0, f1)
+            if self.phasecorr_level == "latent" and s0 is not None and s1 is not None:
+                theta, dx, dy = self._phasecorr_se2_latent_batch(s0, s1, hp, wp)
             else:
-                f0_score = f0.mean(dim=-1)
-                f1_score = f1.mean(dim=-1)
-                theta, dx, dy = self._phasecorr_se2_batch(f0_score, f1_score)
+                if self.phasecorr_mode == "multi":
+                    theta, dx, dy = self._phasecorr_se2_multi_batch(f0, f1)
+                else:
+                    f0_score = f0.mean(dim=-1)
+                    f1_score = f1.mean(dim=-1)
+                    theta, dx, dy = self._phasecorr_se2_batch(f0_score, f1_score)
         else:
             theta = torch.zeros((f0.shape[0],), device=f0.device, dtype=f0.dtype)
             dx = torch.zeros_like(theta)
@@ -778,11 +860,11 @@ class SinkhornWarpInterpolator(nn.Module):
         return conf01, conf10, err01, err10
 
     def compute_bidirectional_flow_and_confs_batch(
-        self, f0: torch.Tensor, f1: torch.Tensor
+        self, f0: torch.Tensor, f1: torch.Tensor, *, s0: torch.Tensor | None = None, s1: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # f0/f1: [B,Hp,Wp,D]
-        flow01_tok, conf01_dust = self._compute_flow_from_feats_batch(f0, f1)
-        flow10_tok, conf10_dust = self._compute_flow_from_feats_batch(f1, f0)
+        flow01_tok, conf01_dust = self._compute_flow_from_feats_batch(f0, f1, s0=s0, s1=s1)
+        flow10_tok, conf10_dust = self._compute_flow_from_feats_batch(f1, f0, s0=s1, s1=s0)
         conf01_fb, conf10_fb, fb_err01, fb_err10 = self._fb_consistency_conf(flow01_tok, flow10_tok)
         conf01 = conf01_dust.float() * conf01_fb
         conf10 = conf10_dust.float() * conf10_fb
@@ -852,7 +934,20 @@ class SinkhornWarpInterpolator(nn.Module):
         f0 = feats[pair_b, pair_t0]
         f1 = feats[pair_b, pair_t1]
 
-        flow01_tok, flow10_tok, conf01_tok, conf10_tok, _, _, _, _ = self.compute_bidirectional_flow_and_confs_batch(f0, f1)
+        # Global phase correlation can optionally run at full latent resolution.
+        s0_pairs = None
+        s1_pairs = None
+        if self.global_mode == "phasecorr" and self.phasecorr_level == "latent":
+            if s_latents_flat is not None:
+                global_maps = s_latents_flat.view(B, T, latents.shape[2], H, W)
+            else:
+                global_maps = latents
+            s0_pairs = global_maps[pair_b, pair_t0]
+            s1_pairs = global_maps[pair_b, pair_t1]
+
+        flow01_tok, flow10_tok, conf01_tok, conf10_tok, _, _, _, _ = self.compute_bidirectional_flow_and_confs_batch(
+            f0, f1, s0=s0_pairs, s1=s1_pairs
+        )
 
         flow01_tok = flow01_tok.permute(0, 3, 1, 2)  # [P,2,Hp,Wp]
         flow10_tok = flow10_tok.permute(0, 3, 1, 2)

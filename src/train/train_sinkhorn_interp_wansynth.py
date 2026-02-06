@@ -56,6 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["mean", "multi"],
         help="When using --sinkhorn_global_mode=phasecorr, run phase correlation on a mean score-map or multi-channel features.",
     )
+    p.add_argument(
+        "--sinkhorn_phasecorr_level",
+        type=str,
+        default="token",
+        choices=["token", "latent"],
+        help="When using --sinkhorn_global_mode=phasecorr, compute the global shift on token maps or full latent maps.",
+    )
     p.add_argument("--sinkhorn_iters", type=int, default=20)
     p.add_argument("--sinkhorn_tau", type=float, default=0.05)
     p.add_argument("--sinkhorn_dustbin", type=float, default=-2.0)
@@ -303,7 +310,7 @@ def _eval_model(
             f0, hp, wp = matcher.token_features(s0, assume_straightened=True)
             f1, _, _ = matcher.token_features(s1, assume_straightened=True)
             flow01_tok, flow10_tok, conf01_tok, conf10_tok, _, _, _, _ = matcher.compute_bidirectional_flow_and_confs_batch(
-                f0, f1
+                f0, f1, s0=s0, s1=s1
             )
 
         flow01 = (
@@ -432,6 +439,7 @@ def main() -> None:
         win_stride=args.sinkhorn_stride,
         global_mode=args.sinkhorn_global_mode,
         phasecorr_mode=str(args.sinkhorn_phasecorr_mode),
+        phasecorr_level=str(args.sinkhorn_phasecorr_level),
         angles_deg=angles,
         shift_range=args.sinkhorn_shift,
         sinkhorn_iters=args.sinkhorn_iters,
@@ -531,7 +539,7 @@ def main() -> None:
             f0, hp, wp = matcher.token_features(s0, assume_straightened=True)
             f1, _, _ = matcher.token_features(s1, assume_straightened=True)
             flow01_tok, flow10_tok, conf01_tok, conf10_tok, conf01_dust, conf10_dust, fb_err01, fb_err10 = (
-                matcher.compute_bidirectional_flow_and_confs_batch(f0, f1)
+                matcher.compute_bidirectional_flow_and_confs_batch(f0, f1, s0=s0, s1=s1)
             )
 
             flow01 = (
@@ -750,6 +758,7 @@ def main() -> None:
                 "sinkhorn_shift": args.sinkhorn_shift,
                 "sinkhorn_global_mode": args.sinkhorn_global_mode,
                 "sinkhorn_phasecorr_mode": str(args.sinkhorn_phasecorr_mode),
+                "sinkhorn_phasecorr_level": str(args.sinkhorn_phasecorr_level),
                 "sinkhorn_iters": args.sinkhorn_iters,
                 "sinkhorn_tau": float(args.sinkhorn_tau),
                 "sinkhorn_dustbin": float(args.sinkhorn_dustbin),
@@ -790,6 +799,7 @@ def main() -> None:
         "sinkhorn_shift": args.sinkhorn_shift,
         "sinkhorn_global_mode": args.sinkhorn_global_mode,
         "sinkhorn_phasecorr_mode": str(args.sinkhorn_phasecorr_mode),
+        "sinkhorn_phasecorr_level": str(args.sinkhorn_phasecorr_level),
         "sinkhorn_iters": args.sinkhorn_iters,
         "sinkhorn_tau": float(args.sinkhorn_tau),
         "sinkhorn_dustbin": float(args.sinkhorn_dustbin),

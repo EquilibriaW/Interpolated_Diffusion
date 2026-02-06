@@ -35,6 +35,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["", "mean", "multi"],
         help="Override phasecorr mode used by matcher (for analyzing older checkpoints).",
     )
+    p.add_argument(
+        "--phasecorr_level",
+        type=str,
+        default="",
+        choices=["", "token", "latent"],
+        help="Override phasecorr level used by matcher (for analyzing older checkpoints).",
+    )
     p.add_argument("--topk", type=int, default=12)
     p.add_argument("--out_dir", type=str, default="tmp_sinkhorn_outliers")
     p.add_argument("--save_tensors", type=int, default=1)
@@ -143,6 +150,7 @@ def _load_joint(
     phasecorr_mode = str(meta.get("sinkhorn_phasecorr_mode", "mean"))
     if phasecorr_mode_override:
         phasecorr_mode = str(phasecorr_mode_override)
+    phasecorr_level = str(meta.get("sinkhorn_phasecorr_level", "token"))
 
     matcher = SinkhornWarpInterpolator(
         in_channels=int(meta.get("in_channels", 16)),
@@ -151,6 +159,7 @@ def _load_joint(
         win_stride=int(meta.get("sinkhorn_stride", 0)),
         global_mode=str(meta.get("sinkhorn_global_mode", "phasecorr")),
         phasecorr_mode=phasecorr_mode,
+        phasecorr_level=phasecorr_level,
         angles_deg=angles,
         shift_range=int(meta.get("sinkhorn_shift", 4)),
         se2_chunk=int(meta.get("se2_chunk", 64)),
@@ -187,6 +196,8 @@ def main() -> None:
     model, matcher, meta = _load_joint(
         args.ckpt, device=device, dtype=model_dtype, phasecorr_mode_override=str(args.phasecorr_mode)
     )
+    if args.phasecorr_level:
+        matcher.phasecorr_level = str(args.phasecorr_level)
 
     os.makedirs(args.out_dir, exist_ok=True)
     loader = create_wan_synth_dataloader(
@@ -244,7 +255,7 @@ def main() -> None:
             f0, hp, wp = matcher.token_features(s0, assume_straightened=True)
             f1, _, _ = matcher.token_features(s1, assume_straightened=True)
             flow01_tok, flow10_tok, conf01_tok, conf10_tok, conf01_dust, conf10_dust, fb_err01, fb_err10 = (
-                matcher.compute_bidirectional_flow_and_confs_batch(f0, f1)
+                matcher.compute_bidirectional_flow_and_confs_batch(f0, f1, s0=s0, s1=s1)
             )
             flow01 = (
                 F.interpolate(flow01_tok.permute(0, 3, 1, 2), size=(H, W), mode="bilinear", align_corners=True)
@@ -297,7 +308,9 @@ def main() -> None:
 
         # Global params (for interpretability).
         if getattr(matcher, "global_mode", "phasecorr") == "phasecorr":
-            if getattr(matcher, "phasecorr_mode", "mean") == "multi":
+            if getattr(matcher, "phasecorr_level", "token") == "latent":
+                theta, dx, dy = matcher._phasecorr_se2_latent_batch(s0, s1, hp, wp)
+            elif getattr(matcher, "phasecorr_mode", "mean") == "multi":
                 theta, dx, dy = matcher._phasecorr_se2_multi_batch(f0, f1)
             else:
                 theta, dx, dy = matcher._phasecorr_se2_batch(f0.mean(dim=-1), f1.mean(dim=-1))
@@ -411,7 +424,7 @@ def main() -> None:
             f0, hp, wp = matcher.token_features(s0, assume_straightened=True)
             f1, _, _ = matcher.token_features(s1, assume_straightened=True)
             flow01_tok, flow10_tok, conf01_tok, conf10_tok, conf01_dust, conf10_dust, fb_err01, fb_err10 = (
-                matcher.compute_bidirectional_flow_and_confs_batch(f0, f1)
+                matcher.compute_bidirectional_flow_and_confs_batch(f0, f1, s0=s0, s1=s1)
             )
             flow01 = (
                 F.interpolate(flow01_tok.permute(0, 3, 1, 2), size=(H, W), mode="bilinear", align_corners=True)

@@ -70,6 +70,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["mean", "multi"],
         help="When using sinkhorn_global_mode=phasecorr, run phase correlation on a mean score-map or multi-channel features.",
     )
+    p.add_argument(
+        "--sinkhorn_phasecorr_level",
+        type=str,
+        default="token",
+        choices=["token", "latent"],
+        help="When using sinkhorn_global_mode=phasecorr, compute the global shift on token maps or full latent maps.",
+    )
     p.add_argument("--sinkhorn_warp_space", type=str, default="s", choices=["z", "s"])
     p.add_argument("--sinkhorn_iters", type=int, default=20)
     p.add_argument("--sinkhorn_tau", type=float, default=0.05)
@@ -159,6 +166,7 @@ def main() -> None:
             win_stride=args.sinkhorn_stride,
             global_mode=args.sinkhorn_global_mode,
             phasecorr_mode=str(args.sinkhorn_phasecorr_mode),
+            phasecorr_level=str(args.sinkhorn_phasecorr_level),
             angles_deg=angles,
             shift_range=args.sinkhorn_shift,
             sinkhorn_iters=args.sinkhorn_iters,
@@ -368,6 +376,7 @@ def main() -> None:
                 "sinkhorn_shift": args.sinkhorn_shift,
                 "sinkhorn_global_mode": args.sinkhorn_global_mode,
                 "sinkhorn_phasecorr_mode": str(args.sinkhorn_phasecorr_mode),
+                "sinkhorn_phasecorr_level": str(args.sinkhorn_phasecorr_level),
                 "sinkhorn_warp_space": args.sinkhorn_warp_space,
                 "sinkhorn_iters": args.sinkhorn_iters,
                 "sinkhorn_tau": args.sinkhorn_tau,
@@ -414,6 +423,7 @@ def main() -> None:
         "sinkhorn_shift": args.sinkhorn_shift,
         "sinkhorn_global_mode": args.sinkhorn_global_mode,
         "sinkhorn_phasecorr_mode": str(args.sinkhorn_phasecorr_mode),
+        "sinkhorn_phasecorr_level": str(args.sinkhorn_phasecorr_level),
         "sinkhorn_warp_space": args.sinkhorn_warp_space,
         "sinkhorn_iters": args.sinkhorn_iters,
         "sinkhorn_tau": args.sinkhorn_tau,
