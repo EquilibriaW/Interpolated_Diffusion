@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from src.data.wan_synth import create_wan_synth_dataloader
-from src.models.latent_straightener import LatentStraightener
+from src.models.latent_straightener import LatentStraightener, LatentStraightenerTokenTransformer
 from src.models.sinkhorn_warp import SinkhornWarpInterpolator
 from src.models.wan_backbone import resolve_dtype
 
@@ -142,13 +142,26 @@ def _load_joint(
 ) -> Tuple[LatentStraightener, SinkhornWarpInterpolator, dict]:
     payload = torch.load(ckpt, map_location="cpu")
     meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
-    model = LatentStraightener(
-        in_channels=int(meta.get("in_channels", 16)),
-        hidden_channels=int(meta.get("hidden_channels", 448)),
-        blocks=int(meta.get("blocks", 5)),
-        kernel_size=int(meta.get("kernel_size", 3)),
-        use_residual=bool(meta.get("use_residual", True)),
-    )
+    arch = str(meta.get("arch", "conv"))
+    if arch in ("token_transformer", "toktr"):
+        model = LatentStraightenerTokenTransformer(
+            in_channels=int(meta.get("in_channels", 16)),
+            patch_size=int(meta.get("patch_size", 4)),
+            d_model=int(meta.get("d_model", 256)),
+            n_layers=int(meta.get("n_layers", 6)),
+            n_heads=int(meta.get("n_heads", 8)),
+            d_ff=int(meta.get("d_ff", 1024)),
+            dropout=float(meta.get("dropout", 0.0)),
+            use_residual=bool(meta.get("use_residual", True)),
+        )
+    else:
+        model = LatentStraightener(
+            in_channels=int(meta.get("in_channels", 16)),
+            hidden_channels=int(meta.get("hidden_channels", 448)),
+            blocks=int(meta.get("blocks", 5)),
+            kernel_size=int(meta.get("kernel_size", 3)),
+            use_residual=bool(meta.get("use_residual", True)),
+        )
     model.load_state_dict(payload["model"], strict=True)
     model.to(device=device, dtype=dtype)
     model.eval()
@@ -160,6 +173,21 @@ def _load_joint(
     if phasecorr_mode_override:
         phasecorr_mode = str(phasecorr_mode_override)
     phasecorr_level = str(meta.get("sinkhorn_phasecorr_level", "token"))
+
+    matcher_state = payload.get("matcher", {}) if isinstance(payload, dict) else {}
+    if not isinstance(matcher_state, dict):
+        matcher_state = {}
+    has_tau = "tau_raw" in matcher_state
+    has_dust = "dustbin_param" in matcher_state
+    has_proj = any(k.startswith("token_proj.") for k in matcher_state.keys())
+    proj_mode = str(meta.get("sinkhorn_proj_mode", "linear"))
+    if not has_proj and proj_mode == "linear":
+        # Backwards-compat: older checkpoints may not have a learned token projection.
+        proj_mode = "groupmean"
+    if has_proj and "token_proj.weight" in matcher_state:
+        d_match = int(matcher_state["token_proj.weight"].shape[0])
+    else:
+        d_match = int(meta.get("sinkhorn_d_match", 64))
 
     matcher = SinkhornWarpInterpolator(
         in_channels=int(meta.get("in_channels", 16)),
@@ -178,15 +206,15 @@ def _load_joint(
         spatial_gamma=float(meta.get("sinkhorn_spatial_gamma", 0.0)),
         spatial_radius=int(meta.get("sinkhorn_spatial_radius", 0)),
         fb_sigma=float(meta.get("sinkhorn_fb_sigma", 0.0)),
-        d_match=int(meta.get("sinkhorn_d_match", 64)),
-        proj_mode=str(meta.get("sinkhorn_proj_mode", "linear")),
-        learn_tau=bool(meta.get("sinkhorn_learn_tau", True)),
-        learn_dustbin=bool(meta.get("sinkhorn_learn_dustbin", True)),
+        d_match=d_match,
+        proj_mode=proj_mode,
+        learn_tau=bool(meta.get("sinkhorn_learn_tau", has_tau)),
+        learn_dustbin=bool(meta.get("sinkhorn_learn_dustbin", has_dust)),
         tau_min=float(meta.get("sinkhorn_tau_min", 1e-3)),
         straightener=None,
         warp_space="z",
     )
-    matcher.load_state_dict(payload.get("matcher", {}), strict=True)
+    matcher.load_state_dict(matcher_state, strict=True)
     matcher.to(device=device)
     matcher.eval()
     for p in matcher.parameters():

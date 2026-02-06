@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from src.data.wan_synth import create_wan_synth_dataloader
-from src.models.latent_straightener import LatentStraightener
+from src.models.latent_straightener import LatentStraightener, LatentStraightenerTokenTransformer
 from src.models.wan_backbone import resolve_dtype
 from src.utils.checkpoint import load_checkpoint, save_checkpoint
 from src.utils.device import get_autocast_dtype
@@ -26,9 +26,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--arch", type=str, default="conv", choices=["conv", "token_transformer"])
+    # conv straightener
     p.add_argument("--hidden_channels", type=int, default=64)
     p.add_argument("--blocks", type=int, default=2)
     p.add_argument("--kernel_size", type=int, default=3)
+    # token-grid transformer straightener
+    p.add_argument("--patch_size", type=int, default=4)
+    p.add_argument("--d_model", type=int, default=256)
+    p.add_argument("--n_layers", type=int, default=6)
+    p.add_argument("--n_heads", type=int, default=8)
+    p.add_argument("--d_ff", type=int, default=1024)
+    p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--use_residual", type=int, default=1)
     p.add_argument("--model_dtype", type=str, default="")
     p.add_argument("--min_gap", type=int, default=2)
@@ -290,13 +299,25 @@ def main() -> None:
     if T0 != args.T:
         raise ValueError(f"T mismatch: batch={T0} args={args.T}")
 
-    model = LatentStraightener(
-        in_channels=C0,
-        hidden_channels=args.hidden_channels,
-        blocks=args.blocks,
-        kernel_size=args.kernel_size,
-        use_residual=bool(args.use_residual),
-    ).to(device=device, dtype=model_dtype)
+    if str(args.arch) == "token_transformer":
+        model = LatentStraightenerTokenTransformer(
+            in_channels=C0,
+            patch_size=int(args.patch_size),
+            d_model=int(args.d_model),
+            n_layers=int(args.n_layers),
+            n_heads=int(args.n_heads),
+            d_ff=int(args.d_ff),
+            dropout=float(args.dropout),
+            use_residual=bool(args.use_residual),
+        ).to(device=device, dtype=model_dtype)
+    else:
+        model = LatentStraightener(
+            in_channels=C0,
+            hidden_channels=args.hidden_channels,
+            blocks=args.blocks,
+            kernel_size=args.kernel_size,
+            use_residual=bool(args.use_residual),
+        ).to(device=device, dtype=model_dtype)
     if args.compile:
         model = torch.compile(model)
 
@@ -435,9 +456,16 @@ def main() -> None:
                 "stage": "latent_straightener_wansynth",
                 "T": args.T,
                 "in_channels": C0,
+                "arch": str(args.arch),
                 "hidden_channels": int(args.hidden_channels),
                 "blocks": int(args.blocks),
                 "kernel_size": int(args.kernel_size),
+                "patch_size": int(args.patch_size),
+                "d_model": int(args.d_model),
+                "n_layers": int(args.n_layers),
+                "n_heads": int(args.n_heads),
+                "d_ff": int(args.d_ff),
+                "dropout": float(args.dropout),
                 "use_residual": bool(args.use_residual),
                 "min_gap": args.min_gap,
                 "lin_weight": args.lin_weight,
@@ -456,9 +484,16 @@ def main() -> None:
         "stage": "latent_straightener_wansynth",
         "T": args.T,
         "in_channels": C0,
+        "arch": str(args.arch),
         "hidden_channels": int(args.hidden_channels),
         "blocks": int(args.blocks),
         "kernel_size": int(args.kernel_size),
+        "patch_size": int(args.patch_size),
+        "d_model": int(args.d_model),
+        "n_layers": int(args.n_layers),
+        "n_heads": int(args.n_heads),
+        "d_ff": int(args.d_ff),
+        "dropout": float(args.dropout),
         "use_residual": bool(args.use_residual),
         "min_gap": args.min_gap,
         "lin_weight": args.lin_weight,

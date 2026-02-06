@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from src.data.wan_synth import create_wan_synth_dataloader
-from src.models.latent_straightener import LatentStraightener
+from src.models.latent_straightener import LatentStraightener, LatentStraightenerTokenTransformer
 from src.models.sinkhorn_warp import SinkhornWarpInterpolator
 from src.models.wan_backbone import resolve_dtype
 from src.utils.checkpoint import load_checkpoint, save_checkpoint
@@ -190,21 +190,34 @@ def _load_straightener_trainable(
     *,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[LatentStraightener, dict]:
+) -> tuple[torch.nn.Module, dict]:
     payload = torch.load(ckpt_path, map_location="cpu")
     meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+    arch = str(meta.get("arch", "conv"))
     in_channels = int(meta.get("in_channels", 16))
-    hidden_channels = int(meta.get("hidden_channels", 64))
-    blocks = int(meta.get("blocks", 2))
-    kernel_size = int(meta.get("kernel_size", 3))
     use_residual = bool(meta.get("use_residual", True))
-    model = LatentStraightener(
-        in_channels=in_channels,
-        hidden_channels=hidden_channels,
-        blocks=blocks,
-        kernel_size=kernel_size,
-        use_residual=use_residual,
-    )
+    if arch in ("token_transformer", "toktr"):
+        model: torch.nn.Module = LatentStraightenerTokenTransformer(
+            in_channels=in_channels,
+            patch_size=int(meta.get("patch_size", 4)),
+            d_model=int(meta.get("d_model", 256)),
+            n_layers=int(meta.get("n_layers", 6)),
+            n_heads=int(meta.get("n_heads", 8)),
+            d_ff=int(meta.get("d_ff", 1024)),
+            dropout=float(meta.get("dropout", 0.0)),
+            use_residual=use_residual,
+        )
+    else:
+        hidden_channels = int(meta.get("hidden_channels", 64))
+        blocks = int(meta.get("blocks", 2))
+        kernel_size = int(meta.get("kernel_size", 3))
+        model = LatentStraightener(
+            in_channels=in_channels,
+            hidden_channels=hidden_channels,
+            blocks=blocks,
+            kernel_size=kernel_size,
+            use_residual=use_residual,
+        )
     state = payload.get("model", payload) if isinstance(payload, dict) else payload
     model.load_state_dict(state, strict=True)
     model.to(device=device, dtype=dtype)
@@ -747,10 +760,7 @@ def main() -> None:
                 "min_gap": args.min_gap,
                 "warp_space": str(args.warp_space),
                 "in_channels": int(model.in_channels),
-                "hidden_channels": int(model.hidden_channels),
-                "blocks": int(model.blocks),
-                "kernel_size": int(model.kernel_size),
-                "use_residual": bool(model.use_residual),
+                "use_residual": bool(getattr(model, "use_residual", True)),
                 "interp_weight": float(args.interp_weight),
                 "recon_weight": float(args.recon_weight),
                 "lin_weight": float(args.lin_weight),
@@ -776,6 +786,27 @@ def main() -> None:
                 "init_straightener_ckpt": args.init_straightener_ckpt,
                 "init_meta": init_meta,
             }
+            if isinstance(model, LatentStraightenerTokenTransformer):
+                meta.update(
+                    {
+                        "arch": "token_transformer",
+                        "patch_size": int(model.patch_size),
+                        "d_model": int(model.d_model),
+                        "n_layers": int(model.n_layers),
+                        "n_heads": int(model.n_heads),
+                        "d_ff": int(model.d_ff),
+                        "dropout": float(model.dropout),
+                    }
+                )
+            else:
+                meta.update(
+                    {
+                        "arch": "conv",
+                        "hidden_channels": int(model.hidden_channels),
+                        "blocks": int(model.blocks),
+                        "kernel_size": int(model.kernel_size),
+                    }
+                )
             _save_joint_checkpoint(
                 ckpt_path, model=model, matcher=matcher, optimizer=opt, step=step, meta=meta
             )
@@ -788,10 +819,7 @@ def main() -> None:
         "min_gap": args.min_gap,
         "warp_space": str(args.warp_space),
         "in_channels": int(model.in_channels),
-        "hidden_channels": int(model.hidden_channels),
-        "blocks": int(model.blocks),
-        "kernel_size": int(model.kernel_size),
-        "use_residual": bool(model.use_residual),
+        "use_residual": bool(getattr(model, "use_residual", True)),
         "interp_weight": float(args.interp_weight),
         "recon_weight": float(args.recon_weight),
         "lin_weight": float(args.lin_weight),
@@ -817,6 +845,27 @@ def main() -> None:
         "init_straightener_ckpt": args.init_straightener_ckpt,
         "init_meta": init_meta,
     }
+    if isinstance(model, LatentStraightenerTokenTransformer):
+        meta.update(
+            {
+                "arch": "token_transformer",
+                "patch_size": int(model.patch_size),
+                "d_model": int(model.d_model),
+                "n_layers": int(model.n_layers),
+                "n_heads": int(model.n_heads),
+                "d_ff": int(model.d_ff),
+                "dropout": float(model.dropout),
+            }
+        )
+    else:
+        meta.update(
+            {
+                "arch": "conv",
+                "hidden_channels": int(model.hidden_channels),
+                "blocks": int(model.blocks),
+                "kernel_size": int(model.kernel_size),
+            }
+        )
     _save_joint_checkpoint(
         final_path, model=model, matcher=matcher, optimizer=opt, step=args.steps, meta=meta
     )
