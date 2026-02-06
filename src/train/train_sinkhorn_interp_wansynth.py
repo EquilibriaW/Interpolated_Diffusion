@@ -61,6 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sinkhorn_spatial_radius", type=int, default=0, help="Hard spatial radius (token units) for matching; 0 disables")
     p.add_argument("--sinkhorn_fb_sigma", type=float, default=0.0, help="Forward-backward consistency sigma (token units); 0 disables")
 
+    # Where to apply warping/blending.
+    p.add_argument(
+        "--warp_space",
+        type=str,
+        default="s",
+        choices=["s", "z"],
+        help="Warp/blend in straightened space ('s') or original latent space ('z'). Matching is always in straightened space.",
+    )
+
     # Loss weights.
     p.add_argument("--interp_weight", type=float, default=1.0)
     p.add_argument("--recon_weight", type=float, default=0.1)
@@ -232,9 +241,12 @@ def _eval_model(
     pin_memory: bool,
     resampled: bool,
     seed: int,
+    warp_space: str,
 ) -> dict:
     model_was_training = model.training
     model.eval()
+    if warp_space not in ("s", "z"):
+        raise ValueError(f"warp_space must be 's' or 'z', got {warp_space}")
     loader = create_wan_synth_dataloader(
         data_pattern,
         batch_size=batch,
@@ -298,21 +310,35 @@ def _eval_model(
         conf01 = F.interpolate(conf01_tok.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=True).clamp(0.0, 1.0)
         conf10 = F.interpolate(conf10_tok.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=True).clamp(0.0, 1.0)
 
-        # Warp and blend in straightened space; decode back to z.
-        s0_w = _warp_fp32(s0, -flow01 * alpha4)
-        s1_w = _warp_fp32(s1, -flow10 * (1.0 - alpha4))
-        conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
-        conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
-        w0 = (1.0 - alpha4) * conf0_w
-        w1 = alpha4 * conf1_w
-        denom = w0 + w1
-        s_mix = (w0 * s0_w + w1 * s1_w) / denom.clamp_min(1e-6)
-        s_lin = (1.0 - alpha4) * s0_w + alpha4 * s1_w
-        s_t = torch.where(denom > 1e-6, s_mix, s_lin)
-
-        with torch.cuda.amp.autocast(dtype=autocast_dtype):
-            z_hat = model.decode(s_t.to(dtype=s0.dtype))
-            z_straight = model.decode(s_lerp)
+        if warp_space == "s":
+            # Warp and blend in straightened space; decode back to z.
+            s0_w = _warp_fp32(s0, -flow01 * alpha4)
+            s1_w = _warp_fp32(s1, -flow10 * (1.0 - alpha4))
+            conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
+            conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+            w0 = (1.0 - alpha4) * conf0_w
+            w1 = alpha4 * conf1_w
+            denom = w0 + w1
+            s_mix = (w0 * s0_w + w1 * s1_w) / denom.clamp_min(1e-6)
+            s_lin = (1.0 - alpha4) * s0_w + alpha4 * s1_w
+            s_t = torch.where(denom > 1e-6, s_mix, s_lin)
+            with torch.cuda.amp.autocast(dtype=autocast_dtype):
+                z_hat = model.decode(s_t.to(dtype=s0.dtype))
+                z_straight = model.decode(s_lerp)
+        else:
+            # Warp and blend in original latent space; straightener only affects correspondences.
+            z0_w = _warp_fp32(z0, -flow01 * alpha4)
+            z1_w = _warp_fp32(z1, -flow10 * (1.0 - alpha4))
+            conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
+            conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+            w0 = (1.0 - alpha4) * conf0_w
+            w1 = alpha4 * conf1_w
+            denom = w0 + w1
+            z_mix = (w0 * z0_w + w1 * z1_w) / denom.clamp_min(1e-6)
+            z_lin = (1.0 - alpha4) * z0_w + alpha4 * z1_w
+            z_hat = torch.where(denom > 1e-6, z_mix, z_lin)
+            with torch.cuda.amp.autocast(dtype=autocast_dtype):
+                z_straight = model.decode(s_lerp)
 
         z_hat_f = z_hat.float()
         zt_f = zt.float()
@@ -511,20 +537,34 @@ def main() -> None:
             conf01 = F.interpolate(conf01_tok.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=True).clamp(0.0, 1.0)
             conf10 = F.interpolate(conf10_tok.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=True).clamp(0.0, 1.0)
 
-            # Warp and blend in straightened space; decode back to z.
-            s0_w = _warp_fp32(s0, -flow01 * alpha4)
-            s1_w = _warp_fp32(s1, -flow10 * (1.0 - alpha4))
-            conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
-            conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
-            w0 = (1.0 - alpha4) * conf0_w
-            w1 = alpha4 * conf1_w
-            denom = w0 + w1
-            s_mix = (w0 * s0_w + w1 * s1_w) / denom.clamp_min(1e-6)
-            s_lin = (1.0 - alpha4) * s0_w + alpha4 * s1_w
-            s_t = torch.where(denom > 1e-6, s_mix, s_lin)
+            if args.warp_space == "s":
+                # Warp and blend in straightened space; decode back to z.
+                s0_w = _warp_fp32(s0, -flow01 * alpha4)
+                s1_w = _warp_fp32(s1, -flow10 * (1.0 - alpha4))
+                conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
+                conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+                w0 = (1.0 - alpha4) * conf0_w
+                w1 = alpha4 * conf1_w
+                denom = w0 + w1
+                s_mix = (w0 * s0_w + w1 * s1_w) / denom.clamp_min(1e-6)
+                s_lin = (1.0 - alpha4) * s0_w + alpha4 * s1_w
+                s_t = torch.where(denom > 1e-6, s_mix, s_lin)
+            else:
+                # Warp and blend in original latent space; straightener only affects correspondences.
+                z0_w = _warp_fp32(z0, -flow01 * alpha4)
+                z1_w = _warp_fp32(z1, -flow10 * (1.0 - alpha4))
+                conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
+                conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+                w0 = (1.0 - alpha4) * conf0_w
+                w1 = alpha4 * conf1_w
+                denom = w0 + w1
+                z_mix = (w0 * z0_w + w1 * z1_w) / denom.clamp_min(1e-6)
+                z_lin = (1.0 - alpha4) * z0_w + alpha4 * z1_w
+                z_hat = torch.where(denom > 1e-6, z_mix, z_lin)
 
         with torch.cuda.amp.autocast(dtype=autocast_dtype):
-            z_hat = model.decode(s_t.to(dtype=s0.dtype))
+            if args.warp_space == "s":
+                z_hat = model.decode(s_t.to(dtype=s0.dtype))
             z_recon = model.decode(st)
 
         # Losses in float32.
@@ -658,10 +698,24 @@ def main() -> None:
                 pin_memory=False,
                 resampled=False,
                 seed=args.seed,
+                warp_space=str(args.warp_space),
             )
             writer.add_scalar("val/sinkhorn_mse", metrics["val_sinkhorn_mse"], step)
             writer.add_scalar("val/lerp_mse", metrics["val_lerp_mse"], step)
             writer.add_scalar("val/straight_lerp_mse", metrics["val_straight_lerp_mse"], step)
+            try:
+                tau_val = float(matcher._tau(device=device, dtype=torch.float32).item())
+                dust_val = float(matcher._dustbin(device=device, dtype=torch.float32).item())
+            except Exception:
+                tau_val = float("nan")
+                dust_val = float("nan")
+            print(
+                f"[VAL step={step} warp_space={args.warp_space}] "
+                f"sinkhorn_mse={metrics['val_sinkhorn_mse']:.6f} lerp_mse={metrics['val_lerp_mse']:.6f} "
+                f"straight_lerp_mse={metrics['val_straight_lerp_mse']:.6f} tau={tau_val:.6f} dustbin={dust_val:.3f}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
             ckpt_path = os.path.join(args.ckpt_dir, f"ckpt_{step:07d}.pt")
@@ -670,6 +724,7 @@ def main() -> None:
                 "T": args.T,
                 "patch_size": args.patch_size,
                 "min_gap": args.min_gap,
+                "warp_space": str(args.warp_space),
                 "in_channels": int(model.in_channels),
                 "hidden_channels": int(model.hidden_channels),
                 "blocks": int(model.blocks),
@@ -708,6 +763,7 @@ def main() -> None:
         "T": args.T,
         "patch_size": args.patch_size,
         "min_gap": args.min_gap,
+        "warp_space": str(args.warp_space),
         "in_channels": int(model.in_channels),
         "hidden_channels": int(model.hidden_channels),
         "blocks": int(model.blocks),
