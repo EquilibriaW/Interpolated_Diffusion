@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save_every", type=int, default=2000)
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--shuffle_buffer", type=int, default=1000)
+    p.add_argument("--shuffle_buffer", type=int, default=200)
     p.add_argument("--prefetch_factor", type=int, default=4)
     p.add_argument("--persistent_workers", type=int, default=1)
     p.add_argument("--pin_memory", type=int, default=1)

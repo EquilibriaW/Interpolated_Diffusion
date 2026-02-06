@@ -53,6 +53,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sinkhorn_tau", type=float, default=0.05)
     p.add_argument("--sinkhorn_dustbin", type=float, default=-2.0)
     p.add_argument("--sinkhorn_d_match", type=int, default=64)
+    p.add_argument("--sinkhorn_proj_mode", type=str, default="linear", choices=["none", "groupmean", "linear"])
+    p.add_argument("--sinkhorn_learn_tau", type=int, default=1)
+    p.add_argument("--sinkhorn_learn_dustbin", type=int, default=1)
+    p.add_argument("--sinkhorn_tau_min", type=float, default=1e-3)
     p.add_argument("--sinkhorn_spatial_gamma", type=float, default=0.0, help="Spatial prior weight in Sinkhorn logits")
     p.add_argument("--sinkhorn_spatial_radius", type=int, default=0, help="Hard spatial radius (token units) for matching; 0 disables")
     p.add_argument("--sinkhorn_fb_sigma", type=float, default=0.0, help="Forward-backward consistency sigma (token units); 0 disables")
@@ -187,6 +191,25 @@ def _load_straightener_trainable(
     return model, meta
 
 
+def _save_joint_checkpoint(
+    path: str,
+    *,
+    model: LatentStraightener,
+    matcher: SinkhornWarpInterpolator,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    meta: dict,
+) -> None:
+    payload = {
+        "model": model.state_dict(),
+        "matcher": matcher.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": int(step),
+        "meta": meta,
+    }
+    torch.save(payload, path)
+
+
 @torch.no_grad()
 def _eval_model(
     model: LatentStraightener,
@@ -257,9 +280,12 @@ def _eval_model(
             s0 = model.encode(z0)
             s1 = model.encode(z1)
             s_lerp = (1.0 - alpha4.to(dtype=s0.dtype)) * s0 + alpha4.to(dtype=s0.dtype) * s1
-        f0, hp, wp = _token_features(s0, patch_size=patch_size, d_match=d_match)
-        f1, _, _ = _token_features(s1, patch_size=patch_size, d_match=d_match)
-        flow01_tok, flow10_tok, conf01_tok, conf10_tok, _, _, _, _ = matcher.compute_bidirectional_flow_and_confs_batch(f0, f1)
+        with torch.cuda.amp.autocast(enabled=False):
+            f0, hp, wp = matcher.token_features(s0, assume_straightened=True)
+            f1, _, _ = matcher.token_features(s1, assume_straightened=True)
+            flow01_tok, flow10_tok, conf01_tok, conf10_tok, _, _, _, _ = matcher.compute_bidirectional_flow_and_confs_batch(
+                f0, f1
+            )
 
         flow01 = (
             F.interpolate(flow01_tok.permute(0, 3, 1, 2), size=(H, W), mode="bilinear", align_corners=True)
@@ -377,25 +403,51 @@ def main() -> None:
         sinkhorn_iters=args.sinkhorn_iters,
         sinkhorn_tau=args.sinkhorn_tau,
         dustbin_logit=args.sinkhorn_dustbin,
+        d_match=args.sinkhorn_d_match,
+        proj_mode=args.sinkhorn_proj_mode,
+        learn_tau=bool(args.sinkhorn_learn_tau),
+        learn_dustbin=bool(args.sinkhorn_learn_dustbin),
+        tau_min=args.sinkhorn_tau_min,
         spatial_gamma=args.sinkhorn_spatial_gamma,
         spatial_radius=args.sinkhorn_spatial_radius,
         fb_sigma=args.sinkhorn_fb_sigma,
-        d_match=0,
         straightener=None,
         warp_space="z",
     ).to(device=device)
+    matcher.train()
 
-    train_params = [p for p in model.parameters() if p.requires_grad]
-    if not train_params:
-        raise RuntimeError("No trainable parameters. Disable --freeze_straightener or add trainable components.")
-    opt = torch.optim.AdamW(train_params, lr=args.lr, weight_decay=args.weight_decay)
+    wd_params = []
+    no_wd_params = []
+    for p in model.parameters():
+        if p.requires_grad:
+            wd_params.append(p)
+    for name, p in matcher.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "tau_raw" in name or "dustbin_param" in name:
+            no_wd_params.append(p)
+        else:
+            wd_params.append(p)
+    if not wd_params and not no_wd_params:
+        raise RuntimeError("No trainable parameters. Disable --freeze_straightener or enable trainable matcher params.")
+    param_groups = [{"params": wd_params, "weight_decay": args.weight_decay}]
+    if no_wd_params:
+        param_groups.append({"params": no_wd_params, "weight_decay": 0.0})
+    opt = torch.optim.AdamW(param_groups, lr=args.lr)
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     writer = create_writer(args.log_dir)
 
     start_step = 0
     if args.resume:
-        start_step = load_checkpoint(args.resume, model, opt, ema=None, map_location=device)
+        payload = torch.load(args.resume, map_location="cpu")
+        model.load_state_dict(payload["model"], strict=True)
+        matcher_state = payload.get("matcher")
+        if matcher_state is not None:
+            matcher.load_state_dict(matcher_state, strict=True)
+        if "optimizer" in payload:
+            opt.load_state_dict(payload["optimizer"])
+        start_step = int(payload.get("step", 0))
 
     gen = torch.Generator(device=device)
     gen.manual_seed(args.seed + 23)
@@ -442,8 +494,8 @@ def main() -> None:
 
         # Compute correspondence in float32 (features + sinkhorn).
         with torch.cuda.amp.autocast(enabled=False):
-            f0, hp, wp = _token_features(s0, patch_size=args.patch_size, d_match=args.sinkhorn_d_match)
-            f1, _, _ = _token_features(s1, patch_size=args.patch_size, d_match=args.sinkhorn_d_match)
+            f0, hp, wp = matcher.token_features(s0, assume_straightened=True)
+            f1, _, _ = matcher.token_features(s1, assume_straightened=True)
             flow01_tok, flow10_tok, conf01_tok, conf10_tok, conf01_dust, conf10_dust, fb_err01, fb_err10 = (
                 matcher.compute_bidirectional_flow_and_confs_batch(f0, f1)
             )
@@ -576,6 +628,15 @@ def main() -> None:
                     # Diagnostics should never crash training.
                     pass
 
+                # Learnable matcher scalars (if enabled).
+                try:
+                    tau_val = float(matcher._tau(device=device, dtype=torch.float32).item())
+                    dust_val = float(matcher._dustbin(device=device, dtype=torch.float32).item())
+                    writer.add_scalar("match/tau", tau_val, step)
+                    writer.add_scalar("match/dustbin_logit", dust_val, step)
+                except Exception:
+                    pass
+
         if args.val_pattern and args.eval_every > 0 and step > 0 and step % args.eval_every == 0:
             metrics = _eval_model(
                 model,
@@ -629,11 +690,17 @@ def main() -> None:
                 "sinkhorn_spatial_radius": int(args.sinkhorn_spatial_radius),
                 "sinkhorn_fb_sigma": float(args.sinkhorn_fb_sigma),
                 "sinkhorn_d_match": int(args.sinkhorn_d_match),
+                "sinkhorn_proj_mode": str(args.sinkhorn_proj_mode),
+                "sinkhorn_learn_tau": bool(args.sinkhorn_learn_tau),
+                "sinkhorn_learn_dustbin": bool(args.sinkhorn_learn_dustbin),
+                "sinkhorn_tau_min": float(args.sinkhorn_tau_min),
                 "model_dtype": str(model_dtype).replace("torch.", ""),
                 "init_straightener_ckpt": args.init_straightener_ckpt,
                 "init_meta": init_meta,
             }
-            save_checkpoint(ckpt_path, model, opt, step, ema=None, meta=meta)
+            _save_joint_checkpoint(
+                ckpt_path, model=model, matcher=matcher, optimizer=opt, step=step, meta=meta
+            )
 
     final_path = os.path.join(args.ckpt_dir, "ckpt_final.pt")
     meta = {
@@ -661,11 +728,17 @@ def main() -> None:
         "sinkhorn_spatial_radius": int(args.sinkhorn_spatial_radius),
         "sinkhorn_fb_sigma": float(args.sinkhorn_fb_sigma),
         "sinkhorn_d_match": int(args.sinkhorn_d_match),
+        "sinkhorn_proj_mode": str(args.sinkhorn_proj_mode),
+        "sinkhorn_learn_tau": bool(args.sinkhorn_learn_tau),
+        "sinkhorn_learn_dustbin": bool(args.sinkhorn_learn_dustbin),
+        "sinkhorn_tau_min": float(args.sinkhorn_tau_min),
         "model_dtype": str(model_dtype).replace("torch.", ""),
         "init_straightener_ckpt": args.init_straightener_ckpt,
         "init_meta": init_meta,
     }
-    save_checkpoint(final_path, model, opt, args.steps, ema=None, meta=meta)
+    _save_joint_checkpoint(
+        final_path, model=model, matcher=matcher, optimizer=opt, step=args.steps, meta=meta
+    )
     writer.flush()
     writer.close()
 

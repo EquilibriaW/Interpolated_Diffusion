@@ -68,6 +68,10 @@ class SinkhornWarpInterpolator(nn.Module):
         spatial_radius: int = 0,
         fb_sigma: float = 0.0,
         d_match: int = 0,
+        proj_mode: str = "groupmean",
+        learn_tau: bool = False,
+        learn_dustbin: bool = False,
+        tau_min: float = 1e-3,
         straightener: Optional[nn.Module] = None,
         warp_space: str = "z",
     ) -> None:
@@ -90,12 +94,41 @@ class SinkhornWarpInterpolator(nn.Module):
         self.shift_range = int(shift_range)
         self.se2_chunk = int(se2_chunk)
         self.sinkhorn_iters = int(sinkhorn_iters)
-        self.sinkhorn_tau = float(sinkhorn_tau)
-        self.dustbin_logit = float(dustbin_logit)
+        self.learn_tau = bool(learn_tau)
+        self.learn_dustbin = bool(learn_dustbin)
+        self.tau_min = float(tau_min)
+        if self.tau_min < 0.0:
+            raise ValueError("tau_min must be >= 0")
+        # Parameterize tau via softplus to keep it positive and avoid tau->0 instabilities.
+        if self.learn_tau:
+            init_tau = float(sinkhorn_tau)
+            init_tau = max(init_tau - self.tau_min, 1e-6)
+            init_raw = math.log(math.expm1(init_tau))  # inverse softplus
+            self.tau_raw = nn.Parameter(torch.tensor(init_raw, dtype=torch.float32))
+        else:
+            self.register_buffer(
+                "tau_const", torch.tensor(float(sinkhorn_tau), dtype=torch.float32), persistent=False
+            )
+        if self.learn_dustbin:
+            self.dustbin_param = nn.Parameter(torch.tensor(float(dustbin_logit), dtype=torch.float32))
+        else:
+            self.register_buffer(
+                "dustbin_const", torch.tensor(float(dustbin_logit), dtype=torch.float32), persistent=False
+            )
         self.spatial_gamma = float(spatial_gamma)
         self.spatial_radius = int(spatial_radius)
         self.fb_sigma = float(fb_sigma)
         self.d_match = int(d_match)
+        self.proj_mode = str(proj_mode)
+        if self.proj_mode not in ("none", "groupmean", "linear"):
+            raise ValueError(f"proj_mode must be one of none/groupmean/linear, got {self.proj_mode}")
+        token_dim = int(self.in_channels) * int(self.patch_size) * int(self.patch_size)
+        self.token_dim = int(token_dim)
+        self.token_proj: nn.Module | None = None
+        if self.proj_mode == "linear":
+            if self.d_match <= 0:
+                raise ValueError("proj_mode='linear' requires d_match > 0")
+            self.token_proj = nn.Linear(self.token_dim, self.d_match, bias=False)
         self.straightener = straightener
         self.warp_space = str(warp_space)
         if self.warp_space not in ("z", "s"):
@@ -108,6 +141,16 @@ class SinkhornWarpInterpolator(nn.Module):
             self.straightener.eval()
             for p in self.straightener.parameters():
                 p.requires_grad_(False)
+
+    def _tau(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if self.learn_tau:
+            return (F.softplus(self.tau_raw) + self.tau_min).to(device=device, dtype=dtype)
+        return self.tau_const.to(device=device, dtype=dtype)
+
+    def _dustbin(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if self.learn_dustbin:
+            return self.dustbin_param.to(device=device, dtype=dtype)
+        return self.dustbin_const.to(device=device, dtype=dtype)
 
     def _spatial_dist2(self, h: int, w: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         # Returns [n,n] squared distances between token coords within an h x w window.
@@ -136,13 +179,27 @@ class SinkhornWarpInterpolator(nn.Module):
         tokens = tokens[:, 0]  # [B,N,D]
         tokens = tokens.float()
         B, N, D = tokens.shape
-        if self.d_match > 0 and self.d_match < D:
-            if D % self.d_match != 0:
-                raise ValueError(f"d_match {self.d_match} must divide token dim {D}")
-            tokens = tokens.view(B, N, self.d_match, D // self.d_match).mean(dim=-1)
+        if self.proj_mode == "linear":
+            if self.token_proj is None:
+                raise RuntimeError("token_proj missing for proj_mode='linear'")
+            if D != self.token_dim:
+                raise ValueError(f"token dim mismatch: expected {self.token_dim}, got {D}")
+            tokens = self.token_proj(tokens)
+        elif self.proj_mode == "groupmean":
+            if self.d_match > 0 and self.d_match < D:
+                if D % self.d_match != 0:
+                    raise ValueError(f"d_match {self.d_match} must divide token dim {D}")
+                tokens = tokens.view(B, N, self.d_match, D // self.d_match).mean(dim=-1)
+        elif self.proj_mode == "none":
+            pass
+        else:
+            raise RuntimeError(f"unknown proj_mode {self.proj_mode}")
         tokens = F.normalize(tokens, dim=-1, eps=1e-6)
         feats = tokens.view(B, hp, wp, -1)
         return feats, hp, wp
+
+    def token_features(self, z: torch.Tensor, *, assume_straightened: bool = False) -> Tuple[torch.Tensor, int, int]:
+        return self._token_features(z, assume_straightened=assume_straightened)
 
     def _get_se2_candidates(
         self, device: torch.device, dtype: torch.dtype
@@ -317,7 +374,8 @@ class SinkhornWarpInterpolator(nn.Module):
                 if n == 0:
                     continue
                 logits = (x @ y.T) / math.sqrt(max(1.0, float(x.shape[1])))
-                logits = logits / max(self.sinkhorn_tau, 1e-6)
+                tau = self._tau(device=logits.device, dtype=logits.dtype)
+                logits = logits / tau.clamp_min(1e-6)
                 if self.spatial_gamma > 0.0 or self.spatial_radius > 0:
                     dist2 = self._spatial_dist2(h, w, device=logits.device, dtype=logits.dtype)
                     if self.spatial_gamma > 0.0:
@@ -325,7 +383,8 @@ class SinkhornWarpInterpolator(nn.Module):
                     if self.spatial_radius > 0:
                         r2 = float(self.spatial_radius * self.spatial_radius)
                         logits = logits.masked_fill(dist2 > r2, -1e4)
-                logp = torch.full((n + 1, n + 1), self.dustbin_logit, device=logits.device, dtype=logits.dtype)
+                dust = self._dustbin(device=logits.device, dtype=logits.dtype)
+                logp = torch.zeros((n + 1, n + 1), device=logits.device, dtype=logits.dtype) + dust
                 logp[:n, :n] = logits
                 logp = _sinkhorn_log(logp, self.sinkhorn_iters)
                 p = torch.exp(logp)
@@ -383,7 +442,8 @@ class SinkhornWarpInterpolator(nn.Module):
             y = cols1.view(B, D, n, L).permute(0, 3, 2, 1).reshape(B * L, n, D)
 
             logits = torch.bmm(x, y.transpose(1, 2)) / math.sqrt(max(1.0, float(D)))
-            logits = logits / max(self.sinkhorn_tau, 1e-6)
+            tau = self._tau(device=logits.device, dtype=logits.dtype)
+            logits = logits / tau.clamp_min(1e-6)
             if self.spatial_gamma > 0.0 or self.spatial_radius > 0:
                 dist2 = self._spatial_dist2(win, win, device=logits.device, dtype=logits.dtype)
                 if self.spatial_gamma > 0.0:
@@ -392,12 +452,8 @@ class SinkhornWarpInterpolator(nn.Module):
                     r2 = float(self.spatial_radius * self.spatial_radius)
                     logits = logits.masked_fill(dist2 > r2, -1e4)
 
-            logp = torch.full(
-                (B * L, n + 1, n + 1),
-                self.dustbin_logit,
-                device=logits.device,
-                dtype=logits.dtype,
-            )
+            dust = self._dustbin(device=logits.device, dtype=logits.dtype)
+            logp = torch.zeros((B * L, n + 1, n + 1), device=logits.device, dtype=logits.dtype) + dust
             logp[:, :n, :n] = logits
             logp = _sinkhorn_log_batch(logp, self.sinkhorn_iters)
             p = torch.exp(logp)
@@ -442,7 +498,8 @@ class SinkhornWarpInterpolator(nn.Module):
             if n == 0:
                 return
             logits = torch.bmm(x, y.transpose(1, 2)) / math.sqrt(max(1.0, float(x.shape[2])))
-            logits = logits / max(self.sinkhorn_tau, 1e-6)
+            tau = self._tau(device=logits.device, dtype=logits.dtype)
+            logits = logits / tau.clamp_min(1e-6)
             if self.spatial_gamma > 0.0 or self.spatial_radius > 0:
                 dist2 = self._spatial_dist2(h, w, device=logits.device, dtype=logits.dtype)
                 if self.spatial_gamma > 0.0:
@@ -450,12 +507,8 @@ class SinkhornWarpInterpolator(nn.Module):
                 if self.spatial_radius > 0:
                     r2 = float(self.spatial_radius * self.spatial_radius)
                     logits = logits.masked_fill(dist2 > r2, -1e4)
-            logp = torch.full(
-                (B, n + 1, n + 1),
-                self.dustbin_logit,
-                device=logits.device,
-                dtype=logits.dtype,
-            )
+            dust = self._dustbin(device=logits.device, dtype=logits.dtype)
+            logp = torch.zeros((B, n + 1, n + 1), device=logits.device, dtype=logits.dtype) + dust
             logp[:, :n, :n] = logits
             logp = _sinkhorn_log_batch(logp, self.sinkhorn_iters)
             p = torch.exp(logp)
@@ -496,7 +549,8 @@ class SinkhornWarpInterpolator(nn.Module):
             )
 
             logits = torch.bmm(f0_blk, f1_blk.transpose(1, 2)) / math.sqrt(max(1.0, float(D)))
-            logits = logits / max(self.sinkhorn_tau, 1e-6)
+            tau = self._tau(device=logits.device, dtype=logits.dtype)
+            logits = logits / tau.clamp_min(1e-6)
             if self.spatial_gamma > 0.0 or self.spatial_radius > 0:
                 dist2 = self._spatial_dist2(win, win, device=logits.device, dtype=logits.dtype)
                 if self.spatial_gamma > 0.0:
@@ -504,11 +558,10 @@ class SinkhornWarpInterpolator(nn.Module):
                 if self.spatial_radius > 0:
                     r2 = float(self.spatial_radius * self.spatial_radius)
                     logits = logits.masked_fill(dist2 > r2, -1e4)
-            logp = torch.full(
-                (B * nH * nW, win * win + 1, win * win + 1),
-                self.dustbin_logit,
-                device=logits.device,
-                dtype=logits.dtype,
+            dust = self._dustbin(device=logits.device, dtype=logits.dtype)
+            logp = (
+                torch.zeros((B * nH * nW, win * win + 1, win * win + 1), device=logits.device, dtype=logits.dtype)
+                + dust
             )
             logp[:, : win * win, : win * win] = logits
             logp = _sinkhorn_log_batch(logp, self.sinkhorn_iters)

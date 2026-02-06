@@ -78,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save_every", type=int, default=2000)
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--shuffle_buffer", type=int, default=1000)
+    p.add_argument("--shuffle_buffer", type=int, default=200)
     return p
 
 
