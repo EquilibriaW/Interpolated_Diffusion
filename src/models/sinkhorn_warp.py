@@ -56,6 +56,7 @@ class SinkhornWarpInterpolator(nn.Module):
         in_channels: int,
         patch_size: int = 4,
         win_size: int = 5,
+        win_stride: int = 0,
         global_mode: str = "se2",
         angles_deg: Optional[Iterable[float]] = None,
         shift_range: int = 4,
@@ -63,6 +64,9 @@ class SinkhornWarpInterpolator(nn.Module):
         sinkhorn_iters: int = 20,
         sinkhorn_tau: float = 0.05,
         dustbin_logit: float = -2.0,
+        spatial_gamma: float = 0.0,
+        spatial_radius: int = 0,
+        fb_sigma: float = 0.0,
         d_match: int = 0,
         straightener: Optional[nn.Module] = None,
         warp_space: str = "z",
@@ -71,6 +75,9 @@ class SinkhornWarpInterpolator(nn.Module):
         self.in_channels = int(in_channels)
         self.patch_size = int(patch_size)
         self.win_size = int(win_size)
+        self.win_stride = int(win_stride) if int(win_stride) > 0 else int(win_size)
+        if self.win_stride <= 0:
+            raise ValueError("win_stride must be >= 1")
         self.global_mode = str(global_mode)
         if self.global_mode not in ("se2", "phasecorr", "none"):
             raise ValueError(f"global_mode must be one of se2/phasecorr/none, got {self.global_mode}")
@@ -85,6 +92,9 @@ class SinkhornWarpInterpolator(nn.Module):
         self.sinkhorn_iters = int(sinkhorn_iters)
         self.sinkhorn_tau = float(sinkhorn_tau)
         self.dustbin_logit = float(dustbin_logit)
+        self.spatial_gamma = float(spatial_gamma)
+        self.spatial_radius = int(spatial_radius)
+        self.fb_sigma = float(fb_sigma)
         self.d_match = int(d_match)
         self.straightener = straightener
         self.warp_space = str(warp_space)
@@ -93,10 +103,29 @@ class SinkhornWarpInterpolator(nn.Module):
         if self.warp_space == "s" and self.straightener is None:
             raise ValueError("warp_space='s' requires a straightener")
         self._se2_cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._dist_cache: dict[tuple[torch.device, int, int], torch.Tensor] = {}
         if self.straightener is not None:
             self.straightener.eval()
             for p in self.straightener.parameters():
                 p.requires_grad_(False)
+
+    def _spatial_dist2(self, h: int, w: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        # Returns [n,n] squared distances between token coords within an h x w window.
+        # Cache in float32 and cast at use sites.
+        key = (device, int(h), int(w))
+        cached = self._dist_cache.get(key)
+        if cached is None:
+            yy, xx = torch.meshgrid(
+                torch.arange(h, device=device),
+                torch.arange(w, device=device),
+                indexing="ij",
+            )
+            coords = torch.stack([xx, yy], dim=-1).reshape(h * w, 2).float()
+            diff = coords[:, None, :] - coords[None, :, :]
+            dist2 = (diff * diff).sum(dim=-1)  # [n,n]
+            self._dist_cache[key] = dist2
+            cached = dist2
+        return cached.to(dtype=dtype)
 
     def _token_features(self, z: torch.Tensor, *, assume_straightened: bool = False) -> Tuple[torch.Tensor, int, int]:
         # z: [B,C,H,W]
@@ -289,6 +318,13 @@ class SinkhornWarpInterpolator(nn.Module):
                     continue
                 logits = (x @ y.T) / math.sqrt(max(1.0, float(x.shape[1])))
                 logits = logits / max(self.sinkhorn_tau, 1e-6)
+                if self.spatial_gamma > 0.0 or self.spatial_radius > 0:
+                    dist2 = self._spatial_dist2(h, w, device=logits.device, dtype=logits.dtype)
+                    if self.spatial_gamma > 0.0:
+                        logits = logits - float(self.spatial_gamma) * dist2
+                    if self.spatial_radius > 0:
+                        r2 = float(self.spatial_radius * self.spatial_radius)
+                        logits = logits.masked_fill(dist2 > r2, -1e4)
                 logp = torch.full((n + 1, n + 1), self.dustbin_logit, device=logits.device, dtype=logits.dtype)
                 logp[:n, :n] = logits
                 logp = _sinkhorn_log(logp, self.sinkhorn_iters)
@@ -316,6 +352,86 @@ class SinkhornWarpInterpolator(nn.Module):
         delta = torch.zeros((B, hp, wp, 2), device=f0.device, dtype=torch.float32)
         conf = torch.zeros((B, hp, wp), device=f0.device, dtype=torch.float32)
         win = self.win_size
+        stride = int(self.win_stride)
+
+        # Overlapping windows (stride < win): use unfold/fold to stay vectorized and avoid seams.
+        if stride < win:
+            f0_map = f0.permute(0, 3, 1, 2).float()  # [B,D,Hp,Wp]
+            f1_map = f1.permute(0, 3, 1, 2).float()
+            D = f0_map.shape[1]
+
+            # Pad bottom/right so every token participates in at least one window.
+            if hp < win:
+                pad_h = win - hp
+            else:
+                pad_h = (stride - ((hp - win) % stride)) % stride
+            if wp < win:
+                pad_w = win - wp
+            else:
+                pad_w = (stride - ((wp - win) % stride)) % stride
+            if pad_h or pad_w:
+                f0_map = F.pad(f0_map, (0, pad_w, 0, pad_h), mode="replicate")
+                f1_map = F.pad(f1_map, (0, pad_w, 0, pad_h), mode="replicate")
+            hp_p, wp_p = int(f0_map.shape[2]), int(f0_map.shape[3])
+
+            cols0 = F.unfold(f0_map, kernel_size=win, stride=stride)  # [B, D*win*win, L]
+            cols1 = F.unfold(f1_map, kernel_size=win, stride=stride)
+            L = int(cols0.shape[-1])
+            n = win * win
+
+            x = cols0.view(B, D, n, L).permute(0, 3, 2, 1).reshape(B * L, n, D)
+            y = cols1.view(B, D, n, L).permute(0, 3, 2, 1).reshape(B * L, n, D)
+
+            logits = torch.bmm(x, y.transpose(1, 2)) / math.sqrt(max(1.0, float(D)))
+            logits = logits / max(self.sinkhorn_tau, 1e-6)
+            if self.spatial_gamma > 0.0 or self.spatial_radius > 0:
+                dist2 = self._spatial_dist2(win, win, device=logits.device, dtype=logits.dtype)
+                if self.spatial_gamma > 0.0:
+                    logits = logits - float(self.spatial_gamma) * dist2
+                if self.spatial_radius > 0:
+                    r2 = float(self.spatial_radius * self.spatial_radius)
+                    logits = logits.masked_fill(dist2 > r2, -1e4)
+
+            logp = torch.full(
+                (B * L, n + 1, n + 1),
+                self.dustbin_logit,
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            logp[:, :n, :n] = logits
+            logp = _sinkhorn_log_batch(logp, self.sinkhorn_iters)
+            p = torch.exp(logp)
+            p_xy = p[:, :n, :n]
+            mass = p_xy.sum(dim=2, keepdim=True).clamp_min(1e-8)
+            yy, xx = torch.meshgrid(
+                torch.arange(win, device=logits.device),
+                torch.arange(win, device=logits.device),
+                indexing="ij",
+            )
+            coords = torch.stack([xx, yy], dim=-1).view(n, 2).float()
+            coords = coords.unsqueeze(0).expand(B * L, -1, -1)
+            q = torch.bmm(p_xy, coords) / mass
+            delta_blk = (q - coords).view(B * L, win, win, 2)
+            conf_blk = (1.0 - p[:, :n, n]).view(B * L, win, win)
+
+            # Weight delta by confidence when accumulating overlapping windows.
+            dx_w = (delta_blk[..., 0] * conf_blk).view(B, L, n).permute(0, 2, 1)  # [B,n,L]
+            dy_w = (delta_blk[..., 1] * conf_blk).view(B, L, n).permute(0, 2, 1)
+            c_cols = conf_blk.view(B, L, n).permute(0, 2, 1)
+            ones = torch.ones_like(c_cols)
+
+            dx_sum = F.fold(dx_w, output_size=(hp_p, wp_p), kernel_size=win, stride=stride)
+            dy_sum = F.fold(dy_w, output_size=(hp_p, wp_p), kernel_size=win, stride=stride)
+            c_sum = F.fold(c_cols, output_size=(hp_p, wp_p), kernel_size=win, stride=stride)
+            cnt = F.fold(ones, output_size=(hp_p, wp_p), kernel_size=win, stride=stride)
+
+            # Convert to [B,Hp,Wp,2] / [B,Hp,Wp] and crop padding.
+            c_sum = c_sum.clamp_min(1e-8)
+            dx = (dx_sum / c_sum)[:, 0, :hp, :wp]
+            dy = (dy_sum / c_sum)[:, 0, :hp, :wp]
+            delta = torch.stack([dx, dy], dim=-1)
+            conf = (c_sum / cnt.clamp_min(1.0))[:, 0, :hp, :wp].clamp(0.0, 1.0)
+            return delta, conf
 
         def process_block(y0: int, x0: int, h: int, w: int) -> None:
             if h <= 0 or w <= 0:
@@ -327,6 +443,13 @@ class SinkhornWarpInterpolator(nn.Module):
                 return
             logits = torch.bmm(x, y.transpose(1, 2)) / math.sqrt(max(1.0, float(x.shape[2])))
             logits = logits / max(self.sinkhorn_tau, 1e-6)
+            if self.spatial_gamma > 0.0 or self.spatial_radius > 0:
+                dist2 = self._spatial_dist2(h, w, device=logits.device, dtype=logits.dtype)
+                if self.spatial_gamma > 0.0:
+                    logits = logits - float(self.spatial_gamma) * dist2
+                if self.spatial_radius > 0:
+                    r2 = float(self.spatial_radius * self.spatial_radius)
+                    logits = logits.masked_fill(dist2 > r2, -1e4)
             logp = torch.full(
                 (B, n + 1, n + 1),
                 self.dustbin_logit,
@@ -374,6 +497,13 @@ class SinkhornWarpInterpolator(nn.Module):
 
             logits = torch.bmm(f0_blk, f1_blk.transpose(1, 2)) / math.sqrt(max(1.0, float(D)))
             logits = logits / max(self.sinkhorn_tau, 1e-6)
+            if self.spatial_gamma > 0.0 or self.spatial_radius > 0:
+                dist2 = self._spatial_dist2(win, win, device=logits.device, dtype=logits.dtype)
+                if self.spatial_gamma > 0.0:
+                    logits = logits - float(self.spatial_gamma) * dist2
+                if self.spatial_radius > 0:
+                    r2 = float(self.spatial_radius * self.spatial_radius)
+                    logits = logits.masked_fill(dist2 > r2, -1e4)
             logp = torch.full(
                 (B * nH * nW, win * win + 1, win * win + 1),
                 self.dustbin_logit,
@@ -493,6 +623,45 @@ class SinkhornWarpInterpolator(nn.Module):
         flow_tok = self._compose_flow_batch(delta, theta, dx, dy, hp, wp)
         return flow_tok, conf
 
+    def _fb_consistency_conf(
+        self, flow01_tok: torch.Tensor, flow10_tok: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # flow*_tok: [B,Hp,Wp,2] in token units.
+        if self.fb_sigma <= 0.0:
+            B, Hp, Wp, _ = flow01_tok.shape
+            ones = torch.ones((B, Hp, Wp), device=flow01_tok.device, dtype=torch.float32)
+            zeros = torch.zeros((B, Hp, Wp), device=flow01_tok.device, dtype=torch.float32)
+            return ones, ones, zeros, zeros
+
+        flow01_map = flow01_tok.permute(0, 3, 1, 2).float()  # [B,2,Hp,Wp]
+        flow10_map = flow10_tok.permute(0, 3, 1, 2).float()
+
+        # err01 at frame0 coords: F01(x0) + F10(x0 + F01(x0))
+        flow10_at_01 = _warp(flow10_map, flow01_map)
+        fb01 = flow01_map + flow10_at_01
+        err01 = torch.linalg.norm(fb01, dim=1)  # [B,Hp,Wp]
+
+        # err10 at frame1 coords: F10(x1) + F01(x1 + F10(x1))
+        flow01_at_10 = _warp(flow01_map, flow10_map)
+        fb10 = flow10_map + flow01_at_10
+        err10 = torch.linalg.norm(fb10, dim=1)
+
+        sigma = float(self.fb_sigma)
+        conf01 = torch.exp(-0.5 * (err01 / sigma) ** 2).clamp(0.0, 1.0)
+        conf10 = torch.exp(-0.5 * (err10 / sigma) ** 2).clamp(0.0, 1.0)
+        return conf01, conf10, err01, err10
+
+    def compute_bidirectional_flow_and_confs_batch(
+        self, f0: torch.Tensor, f1: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # f0/f1: [B,Hp,Wp,D]
+        flow01_tok, conf01_dust = self._compute_flow_from_feats_batch(f0, f1)
+        flow10_tok, conf10_dust = self._compute_flow_from_feats_batch(f1, f0)
+        conf01_fb, conf10_fb, fb_err01, fb_err10 = self._fb_consistency_conf(flow01_tok, flow10_tok)
+        conf01 = conf01_dust.float() * conf01_fb
+        conf10 = conf10_dust.float() * conf10_fb
+        return flow01_tok, flow10_tok, conf01, conf10, conf01_dust.float(), conf10_dust.float(), fb_err01, fb_err10
+
     @torch.no_grad()
     def interpolate(self, latents: torch.Tensor, idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # latents: [B,T,C,H,W], idx: [B,K]
@@ -557,8 +726,7 @@ class SinkhornWarpInterpolator(nn.Module):
         f0 = feats[pair_b, pair_t0]
         f1 = feats[pair_b, pair_t1]
 
-        flow01_tok, conf01_tok = self._compute_flow_from_feats_batch(f0, f1)
-        flow10_tok, conf10_tok = self._compute_flow_from_feats_batch(f1, f0)
+        flow01_tok, flow10_tok, conf01_tok, conf10_tok, _, _, _, _ = self.compute_bidirectional_flow_and_confs_batch(f0, f1)
 
         flow01_tok = flow01_tok.permute(0, 3, 1, 2)  # [P,2,Hp,Wp]
         flow10_tok = flow10_tok.permute(0, 3, 1, 2)
@@ -579,7 +747,6 @@ class SinkhornWarpInterpolator(nn.Module):
             flow10_p = flow10[p_idx : p_idx + 1]
             conf01_p = conf01_lat[p_idx : p_idx + 1]
             conf10_p = conf10_lat[p_idx : p_idx + 1]
-            conf_mix = torch.minimum(conf01_p, conf10_p)
 
             gap = t1 - t0
             steps = gap - 1
@@ -602,11 +769,16 @@ class SinkhornWarpInterpolator(nn.Module):
             if self.warp_space == "s":
                 s0_w = _warp(s0_rep, -flow01_rep)
                 s1_w = _warp(s1_rep, -flow10_rep)
+                conf0_w = _warp(conf01_rep, -flow01_rep)
+                conf1_w = _warp(conf10_rep, -flow10_rep)
             else:
                 z0_w = _warp(z0_rep, -flow01_rep)
                 z1_w = _warp(z1_rep, -flow10_rep)
-            w0 = (1.0 - alpha) * conf01_rep
-            w1 = alpha * conf10_rep
+                conf0_w = _warp(conf01_rep, -flow01_rep)
+                conf1_w = _warp(conf10_rep, -flow10_rep)
+
+            w0 = (1.0 - alpha) * conf0_w
+            w1 = alpha * conf1_w
             denom = w0 + w1
             if self.warp_space == "s":
                 s_mix = (w0 * s0_w + w1 * s1_w) / denom.clamp_min(1e-6)
@@ -621,7 +793,8 @@ class SinkhornWarpInterpolator(nn.Module):
                 mask = denom > 1e-6
                 z_t = torch.where(mask, z_mix, z_lin)
             out[b, t0 + 1 : t1] = z_t
-            conf[b, t0 + 1 : t1] = conf_mix[0, 0]
+            conf_step = torch.minimum(conf0_w, conf1_w)
+            conf[b, t0 + 1 : t1] = conf_step[:, 0]
         return out, conf
 
 

@@ -1,8 +1,10 @@
 import argparse
 import os
+import sys
 import time
 from typing import Optional
 
+import math
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -43,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Sinkhorn matcher hyperparams.
     p.add_argument("--sinkhorn_win", type=int, default=5)
+    p.add_argument("--sinkhorn_stride", type=int, default=0, help="Token-window stride (0 uses sinkhorn_win)")
     p.add_argument("--sinkhorn_angles", type=str, default="-10,-5,0,5,10")
     p.add_argument("--sinkhorn_shift", type=int, default=4)
     p.add_argument("--sinkhorn_global_mode", type=str, default="phasecorr", choices=["se2", "phasecorr", "none"])
@@ -50,6 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sinkhorn_tau", type=float, default=0.05)
     p.add_argument("--sinkhorn_dustbin", type=float, default=-2.0)
     p.add_argument("--sinkhorn_d_match", type=int, default=64)
+    p.add_argument("--sinkhorn_spatial_gamma", type=float, default=0.0, help="Spatial prior weight in Sinkhorn logits")
+    p.add_argument("--sinkhorn_spatial_radius", type=int, default=0, help="Hard spatial radius (token units) for matching; 0 disables")
+    p.add_argument("--sinkhorn_fb_sigma", type=float, default=0.0, help="Forward-backward consistency sigma (token units); 0 disables")
 
     # Loss weights.
     p.add_argument("--interp_weight", type=float, default=1.0)
@@ -72,6 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--persistent_workers", type=int, default=1)
     p.add_argument("--pin_memory", type=int, default=1)
     p.add_argument("--resampled", type=int, default=1)
+    # Terminal output hygiene: tqdm updates can be extremely spammy and can
+    # destabilize long foreground runs when stdout/stderr are captured.
+    p.add_argument("--tqdm_interval", type=float, default=5.0, help="Minimum seconds between tqdm refreshes")
     return p
 
 
@@ -224,6 +233,7 @@ def _eval_model(
 
     err_sinkhorn = []
     err_lerp = []
+    err_straight = []
     for _ in range(int(num_batches)):
         try:
             batch_data = next(it)
@@ -246,10 +256,10 @@ def _eval_model(
         with torch.cuda.amp.autocast(dtype=autocast_dtype):
             s0 = model.encode(z0)
             s1 = model.encode(z1)
+            s_lerp = (1.0 - alpha4.to(dtype=s0.dtype)) * s0 + alpha4.to(dtype=s0.dtype) * s1
         f0, hp, wp = _token_features(s0, patch_size=patch_size, d_match=d_match)
         f1, _, _ = _token_features(s1, patch_size=patch_size, d_match=d_match)
-        flow01_tok, conf01_tok = matcher._compute_flow_from_feats_batch(f0, f1)
-        flow10_tok, conf10_tok = matcher._compute_flow_from_feats_batch(f1, f0)
+        flow01_tok, flow10_tok, conf01_tok, conf10_tok, _, _, _, _ = matcher.compute_bidirectional_flow_and_confs_batch(f0, f1)
 
         flow01 = (
             F.interpolate(flow01_tok.permute(0, 3, 1, 2), size=(H, W), mode="bilinear", align_corners=True)
@@ -265,8 +275,10 @@ def _eval_model(
         # Warp and blend in straightened space; decode back to z.
         s0_w = _warp_fp32(s0, -flow01 * alpha4)
         s1_w = _warp_fp32(s1, -flow10 * (1.0 - alpha4))
-        w0 = (1.0 - alpha4) * conf01
-        w1 = alpha4 * conf10
+        conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
+        conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+        w0 = (1.0 - alpha4) * conf0_w
+        w1 = alpha4 * conf1_w
         denom = w0 + w1
         s_mix = (w0 * s0_w + w1 * s1_w) / denom.clamp_min(1e-6)
         s_lin = (1.0 - alpha4) * s0_w + alpha4 * s1_w
@@ -274,18 +286,25 @@ def _eval_model(
 
         with torch.cuda.amp.autocast(dtype=autocast_dtype):
             z_hat = model.decode(s_t.to(dtype=s0.dtype))
+            z_straight = model.decode(s_lerp)
 
         z_hat_f = z_hat.float()
         zt_f = zt.float()
         z_lerp = z0.float() * (1.0 - alpha4) + z1.float() * alpha4
         err_sinkhorn.append(((z_hat_f - zt_f) ** 2).mean(dim=(1, 2, 3)).cpu())
         err_lerp.append(((z_lerp - zt_f) ** 2).mean(dim=(1, 2, 3)).cpu())
+        err_straight.append(((z_straight.float() - zt_f) ** 2).mean(dim=(1, 2, 3)).cpu())
 
     if model_was_training:
         model.train()
     mse_sink = torch.cat(err_sinkhorn, dim=0).mean().item()
     mse_lerp = torch.cat(err_lerp, dim=0).mean().item()
-    return {"val_sinkhorn_mse": float(mse_sink), "val_lerp_mse": float(mse_lerp)}
+    mse_straight = torch.cat(err_straight, dim=0).mean().item()
+    return {
+        "val_sinkhorn_mse": float(mse_sink),
+        "val_lerp_mse": float(mse_lerp),
+        "val_straight_lerp_mse": float(mse_straight),
+    }
 
 
 def main() -> None:
@@ -351,12 +370,16 @@ def main() -> None:
         in_channels=C0,
         patch_size=args.patch_size,
         win_size=args.sinkhorn_win,
+        win_stride=args.sinkhorn_stride,
         global_mode=args.sinkhorn_global_mode,
         angles_deg=angles,
         shift_range=args.sinkhorn_shift,
         sinkhorn_iters=args.sinkhorn_iters,
         sinkhorn_tau=args.sinkhorn_tau,
         dustbin_logit=args.sinkhorn_dustbin,
+        spatial_gamma=args.sinkhorn_spatial_gamma,
+        spatial_radius=args.sinkhorn_spatial_radius,
+        fb_sigma=args.sinkhorn_fb_sigma,
         d_match=0,
         straightener=None,
         warp_space="z",
@@ -382,7 +405,13 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
-    pbar = tqdm(range(start_step, args.steps), dynamic_ncols=True)
+    # Use a conservative refresh cadence to avoid huge log spam when output is captured.
+    pbar = tqdm(
+        range(start_step, args.steps),
+        dynamic_ncols=True,
+        mininterval=max(0.5, float(args.tqdm_interval)),
+        file=sys.stderr,
+    )
     for step in pbar:
         step_start = time.perf_counter()
         log_this = step % args.log_every == 0
@@ -415,8 +444,9 @@ def main() -> None:
         with torch.cuda.amp.autocast(enabled=False):
             f0, hp, wp = _token_features(s0, patch_size=args.patch_size, d_match=args.sinkhorn_d_match)
             f1, _, _ = _token_features(s1, patch_size=args.patch_size, d_match=args.sinkhorn_d_match)
-            flow01_tok, conf01_tok = matcher._compute_flow_from_feats_batch(f0, f1)
-            flow10_tok, conf10_tok = matcher._compute_flow_from_feats_batch(f1, f0)
+            flow01_tok, flow10_tok, conf01_tok, conf10_tok, conf01_dust, conf10_dust, fb_err01, fb_err10 = (
+                matcher.compute_bidirectional_flow_and_confs_batch(f0, f1)
+            )
 
             flow01 = (
                 F.interpolate(flow01_tok.permute(0, 3, 1, 2), size=(H, W), mode="bilinear", align_corners=True)
@@ -432,8 +462,10 @@ def main() -> None:
             # Warp and blend in straightened space; decode back to z.
             s0_w = _warp_fp32(s0, -flow01 * alpha4)
             s1_w = _warp_fp32(s1, -flow10 * (1.0 - alpha4))
-            w0 = (1.0 - alpha4) * conf01
-            w1 = alpha4 * conf10
+            conf0_w = _warp_fp32(conf01, -flow01 * alpha4)
+            conf1_w = _warp_fp32(conf10, -flow10 * (1.0 - alpha4))
+            w0 = (1.0 - alpha4) * conf0_w
+            w1 = alpha4 * conf1_w
             denom = w0 + w1
             s_mix = (w0 * s0_w + w1 * s1_w) / denom.clamp_min(1e-6)
             s_lin = (1.0 - alpha4) * s0_w + alpha4 * s1_w
@@ -470,6 +502,79 @@ def main() -> None:
             writer.add_scalar("train/samples_per_sec", float(B) / max(step_time, 1e-8), step)
             max_mem = torch.cuda.max_memory_allocated() / (1024**3)
             writer.add_scalar("train/max_mem_gb", max_mem, step)
+            with torch.no_grad():
+                # Baseline for this batch: plain z-space LERP between endpoints.
+                z_lerp = z0.float() * (1.0 - alpha4) + z1.float() * alpha4
+                lerp_mse = F.mse_loss(z_lerp, zt.float()).item()
+                writer.add_scalar("train/lerp_mse", lerp_mse, step)
+                writer.add_scalar("train/sinkhorn_minus_lerp_mse", float(interp_loss.item()) - lerp_mse, step)
+
+                # Baseline in straightened space: decode((1-a)S(z0)+aS(z1)).
+                with torch.cuda.amp.autocast(dtype=autocast_dtype):
+                    s_lerp = (1.0 - alpha4.to(dtype=s0.dtype)) * s0.detach() + alpha4.to(dtype=s0.dtype) * s1.detach()
+                    z_straight = model.decode(s_lerp)
+                straight_mse = F.mse_loss(z_straight.float(), zt.float()).item()
+                writer.add_scalar("train/straight_lerp_mse", straight_mse, step)
+                writer.add_scalar(
+                    "train/sinkhorn_minus_straight_mse",
+                    float(interp_loss.item()) - straight_mse,
+                    step,
+                )
+
+                # Matching diagnostics. conf_* are (1 - dustbin_mass) on the token grid.
+                writer.add_scalar("match/conf01_tok_mean", float(conf01_tok.mean().item()), step)
+                writer.add_scalar("match/conf10_tok_mean", float(conf10_tok.mean().item()), step)
+                writer.add_scalar("match/conf01_dust_mean", float(conf01_dust.mean().item()), step)
+                writer.add_scalar("match/conf10_dust_mean", float(conf10_dust.mean().item()), step)
+                # Approximate fb factor as combined / dust, guarded.
+                fb01_fac = torch.where(conf01_dust > 1e-6, conf01_tok / conf01_dust, torch.zeros_like(conf01_tok))
+                fb10_fac = torch.where(conf10_dust > 1e-6, conf10_tok / conf10_dust, torch.zeros_like(conf10_tok))
+                writer.add_scalar("match/conf01_fb_mean", float(fb01_fac.mean().item()), step)
+                writer.add_scalar("match/conf10_fb_mean", float(fb10_fac.mean().item()), step)
+                writer.add_scalar("match/fb_err01_tok_mean", float(fb_err01.mean().item()), step)
+                writer.add_scalar("match/fb_err10_tok_mean", float(fb_err10.mean().item()), step)
+
+                conf_min_tok = torch.minimum(conf01_tok, conf10_tok)
+                writer.add_scalar("match/conf_min_tok_mean", float(conf_min_tok.mean().item()), step)
+                writer.add_scalar("match/dustbin01_tok_mean", float((1.0 - conf01_tok).mean().item()), step)
+                writer.add_scalar("match/dustbin10_tok_mean", float((1.0 - conf10_tok).mean().item()), step)
+                writer.add_scalar("match/conf_min_tok_frac_lt_0p1", float((conf_min_tok < 0.1).float().mean().item()), step)
+
+                # Flow magnitude on token grid and latent grid (pixels).
+                flow01_tok_mag = torch.linalg.norm(flow01_tok.float(), dim=-1)  # [B,Hp,Wp]
+                flow10_tok_mag = torch.linalg.norm(flow10_tok.float(), dim=-1)
+                writer.add_scalar("match/flow01_tok_mag_mean", float(flow01_tok_mag.mean().item()), step)
+                writer.add_scalar("match/flow10_tok_mag_mean", float(flow10_tok_mag.mean().item()), step)
+                flow01_lat_mag = torch.linalg.norm(flow01.float(), dim=1)  # [B,H,W]
+                flow10_lat_mag = torch.linalg.norm(flow10.float(), dim=1)
+                writer.add_scalar("match/flow01_lat_mag_mean", float(flow01_lat_mag.mean().item()), step)
+                writer.add_scalar("match/flow10_lat_mag_mean", float(flow10_lat_mag.mean().item()), step)
+
+                # Blend/fallback behavior.
+                denom_mean = float(denom.mean().item())
+                denom_good_frac = float((denom > 1e-6).float().mean().item())
+                writer.add_scalar("blend/denom_mean", denom_mean, step)
+                writer.add_scalar("blend/denom_gt_eps_frac", denom_good_frac, step)
+
+                # Global alignment diagnostics (non-differentiable); useful to detect “always zero” motion.
+                try:
+                    if args.sinkhorn_global_mode == "phasecorr":
+                        f0_score = f0.mean(dim=-1).detach()
+                        f1_score = f1.mean(dim=-1).detach()
+                        theta_dbg, dx_dbg, dy_dbg = matcher._phasecorr_se2_batch(f0_score, f1_score)
+                    elif args.sinkhorn_global_mode == "se2":
+                        theta_dbg, dx_dbg, dy_dbg = matcher._estimate_global_se2_batch(f0.detach(), f1.detach())
+                    else:
+                        theta_dbg = torch.zeros((B,), device=device, dtype=torch.float32)
+                        dx_dbg = torch.zeros((B,), device=device, dtype=torch.float32)
+                        dy_dbg = torch.zeros((B,), device=device, dtype=torch.float32)
+                    theta_deg = theta_dbg.float() * (180.0 / math.pi)
+                    writer.add_scalar("global/theta_deg_abs_mean", float(theta_deg.abs().mean().item()), step)
+                    writer.add_scalar("global/dx_abs_mean", float(dx_dbg.float().abs().mean().item()), step)
+                    writer.add_scalar("global/dy_abs_mean", float(dy_dbg.float().abs().mean().item()), step)
+                except Exception:
+                    # Diagnostics should never crash training.
+                    pass
 
         if args.val_pattern and args.eval_every > 0 and step > 0 and step % args.eval_every == 0:
             metrics = _eval_model(
@@ -495,6 +600,7 @@ def main() -> None:
             )
             writer.add_scalar("val/sinkhorn_mse", metrics["val_sinkhorn_mse"], step)
             writer.add_scalar("val/lerp_mse", metrics["val_lerp_mse"], step)
+            writer.add_scalar("val/straight_lerp_mse", metrics["val_straight_lerp_mse"], step)
 
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
             ckpt_path = os.path.join(args.ckpt_dir, f"ckpt_{step:07d}.pt")
@@ -503,16 +609,25 @@ def main() -> None:
                 "T": args.T,
                 "patch_size": args.patch_size,
                 "min_gap": args.min_gap,
+                "in_channels": int(model.in_channels),
+                "hidden_channels": int(model.hidden_channels),
+                "blocks": int(model.blocks),
+                "kernel_size": int(model.kernel_size),
+                "use_residual": bool(model.use_residual),
                 "interp_weight": float(args.interp_weight),
                 "recon_weight": float(args.recon_weight),
                 "lin_weight": float(args.lin_weight),
                 "sinkhorn_win": args.sinkhorn_win,
+                "sinkhorn_stride": int(args.sinkhorn_stride),
                 "sinkhorn_angles": args.sinkhorn_angles,
                 "sinkhorn_shift": args.sinkhorn_shift,
                 "sinkhorn_global_mode": args.sinkhorn_global_mode,
                 "sinkhorn_iters": args.sinkhorn_iters,
                 "sinkhorn_tau": float(args.sinkhorn_tau),
                 "sinkhorn_dustbin": float(args.sinkhorn_dustbin),
+                "sinkhorn_spatial_gamma": float(args.sinkhorn_spatial_gamma),
+                "sinkhorn_spatial_radius": int(args.sinkhorn_spatial_radius),
+                "sinkhorn_fb_sigma": float(args.sinkhorn_fb_sigma),
                 "sinkhorn_d_match": int(args.sinkhorn_d_match),
                 "model_dtype": str(model_dtype).replace("torch.", ""),
                 "init_straightener_ckpt": args.init_straightener_ckpt,
@@ -526,16 +641,25 @@ def main() -> None:
         "T": args.T,
         "patch_size": args.patch_size,
         "min_gap": args.min_gap,
+        "in_channels": int(model.in_channels),
+        "hidden_channels": int(model.hidden_channels),
+        "blocks": int(model.blocks),
+        "kernel_size": int(model.kernel_size),
+        "use_residual": bool(model.use_residual),
         "interp_weight": float(args.interp_weight),
         "recon_weight": float(args.recon_weight),
         "lin_weight": float(args.lin_weight),
         "sinkhorn_win": args.sinkhorn_win,
+        "sinkhorn_stride": int(args.sinkhorn_stride),
         "sinkhorn_angles": args.sinkhorn_angles,
         "sinkhorn_shift": args.sinkhorn_shift,
         "sinkhorn_global_mode": args.sinkhorn_global_mode,
         "sinkhorn_iters": args.sinkhorn_iters,
         "sinkhorn_tau": float(args.sinkhorn_tau),
         "sinkhorn_dustbin": float(args.sinkhorn_dustbin),
+        "sinkhorn_spatial_gamma": float(args.sinkhorn_spatial_gamma),
+        "sinkhorn_spatial_radius": int(args.sinkhorn_spatial_radius),
+        "sinkhorn_fb_sigma": float(args.sinkhorn_fb_sigma),
         "sinkhorn_d_match": int(args.sinkhorn_d_match),
         "model_dtype": str(model_dtype).replace("torch.", ""),
         "init_straightener_ckpt": args.init_straightener_ckpt,

@@ -65,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--video_interp_ckpt", type=str, default="")
     p.add_argument("--flow_interp_ckpt", type=str, default="")
     p.add_argument("--sinkhorn_win", type=int, default=5)
+    p.add_argument("--sinkhorn_stride", type=int, default=0)
     p.add_argument("--sinkhorn_angles", type=str, default="-10,-5,0,5,10")
     p.add_argument("--sinkhorn_shift", type=int, default=4)
     p.add_argument("--sinkhorn_global_mode", type=str, default="phasecorr", choices=["se2", "phasecorr", "none"])
@@ -72,6 +73,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sinkhorn_iters", type=int, default=20)
     p.add_argument("--sinkhorn_tau", type=float, default=0.05)
     p.add_argument("--sinkhorn_dustbin", type=float, default=-2.0)
+    p.add_argument("--sinkhorn_spatial_gamma", type=float, default=0.0)
+    p.add_argument("--sinkhorn_spatial_radius", type=int, default=0)
+    p.add_argument("--sinkhorn_fb_sigma", type=float, default=0.0)
     p.add_argument("--sinkhorn_d_match", type=int, default=0)
     p.add_argument("--sinkhorn_straightener_ckpt", type=str, default="")
     p.add_argument("--sinkhorn_straightener_dtype", type=str, default="")
@@ -214,12 +218,16 @@ def main() -> None:
             in_channels=C0,
             patch_size=args.patch_size,
             win_size=args.sinkhorn_win,
+            win_stride=args.sinkhorn_stride,
             global_mode=args.sinkhorn_global_mode,
             angles_deg=angles,
             shift_range=args.sinkhorn_shift,
             sinkhorn_iters=args.sinkhorn_iters,
             sinkhorn_tau=args.sinkhorn_tau,
             dustbin_logit=args.sinkhorn_dustbin,
+            spatial_gamma=args.sinkhorn_spatial_gamma,
+            spatial_radius=args.sinkhorn_spatial_radius,
+            fb_sigma=args.sinkhorn_fb_sigma,
             d_match=args.sinkhorn_d_match,
             straightener=straightener,
             warp_space=args.sinkhorn_warp_space,
@@ -498,6 +506,7 @@ def main() -> None:
                 "video_interp_ckpt": args.video_interp_ckpt,
                 "flow_interp_ckpt": args.flow_interp_ckpt,
                 "sinkhorn_win": args.sinkhorn_win,
+                "sinkhorn_stride": int(args.sinkhorn_stride),
                 "sinkhorn_angles": args.sinkhorn_angles,
                 "sinkhorn_shift": args.sinkhorn_shift,
                 "sinkhorn_global_mode": args.sinkhorn_global_mode,
@@ -505,6 +514,9 @@ def main() -> None:
                 "sinkhorn_iters": args.sinkhorn_iters,
                 "sinkhorn_tau": args.sinkhorn_tau,
                 "sinkhorn_dustbin": args.sinkhorn_dustbin,
+                "sinkhorn_spatial_gamma": float(args.sinkhorn_spatial_gamma),
+                "sinkhorn_spatial_radius": int(args.sinkhorn_spatial_radius),
+                "sinkhorn_fb_sigma": float(args.sinkhorn_fb_sigma),
                 "sinkhorn_d_match": args.sinkhorn_d_match,
                 "sinkhorn_straightener_ckpt": args.sinkhorn_straightener_ckpt,
                 "sinkhorn_straightener_dtype": args.sinkhorn_straightener_dtype,
@@ -546,6 +558,7 @@ def main() -> None:
         "video_interp_ckpt": args.video_interp_ckpt,
         "flow_interp_ckpt": args.flow_interp_ckpt,
         "sinkhorn_win": args.sinkhorn_win,
+        "sinkhorn_stride": int(args.sinkhorn_stride),
         "sinkhorn_angles": args.sinkhorn_angles,
         "sinkhorn_shift": args.sinkhorn_shift,
         "sinkhorn_global_mode": args.sinkhorn_global_mode,
@@ -553,6 +566,9 @@ def main() -> None:
         "sinkhorn_iters": args.sinkhorn_iters,
         "sinkhorn_tau": args.sinkhorn_tau,
         "sinkhorn_dustbin": args.sinkhorn_dustbin,
+        "sinkhorn_spatial_gamma": float(args.sinkhorn_spatial_gamma),
+        "sinkhorn_spatial_radius": int(args.sinkhorn_spatial_radius),
+        "sinkhorn_fb_sigma": float(args.sinkhorn_fb_sigma),
         "sinkhorn_d_match": args.sinkhorn_d_match,
         "sinkhorn_straightener_ckpt": args.sinkhorn_straightener_ckpt,
         "sinkhorn_straightener_dtype": args.sinkhorn_straightener_dtype,
