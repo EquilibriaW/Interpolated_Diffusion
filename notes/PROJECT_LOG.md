@@ -853,3 +853,39 @@ Anchors: `data/wan_synth_anchors_calib3/` (ddim_steps=4, B=4, 20 batches); joine
     - `mean sinkhorn_mse` improved from `~0.1712` to `~0.1662` (LERP mean `~0.1704`)
     - `delta>0.5` tail removed: `0/1920`, `max(delta_vs_lerp) ~ +0.38`
 - **Extra diagnostic (optional)**: `--scale_flow_by_conf 1` scales flow by confidence before warping; this also removes the `delta>0.5` tail but needs care during training to avoid trivial `conf -> 0` collapse.
+
+### Sinkhorn Pipeline Training (End-to-End, Warp In Straightened Space)
+- **Goal**: train the *full* “phasecorr (rot+shift) + local Sinkhorn + dustbin” interpolator **through** the straightener, warping/blending in `s` and decoding back to `z`.
+- **Script**: `src/train/train_sinkhorn_interp_wansynth.py`
+- **Run**: `runs/sinkhorn_interp_optD_pcmulti_latent_w5_s3_r1_d64_b64_10k_warps`
+- **Ckpt**: `checkpoints/sinkhorn_interp_optD_pcmulti_latent_w5_s3_r1_d64_b64_10k_warps/ckpt_final.pt`
+- **Settings**:
+  - Init straightener: `checkpoints/latent_straightener_optD_h448_b5_10k/ckpt_final.pt`
+  - `freeze_straightener=0` (train straightener + matcher)
+  - Global: `sinkhorn_global_mode=phasecorr`, `sinkhorn_phasecorr_mode=multi`, `sinkhorn_phasecorr_level=latent`
+  - Local: `win=5`, `stride=3`, `d_match=64`, `proj_mode=linear`, `learn_tau=1`, `learn_dustbin=1`
+  - Priors: `spatial_gamma=0.5`, `spatial_radius=1`, `fb_sigma=0.5`
+  - `warp_space=s`, `min_gap=2`, `steps=10000`, `batch=64`, `num_workers=8`
+- **Val during training** (random triplets; MSE in `z`):
+  - Step 1000: `sinkhorn_mse=0.156593`, `lerp_mse=0.167893`, `straight_lerp_mse=0.151825`
+  - Step 9000: `sinkhorn_mse=0.154611`, `lerp_mse=0.167893`, `straight_lerp_mse=0.150652`
+  - Observation: Sinkhorn consistently beats raw `z`-LERP, but is not clearly better than “straightened LERP” (`decode((1-a)S(z0)+aS(z1))`).
+
+### Sinkhorn Diagnostics (ckpt_final, 30x64=1920 samples)
+- **Script**: `scripts/diagnose_sinkhorn_outliers_wansynth.py` (run with `PYTHONPATH=.`).
+- **Dataset**: val shards `shard-0000[8-9].tar`, `warp_space=s`, `min_gap=2`.
+- **Summary stats** from `tmp_sinkhorn_outliers_ckpt_final_warps/cases.jsonl`:
+  - `sinkhorn_mse`: mean **0.15116**, median **0.08791**
+  - `lerp_mse`: mean **0.17045**, median **0.10426**
+  - `straight_lerp_mse`: mean **0.15295**, median **0.09335**
+  - `sinkhorn - lerp` (delta): mean **-0.01929**, p99 **+0.0870**, max **+0.5979**
+  - Gap trend: mean `sinkhorn - lerp` becomes more negative as gap increases (e.g. gap>=10 mean delta **-0.0282**), but there remains a small tail of failures.
+
+### Straightener (New Option): Token-Grid Transformer
+- Added a new straightener architecture: `LatentStraightenerTokenTransformer` (patchify to 15x26=390 tokens; transformer over tokens; unpatchify back).
+- **Code**:
+  - `src/models/latent_straightener.py`: new `token_transformer` arch + checkpoint loader dispatch via `meta['arch']`.
+  - `src/train/train_latent_straightener_wansynth.py`: add `--arch token_transformer` and transformer hyperparams.
+  - `src/train/train_sinkhorn_interp_wansynth.py`: training-time loader/meta updated to support transformer straighteners.
+  - `scripts/diagnose_sinkhorn_outliers_wansynth.py`: backward-compatible matcher loading for older checkpoints.
+- **Commit**: `63c3a4d` ("straightener: add token-transformer arch").
