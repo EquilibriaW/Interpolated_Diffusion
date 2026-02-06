@@ -842,9 +842,14 @@ Anchors: `data/wan_synth_anchors_calib3/` (ddim_steps=4, B=4, 20 batches); joine
 
 ### Outlier Diagnosis (Why Tail Failures Persist)
 - **Scan (val shards, 30 batches x 64 = 1920 samples)**, ckpt above, `phasecorr_mode=multi`, `phasecorr_level=latent`:
-  - Worst cases still have **large global shifts** and **conf ~ 0**, yet the pipeline still applies large warps, producing very high MSE.
-- **Evidence that “warp despite conf=0” is the direct cause**:
-  - Re-run outlier scan with `--scale_flow_by_conf 1` (flow multiplied by confidence before warping):
-    - Worst `delta_vs_lerp` dropped from **~+0.76** to **~+0.42** on the same 1920-sample scan.
-  - Interpretation: confidence is correctly flagging unreliable correspondences, but we were not using it to suppress the warp itself (only for blending).
-  - Next: decide whether to incorporate confidence gating into the actual interpolator (and how to avoid degenerate “conf -> 0” collapse during training).
+  - Original behavior had **catastrophic tail**: `max(delta_vs_lerp) ~ +0.76` and `delta>0.5` count `6/1920`.
+- **Root cause**: when both confidences are near-zero (`denom ~ 0`), the code fell back to a **linear blend of warped endpoints**, which is unstable when the estimated flow is invalid.
+- **Fix (implemented)**: fall back to **unwarped LERP** when `denom` is tiny (no reliable correspondences).
+  - Commit: `c56de0d` ("avoid warping when confidence is zero") in:
+    - `src/models/sinkhorn_warp.py`
+    - `src/train/train_sinkhorn_interp_wansynth.py`
+    - `scripts/diagnose_sinkhorn_outliers_wansynth.py`
+  - After fix on the same 1920-sample scan:
+    - `mean sinkhorn_mse` improved from `~0.1712` to `~0.1662` (LERP mean `~0.1704`)
+    - `delta>0.5` tail removed: `0/1920`, `max(delta_vs_lerp) ~ +0.38`
+- **Extra diagnostic (optional)**: `--scale_flow_by_conf 1` scales flow by confidence before warping; this also removes the `delta>0.5` tail but needs care during training to avoid trivial `conf -> 0` collapse.
