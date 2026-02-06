@@ -202,7 +202,9 @@ def _compute_teacher_student_cost(
     interior = (t_grid > t0.view(B, 1)) & (t_grid < t1.view(B, 1))  # [B,T]
     mask = interior.view(B, 1, T, 1, 1).to(dtype=diff.dtype)
     diff = diff * mask
-    denom = mask.sum(dim=(1, 2, 3, 4)).clamp_min(1.0) * float(C * H * W)
+    # Important: cost should be additive across segments for DP. We therefore scale with the number
+    # of interior frames instead of averaging it out.
+    denom = float(C * H * W)
     cost = diff.sum(dim=(1, 2, 3, 4)) / denom
     return cost  # [B]
 
@@ -467,6 +469,7 @@ def main() -> None:
                 "stage": "segment_cost_wansynth",
                 "T": int(args.T),
                 "interp_mode": str(args.interp_mode),
+                "cost_mode": "sum_over_interior_frames",
                 "straightener_ckpt": args.straightener_ckpt,
                 "straightener_meta": straightener_meta,
                 "wan_repo": args.wan_repo,
@@ -496,6 +499,7 @@ def main() -> None:
         "stage": "segment_cost_wansynth",
         "T": int(args.T),
         "interp_mode": str(args.interp_mode),
+        "cost_mode": "sum_over_interior_frames",
         "straightener_ckpt": args.straightener_ckpt,
         "straightener_meta": straightener_meta,
         "wan_repo": args.wan_repo,

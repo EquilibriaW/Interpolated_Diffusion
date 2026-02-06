@@ -145,7 +145,7 @@ def _eval(
     t_weights: torch.Tensor,
     N_train: int,
     device: torch.device,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     if not args.val_pattern:
         return float("nan"), float("nan")
     selector_was_training = selector.training
@@ -170,6 +170,7 @@ def _eval(
     k_list = _compute_k_schedule(args.T, args.K_min, args.levels, schedule=str(args.k_schedule), geom_gamma=args.k_geom_gamma)
     K_eval = int(k_list[args.levels])
     overlaps = []
+    overlaps_int = []
     maes = []
     for _ in range(int(args.val_batches)):
         try:
@@ -207,12 +208,22 @@ def _eval(
 
         overlap = (pred_mask & target).float().sum(dim=1) / torch.clamp(target.float().sum(dim=1), min=1.0)
         overlaps.append(overlap.mean().item())
-        mae = torch.mean(torch.abs(pred_full.float().mean(dim=1) - idx.float().mean(dim=1)))
+        # Interior overlap excludes endpoints, which are always included and can hide failures at low-K.
+        t_int = target[:, 1:-1]
+        p_int = pred_mask[:, 1:-1]
+        denom_int = torch.clamp(t_int.float().sum(dim=1), min=1.0)
+        overlaps_int.append(((t_int & p_int).float().sum(dim=1) / denom_int).mean().item())
+
+        # MAE on the sorted index sequences (same K).
+        mae = torch.mean(torch.abs(pred_full.float() - idx.float()))
         maes.append(mae.item())
 
     if selector_was_training:
         selector.train()
-    return float(sum(overlaps) / max(1, len(overlaps))), float(sum(maes) / max(1, len(maes)))
+    overlap = float(sum(overlaps) / max(1, len(overlaps)))
+    overlap_int = float(sum(overlaps_int) / max(1, len(overlaps_int))) if overlaps_int else float("nan")
+    mae = float(sum(maes) / max(1, len(maes)))
+    return overlap, overlap_int, mae
 
 
 def _load_dphi(ckpt: str, *, device: torch.device) -> Tuple[SegmentCostPredictor, dict]:
@@ -419,7 +430,7 @@ def main() -> None:
             writer.add_scalar("train/samples_per_sec", float(B) / max(step_time, 1e-8), step)
 
         if args.val_pattern and args.eval_every > 0 and step > 0 and step % args.eval_every == 0:
-            overlap, mae = _eval(
+            overlap, overlap_int, mae = _eval(
                 selector,
                 dphi,
                 seg_feat_base,
@@ -431,8 +442,13 @@ def main() -> None:
                 device=device,
             )
             writer.add_scalar("val/overlap", overlap, step)
+            writer.add_scalar("val/overlap_int", overlap_int, step)
             writer.add_scalar("val/mae", mae, step)
-            print(f"[VAL step={step}] overlap={overlap:.4f} mae={mae:.3f}", file=sys.stderr, flush=True)
+            print(
+                f"[VAL step={step}] overlap={overlap:.4f} overlap_int={overlap_int:.4f} mae={mae:.3f}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
             ckpt_path = os.path.join(args.ckpt_dir, f"ckpt_{step:07d}.pt")
@@ -496,4 +512,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -199,6 +199,46 @@ Include: date, command or script used, dataset/checkpoint paths, key settings, a
     - interp MSE‑to‑GT ≈ **0.00164**
     - refined MSE‑to‑GT ≈ **0.00143**
 
+## 2026-02-06
+
+### Video (Wan2.1-Synth) Notes
+- Dataset shard subset used for rapid iteration:
+  - Train: `data/wan_synth/.../shard-0000[0-7].tar`
+  - Val: `data/wan_synth/.../shard-0000[8-9].tar`
+- Wan2.1-synth shapes:
+  - Latents: `[B, T=21, C=16, H=60, W=104]` (bf16)
+  - Text embeddings: `[B, L=512, D=4096]` (bf16)
+- `TextConditionEncoder` updated to:
+  - pool over sequence dims (`[B,L,D] -> [B,D]`) for cond-vector models (D_phi/selector),
+  - cast input dtype to match module params (fixes bf16 input vs fp32 weights crash).
+
+### Straightener Status
+- Best straightener so far is the token-grid transformer (~14.35M params):
+  - ckpt: `checkpoints/latent_straightener_toktr_d256_L9_ff1024_b64_10k_l2_v2/ckpt_final.pt`
+
+### Video D_phi (Segment Cost) + Selector (DP Labels)
+- Added video-specific implementations:
+  - D_phi trainer: `src/train/train_segment_cost_wansynth.py` (teacher-student eps MSE on interior frames)
+  - Selector model: `src/models/video_selector.py`
+  - Selector trainer: `src/train/train_video_selector_wansynth.py` (DP labels from D_phi)
+
+- D_phi v1 experiment (cost averaged over interior frames, later identified as non-additive for DP):
+  - ckpt: `checkpoints/segment_cost_wansynth_v1_b8_200/ckpt_final.pt`
+  - val (step=100): `val/loss ~= 0.0743`
+  - Key issue: DP indices were prompt-independent and degenerate; for `K=4`, DP consistently returned `[0, 18, 19, 20]` across shards.
+
+- Selector v1 experiment (trained against DP(D_phi) labels above):
+  - ckpt: `checkpoints/video_selector_wansynth_v1_dphi200/ckpt_final.pt`
+  - Observations:
+    - training loss collapsed to ~0, indicating labels were nearly deterministic/easy,
+    - eval overlap for `K=4` stayed at `0.5` (endpoints only), i.e. no interior match.
+
+- Diagnosis and follow-up:
+  - Segment cost used for DP must be additive across time; averaging over interior frames breaks additivity and encourages boundary-adjacent degeneracies.
+  - Updated cost definition in D_phi training to scale with interior length (sum over interior frames).
+  - Early re-trains with additive cost still produced degenerate DP labels (e.g. `[0, 1, 2, 20]` for `K=4`) and remained essentially prompt-independent.
+  - Conclusion: the current eps-diff target is dominated by gap/time terms (and/or too weakly prompt-dependent) to produce meaningful prompt-adaptive keyframe DP labels; needs a rethink (target definition, features, or training objective) before investing in long D_phi/selector runs.
+
 ## 2026-02-04
 
 ### Decisions / Requests
