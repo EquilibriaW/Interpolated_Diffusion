@@ -84,4 +84,13 @@ class TextConditionEncoder(nn.Module):
         text = cond.get("text_embed")
         if text is None:
             raise ValueError("text_embed missing from cond")
+        # Wan synth stores text embeddings as sequences [B, L, D]. D_phi / selectors expect a single
+        # conditioning vector, so we pool over non-batch, non-feature dims.
+        if text.dim() > 2:
+            pool_dims = tuple(range(1, text.dim() - 1))
+            text = text.mean(dim=pool_dims)
+        # Wan synth stores text embeds in bf16; keep encoder in fp32 by default and cast inputs to match.
+        param_dtype = next(self.proj.parameters()).dtype
+        if text.dtype != param_dtype:
+            text = text.to(dtype=param_dtype)
         return self.proj(text)
