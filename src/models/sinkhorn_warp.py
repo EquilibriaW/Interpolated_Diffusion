@@ -348,7 +348,14 @@ class SinkhornWarpInterpolator(nn.Module):
             theta = torch.full((B,), float(angle), device=f0_score.device, dtype=f0_score.dtype)
             zeros = torch.zeros_like(theta)
             f1_rot = self._apply_se2_per_sample(f1_score.unsqueeze(-1), theta, zeros, zeros).squeeze(-1)
-            dx, dy, peak = self._phasecorr_shift_batch(f0_score, f1_rot, return_peak=True)
+            # Phase correlation returns the shift `s` such that rolling `f1_rot` by `s` aligns it to `f0_score`.
+            # Our SE(2) warp uses the mapping x_in = R x_out + t (grid_sample samples input at that coordinate),
+            # so to apply a roll-shift `s` in output coordinates we need t = -R s.
+            dx_s, dy_s, peak = self._phasecorr_shift_batch(f0_score, f1_rot, return_peak=True)
+            cos_t = torch.cos(theta)
+            sin_t = torch.sin(theta)
+            dx = -(cos_t * dx_s - sin_t * dy_s)
+            dy = -(sin_t * dx_s + cos_t * dy_s)
             better = peak > best_score
             best_score = torch.where(better, peak, best_score)
             best_theta = torch.where(better, theta, best_theta)
