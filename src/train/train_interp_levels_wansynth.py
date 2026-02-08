@@ -22,6 +22,7 @@ from src.utils.device import get_autocast_dtype
 from src.utils.ema import EMA
 from src.utils.seed import set_seed
 from src.utils.logging import create_writer
+from src.utils.frame_features import frame_features_from_mask
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -110,6 +111,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wan_attn", type=str, default="default", choices=["default", "sla", "sagesla"])
     p.add_argument("--sla_topk", type=float, default=0.1)
     p.add_argument("--grad_ckpt", type=int, default=1)
+    p.add_argument("--wan_frame_cond", type=int, default=0)
+    p.add_argument("--wan_frame_cond_hidden", type=int, default=256)
+    p.add_argument("--wan_frame_cond_layers", type=int, default=2)
+    p.add_argument("--wan_frame_cond_dropout", type=float, default=0.0)
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--ckpt_dir", type=str, default="checkpoints/interp_levels_wansynth")
     p.add_argument("--log_dir", type=str, default="runs/interp_levels_wansynth")
@@ -303,6 +308,25 @@ def main() -> None:
             writer.add_scalar("train/lora_linear_layers", len(replaced), 0)
             writer.add_scalar("train/lora_trainable_params", trainable, 0)
 
+    if use_wan and int(args.wan_frame_cond) == 1:
+        from src.models.wan_frame_cond import FrameCondProjector
+
+        # Features include mask geometry plus a couple of scalars so Wan can
+        # distinguish anchors/missing across levels.
+        if args.stage2_mode == "adj":
+            feat_dim = 12  # feat_s(5) + feat_prev(4) + conf_s + conf_prev + level_norm
+        else:
+            feat_dim = 7  # feat_s(5) + conf_s + level_norm
+        text_dim = int(text_embed0.shape[-1])
+        proj_dtype = next(model.parameters()).dtype
+        model.frame_cond_proj = FrameCondProjector(
+            feat_dim=feat_dim,
+            text_dim=text_dim,
+            hidden_dim=int(args.wan_frame_cond_hidden),
+            n_layers=int(args.wan_frame_cond_layers),
+            dropout=float(args.wan_frame_cond_dropout),
+        ).to(device=device, dtype=proj_dtype)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     ema = EMA(model.parameters(), decay=args.ema_decay) if args.ema else None
     model_dtype = getattr(model, "dtype", None)
@@ -446,11 +470,46 @@ def main() -> None:
             weight_mask = conf_s if args.anchor_conf else mask_s
 
         cond = {"text_embed": text_embed}
+        text_embed_cond = text_embed
+        if use_wan and hasattr(model, "frame_cond_proj"):
+            level_norm = (s_idx.float() / float(max(1, args.levels))).view(B, 1, 1).expand(B, T, 1)
+            if args.stage2_mode == "adj":
+                mask_s_f = mask_s.any(dim=2)
+                mask_prev_f = mask_prev.any(dim=2)
+                conf_s_f = conf_s.mean(dim=2)
+                conf_prev_f = conf_prev.mean(dim=2)
+                feat_s = frame_features_from_mask(mask_s_f, include_time=True)
+                feat_prev = frame_features_from_mask(mask_prev_f, include_time=False)
+                frame_feat = torch.cat(
+                    [
+                        feat_s,
+                        feat_prev,
+                        conf_s_f.unsqueeze(-1).to(dtype=feat_s.dtype),
+                        conf_prev_f.unsqueeze(-1).to(dtype=feat_s.dtype),
+                        level_norm.to(dtype=feat_s.dtype),
+                    ],
+                    dim=-1,
+                )
+            else:
+                mask_s_f = mask_s.any(dim=2)
+                conf_s_f = conf_s.mean(dim=2)
+                feat_s = frame_features_from_mask(mask_s_f, include_time=True)
+                frame_feat = torch.cat(
+                    [
+                        feat_s,
+                        conf_s_f.unsqueeze(-1).to(dtype=feat_s.dtype),
+                        level_norm.to(dtype=feat_s.dtype),
+                    ],
+                    dim=-1,
+                )
+            frame_feat = frame_feat.to(device=device, dtype=text_embed.dtype)
+            frame_tokens = model.frame_cond_proj(frame_feat).to(dtype=text_embed.dtype)
+            text_embed_cond = torch.cat([text_embed, frame_tokens], dim=1)
         if use_wan:
             latents_in = unpatchify_tokens(z_s, args.patch_size, spatial_shape)
             latents_in = latents_in.permute(0, 2, 1, 3, 4)
             with torch.cuda.amp.autocast(dtype=autocast_dtype):
-                pred_latents = model(latents_in, s_idx, text_embed).sample
+                pred_latents = model(latents_in, s_idx, text_embed_cond).sample
             pred_latents = pred_latents.permute(0, 2, 1, 3, 4)
             pred_tokens, _ = patchify_latents(pred_latents, args.patch_size)
             diff = (pred_tokens - target).pow(2).sum(dim=-1)
@@ -522,6 +581,11 @@ def main() -> None:
                 "wan_dtype": args.wan_dtype,
                 "wan_attn": args.wan_attn,
                 "sla_topk": float(args.sla_topk),
+                "wan_frame_cond": int(args.wan_frame_cond),
+                "wan_frame_cond_feat_dim": 12 if args.stage2_mode == "adj" else 7,
+                "wan_frame_cond_hidden": int(args.wan_frame_cond_hidden),
+                "wan_frame_cond_layers": int(args.wan_frame_cond_layers),
+                "wan_frame_cond_dropout": float(args.wan_frame_cond_dropout),
                 "video_interp_mode": args.video_interp_mode,
                 "video_interp_ckpt": args.video_interp_ckpt,
                 "flow_interp_ckpt": args.flow_interp_ckpt,
@@ -576,6 +640,11 @@ def main() -> None:
         "wan_dtype": args.wan_dtype,
         "wan_attn": args.wan_attn,
         "sla_topk": float(args.sla_topk),
+        "wan_frame_cond": int(args.wan_frame_cond),
+        "wan_frame_cond_feat_dim": 12 if args.stage2_mode == "adj" else 7,
+        "wan_frame_cond_hidden": int(args.wan_frame_cond_hidden),
+        "wan_frame_cond_layers": int(args.wan_frame_cond_layers),
+        "wan_frame_cond_dropout": float(args.wan_frame_cond_dropout),
         "video_interp_mode": args.video_interp_mode,
         "video_interp_ckpt": args.video_interp_ckpt,
         "flow_interp_ckpt": args.flow_interp_ckpt,

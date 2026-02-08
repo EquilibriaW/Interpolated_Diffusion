@@ -20,6 +20,7 @@ from src.utils.logging import create_writer
 from src.corruptions.keyframes import sample_fixed_k_indices_uniform_batch
 from src.corruptions.video_keyframes import interpolate_video_from_indices
 from src.utils.video_tokens import unpatchify_tokens
+from src.utils.frame_features import frame_features_from_mask
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,6 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wan_attn", type=str, default="default", choices=["default", "sla", "sagesla"])
     p.add_argument("--sla_topk", type=float, default=0.1)
     p.add_argument("--grad_ckpt", type=int, default=1)
+    p.add_argument("--wan_frame_cond", type=int, default=0)
+    p.add_argument("--wan_frame_cond_hidden", type=int, default=256)
+    p.add_argument("--wan_frame_cond_layers", type=int, default=2)
+    p.add_argument("--wan_frame_cond_dropout", type=float, default=0.0)
     p.add_argument("--video_interp_mode", type=str, default="smooth", choices=["linear", "smooth", "flow", "sinkhorn"])
     p.add_argument("--video_interp_smooth_kernel", type=str, default="0.25,0.5,0.25")
     p.add_argument("--flow_interp_ckpt", type=str, default="")
@@ -231,6 +236,20 @@ def main() -> None:
         if replaced:
             writer.add_scalar("train/lora_linear_layers", len(replaced), 0)
             writer.add_scalar("train/lora_trainable_params", trainable, 0)
+
+    if use_wan and int(args.wan_frame_cond) == 1:
+        from src.models.wan_frame_cond import FrameCondProjector
+
+        text_dim = int(text_embed0.shape[-1])
+        feat_dim = 5  # frame_features_from_mask(..., include_time=True)
+        proj_dtype = next(model.parameters()).dtype
+        model.frame_cond_proj = FrameCondProjector(
+            feat_dim=feat_dim,
+            text_dim=text_dim,
+            hidden_dim=int(args.wan_frame_cond_hidden),
+            n_layers=int(args.wan_frame_cond_layers),
+            dropout=float(args.wan_frame_cond_dropout),
+        ).to(device=device, dtype=proj_dtype)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     ema = EMA(model.parameters(), decay=args.ema_decay) if args.ema else None
     model_dtype = getattr(model, "dtype", None)
@@ -287,7 +306,15 @@ def main() -> None:
             if torch.any(drop):
                 text_embed = text_embed.clone()
                 text_embed[drop] = 0.0
-        cond = {"text_embed": text_embed}
+        if use_wan and hasattr(model, "frame_cond_proj"):
+            mask = torch.zeros((B, T), device=device, dtype=torch.bool)
+            mask.scatter_(1, idx, True)
+            frame_feat = frame_features_from_mask(mask, include_time=True).to(device=device, dtype=text_embed.dtype)
+            frame_tokens = model.frame_cond_proj(frame_feat).to(dtype=text_embed.dtype)
+            text_embed_cond = torch.cat([text_embed, frame_tokens], dim=1)
+        else:
+            text_embed_cond = text_embed
+        cond = {"text_embed": text_embed_cond}
 
         model.train()
         if use_wan:
@@ -318,7 +345,7 @@ def main() -> None:
                 latents_t = unpatchify_tokens(z_interp, args.patch_size, spatial_shape)
                 latents_t = latents_t.permute(0, 2, 1, 3, 4)
             with torch.cuda.amp.autocast(dtype=autocast_dtype):
-                pred_latents = model(latents_t, t, text_embed).sample
+                pred_latents = model(latents_t, t, text_embed_cond).sample
             pred_latents = pred_latents.permute(0, 2, 1, 3, 4)
             pred_tokens, _ = patchify_latents(pred_latents, args.patch_size)
             pred_key = pred_tokens.gather(1, idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D))
@@ -372,6 +399,11 @@ def main() -> None:
                 "wan_dtype": args.wan_dtype,
                 "wan_attn": args.wan_attn,
                 "sla_topk": float(args.sla_topk),
+                "wan_frame_cond": int(args.wan_frame_cond),
+                "wan_frame_cond_feat_dim": 5,
+                "wan_frame_cond_hidden": int(args.wan_frame_cond_hidden),
+                "wan_frame_cond_layers": int(args.wan_frame_cond_layers),
+                "wan_frame_cond_dropout": float(args.wan_frame_cond_dropout),
                 "video_interp_mode": args.video_interp_mode,
                 "flow_interp_ckpt": args.flow_interp_ckpt,
                 "sinkhorn_win": args.sinkhorn_win,
@@ -419,6 +451,11 @@ def main() -> None:
         "wan_dtype": args.wan_dtype,
         "wan_attn": args.wan_attn,
         "sla_topk": float(args.sla_topk),
+        "wan_frame_cond": int(args.wan_frame_cond),
+        "wan_frame_cond_feat_dim": 5,
+        "wan_frame_cond_hidden": int(args.wan_frame_cond_hidden),
+        "wan_frame_cond_layers": int(args.wan_frame_cond_layers),
+        "wan_frame_cond_dropout": float(args.wan_frame_cond_dropout),
         "video_interp_mode": args.video_interp_mode,
         "flow_interp_ckpt": args.flow_interp_ckpt,
         "sinkhorn_win": args.sinkhorn_win,

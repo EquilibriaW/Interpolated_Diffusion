@@ -16,6 +16,7 @@ from src.corruptions.video_keyframes import interpolate_video_from_indices
 from src.utils.video_tokens import unpatchify_tokens
 from src.utils.video_tokens import patchify_latents
 from src.utils.device import get_autocast_dtype
+from src.utils.frame_features import frame_features_from_mask
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -133,6 +134,13 @@ def _sample_keypoints_ddim_wan(
     n_train = schedule["alpha_bar"].shape[0]
     times = _timesteps(n_train, steps, schedule=schedule_name)
     model_dtype = getattr(model, "dtype", next(model.parameters()).dtype)
+    text_embed_cond = text_embed.to(dtype=model_dtype)
+    if hasattr(model, "frame_cond_proj"):
+        mask = torch.zeros((B, T), device=device, dtype=torch.bool)
+        mask.scatter_(1, idx, True)
+        frame_feat = frame_features_from_mask(mask, include_time=True).to(device=device, dtype=text_embed_cond.dtype)
+        frame_tokens = model.frame_cond_proj(frame_feat).to(dtype=text_embed_cond.dtype)
+        text_embed_cond = torch.cat([text_embed_cond, frame_tokens], dim=1)
     z = torch.randn((B, K, N, D), device=device, dtype=model_dtype)
     for i in range(len(times) - 1):
         t = torch.full((B,), int(times[i]), device=device, dtype=torch.long)
@@ -162,9 +170,8 @@ def _sample_keypoints_ddim_wan(
             latents_t = unpatchify_tokens(z_interp, patch_size, spatial_shape)
         latents_t = latents_t.permute(0, 2, 1, 3, 4)
         latents_t = latents_t.to(dtype=model_dtype)
-        text_embed = text_embed.to(dtype=model_dtype)
         with torch.no_grad():
-            pred_latents = model(latents_t, t, text_embed).sample
+            pred_latents = model(latents_t, t, text_embed_cond).sample
         pred_latents = pred_latents.permute(0, 2, 1, 3, 4)
         pred_tokens, _ = patchify_latents(pred_latents, patch_size)
         pred_key = pred_tokens.gather(1, idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D))
@@ -342,6 +349,23 @@ def main() -> None:
                         attention_type=str(args.wan_attn),
                         use_bf16=use_bf16,
                     )
+
+                if args.use_wan and int(meta.get("wan_frame_cond", 0)) == 1:
+                    from src.models.wan_frame_cond import FrameCondProjector
+
+                    feat_dim = int(meta.get("wan_frame_cond_feat_dim", 5))
+                    text_dim = int(meta.get("text_dim", text_dim))
+                    hidden = int(meta.get("wan_frame_cond_hidden", 256))
+                    n_layers = int(meta.get("wan_frame_cond_layers", 2))
+                    dropout = float(meta.get("wan_frame_cond_dropout", 0.0))
+                    proj_dtype = next(model.parameters()).dtype
+                    model.frame_cond_proj = FrameCondProjector(
+                        feat_dim=feat_dim,
+                        text_dim=text_dim,
+                        hidden_dim=hidden,
+                        n_layers=n_layers,
+                        dropout=dropout,
+                    ).to(device=device, dtype=proj_dtype)
 
                 missing, unexpected = model.load_state_dict(state, strict=False)
                 if has_sla_state:
