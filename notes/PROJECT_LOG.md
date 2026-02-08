@@ -240,6 +240,29 @@ Include: date, command or script used, dataset/checkpoint paths, key settings, a
   - Conclusion: the current eps-diff target is dominated by gap/time terms (and/or too weakly prompt-dependent) to produce meaningful prompt-adaptive keyframe DP labels; needs a rethink (target definition, features, or training objective) before investing in long D_phi/selector runs.
   - Added `--target_mode {teacher_eps,latent_mse}` to allow a cheap latent-space target; initial latent-MSE run still produced near-degenerate DP paths (mostly `[0, 13/14, 19, 20]` for `K=4`), indicating weak prompt dependence even for direct interpolation error.
 
+## 2026-02-08
+
+### Oracle DP Investigation (Wan2.1-synth)
+- **Motivation**: verify whether DP-optimal keyframes vary across samples/prompts when using an *oracle* cost (computed from real latents), before blaming D_phi/selector training.
+- **Code**:
+  - `src/selection/oracle_segment_cost.py`: exact interior-frame oracle segment cost for all (i,j), additive for DP.
+  - `scripts/diagnose_oracle_dp_wansynth.py`: compute oracle cost-matrix, run DP, and report sequence diversity + repeat-prompt stats.
+  - `src/train/train_video_selector_wansynth.py`: added `--label_mode {dphi,oracle_z_mse,oracle_s_mse}` to train selector from oracle DP labels for debugging identifiability.
+
+### Findings (val shards `shard-0000[8-9].tar`, K=4)
+- Oracle DP schedules are **not constant** across samples, but are **deterministic within repeated prompts** in sampled batches.
+  - Oracle `z_mse` (raw latent LERP error): ~`57` unique sequences out of `800` samples (top mode `[0,3,12,20]`).
+  - Oracle `s_mse` (straightener.encode space): ~`81` unique sequences out of `800` samples (top modes around `[0,6/7,13/14,20]`).
+- A simple **fixed schedule** is already a strong baseline under oracle `z_mse`:
+  - Always selecting `[0,3,12,20]` gives `overlap_int ≈ 0.348` vs oracle DP labels on the val subset (significantly above random for 2 interior picks).
+
+### Selector From Oracle Labels (Generalization Test)
+- Trained `VideoKeyframeSelector` using oracle DP labels (no D_phi), and evaluated on val:
+  - Multi-K (levels=6) run reached `val/overlap_int ≈ 0.041` at step 400 (worse than the fixed-schedule baseline).
+  - Fixed-K=4 (levels=1, `--use_level 0`) reached `val/overlap_int ≈ 0.112` at step 200 and `≈ 0.096` at step 400 (near random; still far below the fixed `[0,3,12,20]` baseline).
+- Interpretation: prompt-only selector training appears to **overfit** and **does not generalize** well; the mapping from text embeddings to DP-optimal indices is not reliably learnable under this oracle target on held-out shards.
+  - This supports the earlier suspicion that prompt-conditioned D_phi/selector is fundamentally limited unless we provide additional inference-time signals beyond the prompt (e.g., anchors/preview/content features), or accept a fixed schedule.
+
 ## 2026-02-04
 
 ### Decisions / Requests
