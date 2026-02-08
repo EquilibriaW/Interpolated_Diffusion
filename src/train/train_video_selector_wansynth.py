@@ -11,8 +11,10 @@ from tqdm import tqdm
 from src.corruptions.keyframes import _compute_k_schedule
 from src.data.wan_synth import create_wan_synth_dataloader
 from src.models.encoders import TextConditionEncoder
+from src.models.latent_straightener import load_latent_straightener
 from src.models.segment_cost import SegmentCostPredictor
 from src.models.video_selector import VideoKeyframeSelector
+from src.models.wan_backbone import resolve_dtype
 from src.selection.epiplexity_dp import (
     build_cost_matrix_from_segments_batch,
     build_segment_features,
@@ -21,6 +23,7 @@ from src.selection.epiplexity_dp import (
     dp_select_indices_batch,
     sample_timesteps_log_snr,
 )
+from src.selection.oracle_segment_cost import build_oracle_seg_precompute, compute_oracle_cost_seg_mse
 from src.utils.checkpoint import load_checkpoint, save_checkpoint
 from src.utils.device import get_device
 from src.utils.logging import create_writer
@@ -40,8 +43,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch", type=int, default=128)
     p.add_argument("--seed", type=int, default=0)
 
-    # D_phi checkpoint (for DP labels).
-    p.add_argument("--dphi_ckpt", type=str, required=True)
+    # Label mode (DP supervision).
+    p.add_argument(
+        "--label_mode",
+        type=str,
+        default="dphi",
+        choices=["dphi", "oracle_z_mse", "oracle_s_mse"],
+        help="How to generate DP labels. dphi integrates a learned SegmentCostPredictor over noise steps. "
+        "oracle_* builds an oracle cost matrix directly from latents (linear interpolation error).",
+    )
+
+    # D_phi checkpoint (for DP labels when label_mode=dphi).
+    p.add_argument("--dphi_ckpt", type=str, default="")
 
     # Cost integration over noise steps (defaults to match D_phi meta if present).
     p.add_argument("--schedule", type=str, default="")
@@ -50,6 +63,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--snr_max", type=float, default=0.0)
     p.add_argument("--snr_gamma", type=float, default=0.0)
     p.add_argument("--t_steps", type=int, default=0)
+
+    # Oracle label config.
+    p.add_argument("--oracle_chunk_segments", type=int, default=16)
+    p.add_argument("--model_dtype", type=str, default="bf16")
+    p.add_argument("--straightener_ckpt", type=str, default="")
+    p.add_argument("--straightener_dtype", type=str, default="")
 
     # Selector model.
     p.add_argument("--d_model", type=int, default=256)
@@ -136,9 +155,11 @@ def _integrated_cost_matrix(
 @torch.no_grad()
 def _eval(
     selector: torch.nn.Module,
-    dphi: torch.nn.Module,
-    seg_feat_base: torch.Tensor,
+    dphi: torch.nn.Module | None,
+    seg_feat_base: torch.Tensor | None,
     precomp,
+    oracle_precomp,
+    straightener: torch.nn.Module | None,
     args,
     *,
     t_idx: torch.Tensor,
@@ -147,7 +168,7 @@ def _eval(
     device: torch.device,
 ) -> Tuple[float, float, float]:
     if not args.val_pattern:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan")
     selector_was_training = selector.training
     selector.eval()
     loader = create_wan_synth_dataloader(
@@ -179,15 +200,41 @@ def _eval(
             it = iter(loader)
             batch = next(it)
         text = batch["text_embed"].to(device, non_blocking=True)
-        cond = {"text_embed": text}
         if bool(args.use_level):
             if args.level_mode == "s_norm":
                 level_val = torch.full((text.shape[0], 1), float(args.levels) / float(max(1, args.levels)), device=device)
             else:
                 level_val = torch.full((text.shape[0], 1), float(K_eval) / float(max(1, args.T - 1)), device=device)
-            cond["level"] = level_val
+            cond = {"text_embed": text, "level": level_val}
+        else:
+            cond = {"text_embed": text}
 
-        C = _integrated_cost_matrix(dphi, cond={"text_embed": text}, seg_feat_base=seg_feat_base, precomp=precomp, t_idx=t_idx, t_weights=t_weights, N_train=N_train)
+        if str(args.label_mode) == "dphi":
+            if dphi is None or seg_feat_base is None:
+                raise RuntimeError("label_mode=dphi requires dphi and seg_feat_base")
+            C = _integrated_cost_matrix(
+                dphi,
+                cond={"text_embed": text},
+                seg_feat_base=seg_feat_base,
+                precomp=precomp,
+                t_idx=t_idx,
+                t_weights=t_weights,
+                N_train=N_train,
+            )
+        else:
+            model_dtype = resolve_dtype(args.model_dtype) or torch.bfloat16
+            latents = batch["latents"].to(device, non_blocking=True, dtype=model_dtype)
+            x = latents
+            if str(args.label_mode) == "oracle_s_mse":
+                if straightener is None:
+                    raise RuntimeError("label_mode=oracle_s_mse requires a straightener")
+                B0, T0, C0, H0, W0 = latents.shape
+                flat = latents.reshape(B0 * T0, C0, H0, W0)
+                with torch.no_grad():
+                    s_flat = straightener.encode(flat)
+                x = s_flat.reshape(B0, T0, C0, H0, W0).to(dtype=model_dtype)
+            cost_seg = compute_oracle_cost_seg_mse(x, oracle_precomp, chunk_segments=int(args.oracle_chunk_segments))
+            C = build_cost_matrix_from_segments_batch(cost_seg, precomp=oracle_precomp, T=int(args.T))  # type: ignore[arg-type]
         idx = dp_select_indices_batch(C, K_eval)  # [B,K]
         target = torch.zeros((text.shape[0], args.T), device=device, dtype=torch.bool)
         target.scatter_(1, idx, True)
@@ -288,7 +335,12 @@ def main() -> None:
     if int(batch0["latents"].shape[1]) != int(args.T):
         raise ValueError(f"T mismatch: batch={batch0['latents'].shape[1]} args={args.T}")
 
-    dphi, meta_dphi = _load_dphi(args.dphi_ckpt, device=device)
+    dphi = None
+    meta_dphi = {}
+    if str(args.label_mode) == "dphi":
+        if not args.dphi_ckpt:
+            raise ValueError("label_mode=dphi requires --dphi_ckpt")
+        dphi, meta_dphi = _load_dphi(args.dphi_ckpt, device=device)
 
     # Determine integration timesteps/weights (match D_phi meta by default).
     schedule = str(meta_dphi.get("schedule", "cosine"))
@@ -309,13 +361,29 @@ def main() -> None:
         snr_gamma = float(args.snr_gamma)
     if args.t_steps:
         t_steps = int(args.t_steps)
-    snr, weights = build_snr_weights(schedule, N_train, snr_min, snr_max, snr_gamma)
-    t_idx = sample_timesteps_log_snr(snr.to(device), t_steps).to(device)
-    t_weights = weights.to(device)[t_idx].float()
+    if str(args.label_mode) == "dphi":
+        snr, weights = build_snr_weights(schedule, N_train, snr_min, snr_max, snr_gamma)
+        t_idx = sample_timesteps_log_snr(snr.to(device), t_steps).to(device)
+        t_weights = weights.to(device)[t_idx].float()
+    else:
+        # Dummy tensors (unused).
+        t_idx = torch.tensor([0], device=device, dtype=torch.long)
+        t_weights = torch.tensor([1.0], device=device, dtype=torch.float32)
 
     # Segment precompute for all (i,j).
     precomp = build_segment_precompute(int(args.T), samples_per_seg=1, device=device)
     seg_feat_base = build_segment_features(int(args.T), precomp.seg_i, precomp.seg_j).to(device=device, dtype=torch.float32)
+    oracle_precomp = build_oracle_seg_precompute(int(args.T), device=device)
+
+    # Optional straightener for oracle_s_mse labels.
+    straightener = None
+    if str(args.label_mode) == "oracle_s_mse":
+        if not args.straightener_ckpt:
+            raise ValueError("label_mode=oracle_s_mse requires --straightener_ckpt")
+        model_dtype = resolve_dtype(args.model_dtype) or torch.bfloat16
+        s_dtype = resolve_dtype(args.straightener_dtype) or model_dtype
+        straightener, _ = load_latent_straightener(args.straightener_ckpt, device=device, dtype=s_dtype)
+        straightener.eval()
 
     selector = VideoKeyframeSelector(
         T=int(args.T),
@@ -362,15 +430,30 @@ def main() -> None:
         s_idx = torch.randint(1, int(args.levels) + 1, (B,), generator=gen, device=device)
         K_s = k_list_t[s_idx]
 
-        C = _integrated_cost_matrix(
-            dphi,
-            cond=cond_text,
-            seg_feat_base=seg_feat_base,
-            precomp=precomp,
-            t_idx=t_idx,
-            t_weights=t_weights,
-            N_train=N_train,
-        )
+        if str(args.label_mode) == "dphi":
+            assert dphi is not None
+            C = _integrated_cost_matrix(
+                dphi,
+                cond=cond_text,
+                seg_feat_base=seg_feat_base,
+                precomp=precomp,
+                t_idx=t_idx,
+                t_weights=t_weights,
+                N_train=N_train,
+            )
+        else:
+            model_dtype = resolve_dtype(args.model_dtype) or torch.bfloat16
+            latents = batch["latents"].to(device, non_blocking=True, dtype=model_dtype)
+            x = latents
+            if str(args.label_mode) == "oracle_s_mse":
+                assert straightener is not None
+                B0, T0, C0, H0, W0 = latents.shape
+                flat = latents.reshape(B0 * T0, C0, H0, W0)
+                with torch.no_grad():
+                    s_flat = straightener.encode(flat)
+                x = s_flat.reshape(B0, T0, C0, H0, W0).to(dtype=model_dtype)
+            cost_seg = compute_oracle_cost_seg_mse(x, oracle_precomp, chunk_segments=int(args.oracle_chunk_segments))
+            C = build_cost_matrix_from_segments_batch(cost_seg, precomp=oracle_precomp, T=int(args.T))  # type: ignore[arg-type]
 
         # DP per-sample with varying K is awkward; group by unique K values.
         target = torch.zeros((B, int(args.T)), device=device, dtype=torch.float32)
@@ -433,8 +516,10 @@ def main() -> None:
             overlap, overlap_int, mae = _eval(
                 selector,
                 dphi,
-                seg_feat_base,
+                seg_feat_base if str(args.label_mode) == "dphi" else None,
                 precomp,
+                oracle_precomp,
+                straightener,
                 args,
                 t_idx=t_idx,
                 t_weights=t_weights,
