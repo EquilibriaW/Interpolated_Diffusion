@@ -96,6 +96,14 @@ COMMON_ARGS=(
 MID_CMD=(python -u -m src.train.train_keypoints_wansynth "${COMMON_ARGS[@]}" --phase1_input_mode short_midpoints --ckpt_dir "${MID_CKPT}" --log_dir "${MID_RUN}")
 MP_CMD=(python -u -m src.train.train_keypoints_wansynth "${COMMON_ARGS[@]}" --phase1_input_mode short_meanpool --ckpt_dir "${MP_CKPT}" --log_dir "${MP_RUN}")
 
+quote_cmd() {
+  # Print a shell-escaped command line so patterns like shard-0000[0-7].tar are not glob-expanded.
+  printf '%q ' "$@"
+}
+
+MID_CMD_STR="$(quote_cmd "${MID_CMD[@]}")"
+MP_CMD_STR="$(quote_cmd "${MP_CMD[@]}")"
+
 tmux new-session -d -s "${SESSION}" -c "${ROOT_DIR}" "bash -lc '
 set -euo pipefail
 echo \"[phase1_cmp] tag=${TAG}\"
@@ -103,10 +111,10 @@ echo \"[phase1_cmp] midpoints -> ${MID_RUN}\"
 echo \"[phase1_cmp] meanpool  -> ${MP_RUN}\"
 
 echo \"[phase1_cmp] starting midpoints...\"
-${MID_CMD[*]} |& tee \"${MID_LOG}\"
+${MID_CMD_STR} |& tee \"${MID_LOG}\"
 
 echo \"[phase1_cmp] starting meanpool...\"
-${MP_CMD[*]} |& tee \"${MP_LOG}\"
+${MP_CMD_STR} |& tee \"${MP_LOG}\"
 
 echo \"[phase1_cmp] DONE\"
 exec bash
@@ -126,4 +134,3 @@ echo "Started tmux session: ${SESSION}"
 echo "Attach: tmux attach -t ${SESSION}"
 echo "Midpoints log: ${MID_LOG}"
 echo "Meanpool  log: ${MP_LOG}"
-

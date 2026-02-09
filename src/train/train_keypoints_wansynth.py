@@ -323,7 +323,12 @@ def main() -> None:
 
         text_dim = int(text_embed0.shape[-1])
         feat_dim = 5  # frame_features_from_mask(..., include_time=True)
-        proj_dtype = next(model.parameters()).dtype
+        # Diffusers models may keep some params in fp32 even when loaded in bf16/fp16.
+        # `model.dtype` returns the "effective" dtype (skipping keep-in-fp32 modules), which
+        # matches our runtime casting of `text_embed`/`latents`.
+        proj_dtype = getattr(model, "dtype", None)
+        if proj_dtype is None:
+            proj_dtype = next(model.parameters()).dtype
         model.frame_cond_proj = FrameCondProjector(
             feat_dim=feat_dim,
             text_dim=text_dim,

@@ -413,7 +413,10 @@ def main() -> None:
                     hidden = int(meta.get("wan_frame_cond_hidden", 256))
                     n_layers = int(meta.get("wan_frame_cond_layers", 2))
                     dropout = float(meta.get("wan_frame_cond_dropout", 0.0))
-                    proj_dtype = next(model.parameters()).dtype
+                    # Diffusers models may keep some params in fp32 even when loaded in bf16/fp16.
+                    proj_dtype = getattr(model, "dtype", None)
+                    if proj_dtype is None:
+                        proj_dtype = next(model.parameters()).dtype
                     model.frame_cond_proj = FrameCondProjector(
                         feat_dim=feat_dim,
                         text_dim=text_dim,

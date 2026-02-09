@@ -326,7 +326,10 @@ def main() -> None:
         else:
             feat_dim = 7  # feat_s(5) + conf_s + level_norm
         text_dim = int(text_embed0.shape[-1])
-        proj_dtype = next(model.parameters()).dtype
+        # See train_keypoints_wansynth.py: diffusers models may keep some params in fp32.
+        proj_dtype = getattr(model, "dtype", None)
+        if proj_dtype is None:
+            proj_dtype = next(model.parameters()).dtype
         model.frame_cond_proj = FrameCondProjector(
             feat_dim=feat_dim,
             text_dim=text_dim,
