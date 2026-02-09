@@ -33,11 +33,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--phase1_input_mode",
         type=str,
         default="full",
-        choices=["full", "short_anchors", "short_midpoints"],
+        choices=["full", "short_anchors", "short_midpoints", "short_meanpool"],
         help="How to run Phase-1 when use_wan=1. "
         "'full' = run Wan on length-T sequence with interpolated missing frames (current behavior). "
         "'short_anchors' = run Wan on length-K anchors only. "
-        "'short_midpoints' = run Wan on length-(2K-1) anchors+midpoints, then discard midpoints downstream.",
+        "'short_midpoints' = run Wan on length-(2K-1) anchors+midpoints, then discard midpoints downstream. "
+        "'short_meanpool' = run Wan on length-(2K-1) anchors+pooled segment summaries (mean of in-between frames).",
     )
     p.add_argument("--steps", type=int, default=20000)
     p.add_argument("--batch", type=int, default=8)
@@ -140,6 +141,31 @@ def _midpoint_indices(idx_base: torch.Tensor) -> torch.Tensor:
     mid = (left + right) // 2
     mid = torch.minimum(torch.maximum(mid, left + 1), right - 1)
     return mid
+
+
+def _meanpool_between_anchors(tokens: torch.Tensor, idx_base: torch.Tensor) -> torch.Tensor:
+    # tokens: [B,T,N,D], idx_base: [B,K] sorted
+    if tokens.dim() != 4:
+        raise ValueError("tokens must be [B,T,N,D]")
+    if idx_base.dim() != 2:
+        raise ValueError("idx_base must be [B,K]")
+    B, T, N, D = tokens.shape
+    left = idx_base[:, :-1]
+    right = idx_base[:, 1:]
+    gap = right - left
+    if torch.any(gap < 2):
+        raise ValueError("meanpool requires all anchor gaps >= 2; reduce K or use short_anchors/full")
+    # Sum over (left+1 .. right-1) inclusive using prefix sums: sum = csum[right-1] - csum[left]
+    tokens_f = tokens.float()
+    csum = tokens_f.cumsum(dim=1)
+    idx_r = (right - 1).clamp(0, T - 1)
+    gather_shape = (B, idx_r.shape[1], N, D)
+    sum_r = csum.gather(1, idx_r.unsqueeze(-1).unsqueeze(-1).expand(gather_shape))
+    sum_l = csum.gather(1, left.unsqueeze(-1).unsqueeze(-1).expand(gather_shape))
+    seg_sum = sum_r - sum_l
+    count = (gap - 1).clamp(min=1).to(dtype=seg_sum.dtype).view(B, -1, 1, 1)
+    seg_mean = seg_sum / count
+    return seg_mean.to(dtype=tokens.dtype)
 
 
 def main() -> None:
@@ -247,6 +273,10 @@ def main() -> None:
         model = load_wan_transformer(
             args.wan_repo, subfolder=args.wan_subfolder, torch_dtype=wan_dtype, device=device
         )
+        # Patch Wan RoPE to support absolute-time indices for short temporal inputs.
+        from src.models.wan_abs_rope import enable_wan_absolute_time_rope
+
+        enable_wan_absolute_time_rope(model)
         if int(args.grad_ckpt) == 1 and hasattr(model, "enable_gradient_checkpointing"):
             model.enable_gradient_checkpointing()
         if args.wan_attn != "default":
@@ -356,11 +386,20 @@ def main() -> None:
             idx_mid = _midpoint_indices(idx_base)
             idx_in = torch.cat([idx_base, idx_mid], dim=1)
             idx_in = torch.sort(idx_in, dim=1).values
+        elif args.phase1_input_mode == "short_meanpool":
+            idx_mid = _midpoint_indices(idx_base)
+            idx_in = torch.cat([idx_base, idx_mid], dim=1)
+            idx_in = torch.sort(idx_in, dim=1).values
         elif args.phase1_input_mode == "short_anchors":
             idx_in = idx_base
         else:
             idx_in = idx_base
         z0_in = tokens.gather(1, idx_in.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D)).clone()
+        if args.phase1_input_mode == "short_meanpool":
+            # Replace midpoint slots with pooled segment summaries (mean of in-between frames).
+            pooled = _meanpool_between_anchors(tokens, idx_base)  # [B,K-1,N,D]
+            pos_mid = torch.searchsorted(idx_in.contiguous(), idx_mid.contiguous())
+            z0_in.scatter_(1, pos_mid.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D), pooled)
 
         t = torch.randint(0, args.N_train, (B,), generator=gen, device=device, dtype=torch.long)
         eps = torch.randn_like(z0_in)
@@ -392,6 +431,13 @@ def main() -> None:
 
         model.train()
         if use_wan:
+            from src.models.wan_abs_rope import set_wan_frame_indices
+
+            if args.phase1_input_mode == "full":
+                set_wan_frame_indices(model, None)
+            else:
+                # Absolute-time RoPE: pass the true frame indices for each slot in the short sequence.
+                set_wan_frame_indices(model, idx_in)
             if args.phase1_input_mode == "full":
                 if args.video_interp_mode in ("flow", "sinkhorn"):
                     warper = flow_warper if args.video_interp_mode == "flow" else sinkhorn_warper

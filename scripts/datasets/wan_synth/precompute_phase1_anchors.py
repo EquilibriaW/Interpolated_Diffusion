@@ -144,9 +144,11 @@ def _sample_keypoints_ddim_wan(
     if B2 != B or T2 != T:
         raise ValueError("tokens shape mismatch for wan sampling")
     phase1_input_mode = str(phase1_input_mode)
-    if phase1_input_mode not in ("full", "short_anchors", "short_midpoints"):
-        raise ValueError(f"phase1_input_mode must be full/short_anchors/short_midpoints, got {phase1_input_mode}")
-    if phase1_input_mode == "short_midpoints":
+    if phase1_input_mode not in ("full", "short_anchors", "short_midpoints", "short_meanpool"):
+        raise ValueError(
+            f"phase1_input_mode must be full/short_anchors/short_midpoints/short_meanpool, got {phase1_input_mode}"
+        )
+    if phase1_input_mode in ("short_midpoints", "short_meanpool"):
         idx_mid = _midpoint_indices(idx_base)
         idx_in = torch.cat([idx_base, idx_mid], dim=1)
         idx_in = torch.sort(idx_in, dim=1).values
@@ -201,6 +203,12 @@ def _sample_keypoints_ddim_wan(
             latents_in = unpatchify_tokens(z, patch_size, spatial_shape)  # [B,L,C,H,W]
             latents_t = latents_in.permute(0, 2, 1, 3, 4)  # [B,C,L,H,W]
         latents_t = latents_t.to(dtype=model_dtype)
+        from src.models.wan_abs_rope import set_wan_frame_indices
+
+        if phase1_input_mode == "full":
+            set_wan_frame_indices(model, None)
+        else:
+            set_wan_frame_indices(model, idx_in)
         with torch.no_grad():
             pred_latents = model(latents_t, t, text_embed_cond).sample
         pred_latents = pred_latents.permute(0, 2, 1, 3, 4)
@@ -210,11 +218,11 @@ def _sample_keypoints_ddim_wan(
         else:
             pred = pred_tokens
         z = ddim_step(z, pred, t, t_prev, schedule, eta=0.0)
-    if phase1_input_mode == "short_midpoints":
+    if phase1_input_mode in ("short_midpoints", "short_meanpool"):
         pos = torch.searchsorted(idx_in.contiguous(), idx_base.contiguous())
         check = idx_in.gather(1, pos).eq(idx_base)
         if not bool(check.all()):
-            raise RuntimeError("idx_base not found in idx_in for short_midpoints")
+            raise RuntimeError("idx_base not found in idx_in for short_midpoints/short_meanpool")
         z = z.gather(1, pos.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D))
     return z
 
