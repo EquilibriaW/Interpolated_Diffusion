@@ -23,6 +23,7 @@ from src.utils.ema import EMA
 from src.utils.seed import set_seed
 from src.utils.logging import create_writer
 from src.utils.frame_features import frame_features_from_mask
+from src.utils.optim import create_optimizer
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"])
+    p.add_argument("--muon_momentum", type=float, default=0.95)
+    p.add_argument("--muon_nesterov", type=int, default=0)
     p.add_argument("--ema", type=int, default=1)
     p.add_argument("--ema_decay", type=float, default=0.999)
     p.add_argument("--d_model", type=int, default=512)
@@ -338,7 +342,14 @@ def main() -> None:
             dropout=float(args.wan_frame_cond_dropout),
         ).to(device=device, dtype=proj_dtype)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = create_optimizer(
+        args.optimizer,
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        muon_momentum=float(args.muon_momentum),
+        muon_nesterov=bool(int(args.muon_nesterov)),
+    )
     ema = EMA(model.parameters(), decay=args.ema_decay) if args.ema else None
     model_dtype = getattr(model, "dtype", None)
 
@@ -580,6 +591,11 @@ def main() -> None:
                 "mask_channels": mask_channels,
                 "k_schedule": args.k_schedule,
                 "k_geom_gamma": args.k_geom_gamma,
+                "optimizer": str(args.optimizer),
+                "lr": float(args.lr),
+                "weight_decay": float(args.weight_decay),
+                "muon_momentum": float(args.muon_momentum),
+                "muon_nesterov": int(args.muon_nesterov),
                 "text_dim": int(text_embed.shape[-1]),
                 "d_model": args.d_model,
                 "n_layers": args.n_layers,
@@ -641,6 +657,11 @@ def main() -> None:
             "mask_channels": mask_channels,
             "k_schedule": args.k_schedule,
             "k_geom_gamma": args.k_geom_gamma,
+            "optimizer": str(args.optimizer),
+            "lr": float(args.lr),
+            "weight_decay": float(args.weight_decay),
+            "muon_momentum": float(args.muon_momentum),
+            "muon_nesterov": int(args.muon_nesterov),
             "text_dim": int(text_embed.shape[-1]),
             "d_model": args.d_model,
             "n_layers": args.n_layers,
