@@ -119,6 +119,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ckpt_dir", type=str, default="checkpoints/interp_levels_wansynth")
     p.add_argument("--log_dir", type=str, default="runs/interp_levels_wansynth")
     p.add_argument("--save_every", type=int, default=2000)
+    p.add_argument(
+        "--save_optimizer",
+        type=int,
+        default=0,
+        help="Whether to include optimizer state in checkpoints. "
+        "For Wan-scale models this can create very large checkpoints and spike CPU RAM.",
+    )
+    p.add_argument("--save_final", type=int, default=1)
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--shuffle_buffer", type=int, default=200)
@@ -614,66 +622,68 @@ def main() -> None:
                 "lora_dropout": float(args.lora_dropout),
                 "lora_targets": str(args.lora_targets),
             }
-            save_checkpoint(ckpt_path, model, optimizer, step, ema, meta=meta)
+            # NOTE: optimizer state can be huge for Wan-scale models; default is model-only.
+            save_checkpoint(ckpt_path, model, optimizer, step, ema, meta=meta, save_optimizer=bool(args.save_optimizer))
 
-    final_path = os.path.join(args.ckpt_dir, "ckpt_final.pt")
-    meta = {
-        "stage": "interp_levels_wansynth",
-        "T": args.T,
-        "K_min": args.K_min,
-        "levels": args.levels,
-        "data_dim": D,
-        "patch_size": args.patch_size,
-        "stage2_mode": args.stage2_mode,
-        "mask_channels": mask_channels,
-        "k_schedule": args.k_schedule,
-        "k_geom_gamma": args.k_geom_gamma,
-        "text_dim": int(text_embed.shape[-1]),
-        "d_model": args.d_model,
-        "n_layers": args.n_layers,
-        "n_heads": args.n_heads,
-        "d_ff": args.d_ff,
-        "d_cond": args.d_cond,
-        "use_wan": bool(args.use_wan),
-        "wan_repo": args.wan_repo,
-        "wan_subfolder": args.wan_subfolder,
-        "wan_dtype": args.wan_dtype,
-        "wan_attn": args.wan_attn,
-        "sla_topk": float(args.sla_topk),
-        "wan_frame_cond": int(args.wan_frame_cond),
-        "wan_frame_cond_feat_dim": 12 if args.stage2_mode == "adj" else 7,
-        "wan_frame_cond_hidden": int(args.wan_frame_cond_hidden),
-        "wan_frame_cond_layers": int(args.wan_frame_cond_layers),
-        "wan_frame_cond_dropout": float(args.wan_frame_cond_dropout),
-        "video_interp_mode": args.video_interp_mode,
-        "video_interp_ckpt": args.video_interp_ckpt,
-        "flow_interp_ckpt": args.flow_interp_ckpt,
-        "sinkhorn_win": args.sinkhorn_win,
-        "sinkhorn_stride": int(args.sinkhorn_stride),
-        "sinkhorn_angles": sinkhorn_angles_str,
-        "sinkhorn_shift": args.sinkhorn_shift,
-        "sinkhorn_global_mode": args.sinkhorn_global_mode,
-        "sinkhorn_phasecorr_mode": str(args.sinkhorn_phasecorr_mode),
-        "sinkhorn_phasecorr_level": str(args.sinkhorn_phasecorr_level),
-        "sinkhorn_warp_space": args.sinkhorn_warp_space,
-        "sinkhorn_iters": args.sinkhorn_iters,
-        "sinkhorn_tau": args.sinkhorn_tau,
-        "sinkhorn_dustbin": args.sinkhorn_dustbin,
-        "sinkhorn_spatial_gamma": float(args.sinkhorn_spatial_gamma),
-        "sinkhorn_spatial_radius": int(args.sinkhorn_spatial_radius),
-        "sinkhorn_fb_sigma": float(args.sinkhorn_fb_sigma),
-        "sinkhorn_d_match": args.sinkhorn_d_match,
-        "sinkhorn_straightener_ckpt": args.sinkhorn_straightener_ckpt,
-        "sinkhorn_straightener_dtype": args.sinkhorn_straightener_dtype,
-        "flow_uncertainty_mode": args.flow_uncertainty_mode,
-        "flow_uncertainty_weight": float(args.flow_uncertainty_weight),
-        "flow_uncertainty_power": float(args.flow_uncertainty_power),
-        "lora_rank": int(args.lora_rank),
-        "lora_alpha": float(args.lora_alpha),
-        "lora_dropout": float(args.lora_dropout),
-        "lora_targets": str(args.lora_targets),
-    }
-    save_checkpoint(final_path, model, optimizer, args.steps, ema, meta=meta)
+    if int(args.save_final) == 1:
+        final_path = os.path.join(args.ckpt_dir, "ckpt_final.pt")
+        meta = {
+            "stage": "interp_levels_wansynth",
+            "T": args.T,
+            "K_min": args.K_min,
+            "levels": args.levels,
+            "data_dim": D,
+            "patch_size": args.patch_size,
+            "stage2_mode": args.stage2_mode,
+            "mask_channels": mask_channels,
+            "k_schedule": args.k_schedule,
+            "k_geom_gamma": args.k_geom_gamma,
+            "text_dim": int(text_embed.shape[-1]),
+            "d_model": args.d_model,
+            "n_layers": args.n_layers,
+            "n_heads": args.n_heads,
+            "d_ff": args.d_ff,
+            "d_cond": args.d_cond,
+            "use_wan": bool(args.use_wan),
+            "wan_repo": args.wan_repo,
+            "wan_subfolder": args.wan_subfolder,
+            "wan_dtype": args.wan_dtype,
+            "wan_attn": args.wan_attn,
+            "sla_topk": float(args.sla_topk),
+            "wan_frame_cond": int(args.wan_frame_cond),
+            "wan_frame_cond_feat_dim": 12 if args.stage2_mode == "adj" else 7,
+            "wan_frame_cond_hidden": int(args.wan_frame_cond_hidden),
+            "wan_frame_cond_layers": int(args.wan_frame_cond_layers),
+            "wan_frame_cond_dropout": float(args.wan_frame_cond_dropout),
+            "video_interp_mode": args.video_interp_mode,
+            "video_interp_ckpt": args.video_interp_ckpt,
+            "flow_interp_ckpt": args.flow_interp_ckpt,
+            "sinkhorn_win": args.sinkhorn_win,
+            "sinkhorn_stride": int(args.sinkhorn_stride),
+            "sinkhorn_angles": sinkhorn_angles_str,
+            "sinkhorn_shift": args.sinkhorn_shift,
+            "sinkhorn_global_mode": args.sinkhorn_global_mode,
+            "sinkhorn_phasecorr_mode": str(args.sinkhorn_phasecorr_mode),
+            "sinkhorn_phasecorr_level": str(args.sinkhorn_phasecorr_level),
+            "sinkhorn_warp_space": args.sinkhorn_warp_space,
+            "sinkhorn_iters": args.sinkhorn_iters,
+            "sinkhorn_tau": args.sinkhorn_tau,
+            "sinkhorn_dustbin": args.sinkhorn_dustbin,
+            "sinkhorn_spatial_gamma": float(args.sinkhorn_spatial_gamma),
+            "sinkhorn_spatial_radius": int(args.sinkhorn_spatial_radius),
+            "sinkhorn_fb_sigma": float(args.sinkhorn_fb_sigma),
+            "sinkhorn_d_match": args.sinkhorn_d_match,
+            "sinkhorn_straightener_ckpt": args.sinkhorn_straightener_ckpt,
+            "sinkhorn_straightener_dtype": args.sinkhorn_straightener_dtype,
+            "flow_uncertainty_mode": args.flow_uncertainty_mode,
+            "flow_uncertainty_weight": float(args.flow_uncertainty_weight),
+            "flow_uncertainty_power": float(args.flow_uncertainty_power),
+            "lora_rank": int(args.lora_rank),
+            "lora_alpha": float(args.lora_alpha),
+            "lora_dropout": float(args.lora_dropout),
+            "lora_targets": str(args.lora_targets),
+        }
+        save_checkpoint(final_path, model, optimizer, args.steps, ema, meta=meta, save_optimizer=bool(args.save_optimizer))
     writer.flush()
     writer.close()
 

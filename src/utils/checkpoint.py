@@ -6,16 +6,19 @@ import torch
 def save_checkpoint(
     path: str,
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer: Optional[torch.optim.Optimizer],
     step: int,
     ema: Optional[object] = None,
     meta: Optional[dict] = None,
+    *,
+    save_optimizer: bool = True,
 ):
     payload = {
         "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
         "step": step,
     }
+    if save_optimizer and optimizer is not None:
+        payload["optimizer"] = optimizer.state_dict()
     if ema is not None:
         payload["ema"] = ema.state_dict()
     if meta is not None:
