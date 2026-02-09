@@ -382,6 +382,7 @@ def main() -> None:
         idx_base, _ = sample_fixed_k_indices_uniform_batch(
             B, T, args.K, generator=gen, device=device, ensure_endpoints=False
         )
+        gaps = (idx_base[:, 1:] - idx_base[:, :-1]).to(dtype=torch.float32)
         if args.phase1_input_mode == "short_midpoints":
             idx_mid = _midpoint_indices(idx_base)
             idx_in = torch.cat([idx_base, idx_mid], dim=1)
@@ -476,14 +477,27 @@ def main() -> None:
             if args.phase1_input_mode == "full":
                 pred_sel = pred_tokens.gather(1, idx_base.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D))
                 loss = (pred_sel - eps).pow(2).mean()
+                loss_anchor = loss.detach()
+                loss_summary = None
             else:
                 loss = (pred_tokens - eps).pow(2).mean()
+                # Slot-level diagnostics: anchors vs summary slots (midpoints or pooled summaries).
+                is_anchor_slot = (idx_in.unsqueeze(-1) == idx_base.unsqueeze(1)).any(dim=-1)  # [B,L]
+                mse_slot = (pred_tokens - eps).pow(2).mean(dim=(2, 3))  # [B,L]
+                loss_anchor = mse_slot.masked_select(is_anchor_slot).mean().detach()
+                loss_summary = (
+                    mse_slot.masked_select(~is_anchor_slot).mean().detach()
+                    if bool((~is_anchor_slot).any())
+                    else None
+                )
         else:
             if args.phase1_input_mode != "full":
                 raise ValueError("phase1_input_mode != 'full' currently requires --use_wan 1")
             with torch.cuda.amp.autocast(dtype=autocast_dtype):
                 eps_hat = model(z_t, t, idx_base, cond, args.T, spatial_shape)
                 loss = (eps_hat - eps).pow(2).mean()
+            loss_anchor = loss.detach()
+            loss_summary = None
 
         optimizer.zero_grad(set_to_none=True)
         if scaler.is_enabled():
@@ -500,11 +514,19 @@ def main() -> None:
         if step % args.log_every == 0:
             pbar.set_description(f"loss {loss.item():.4f} step {step_time:.3f}s")
             writer.add_scalar("train/loss", loss.item(), step)
+            writer.add_scalar("train/loss_anchor", float(loss_anchor.item()), step)
+            if loss_summary is not None:
+                writer.add_scalar("train/loss_summary", float(loss_summary.item()), step)
+                writer.add_scalar("train/loss_summary_over_anchor", float(loss_summary.item() / (loss_anchor.item() + 1e-12)), step)
             writer.add_scalar("train/step_time_sec", step_time, step)
             writer.add_scalar("train/samples_per_sec", float(B) / max(step_time, 1e-8), step)
             wan_T = int(T if args.phase1_input_mode == "full" else idx_in.shape[1])
             writer.add_scalar("train/wan_frames_per_sec", float(B * wan_T) / max(step_time, 1e-8), step)
             writer.add_scalar("train/fullT_frames_per_sec", float(B * T) / max(step_time, 1e-8), step)
+            writer.add_scalar("train/avg_gap", float(gaps.mean().item()), step)
+            writer.add_scalar("train/min_gap", float(gaps.min().item()), step)
+            writer.add_scalar("train/max_gap", float(gaps.max().item()), step)
+            writer.add_scalar("train/slots_L", float(wan_T), step)
             rss_gb = proc.memory_info().rss / (1024**3)
             writer.add_scalar("train/cpu_mem_percent", float(vm.percent), step)
             writer.add_scalar("train/cpu_rss_gb", float(rss_gb), step)
