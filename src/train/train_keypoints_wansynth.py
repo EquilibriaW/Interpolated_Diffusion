@@ -2,6 +2,7 @@ import argparse
 import os
 import time
 
+import psutil
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -28,6 +29,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data_pattern", type=str, required=True, help="Shard pattern for Wan2.1 synthetic dataset")
     p.add_argument("--T", type=int, default=21)
     p.add_argument("--K", type=int, default=4)
+    p.add_argument(
+        "--phase1_input_mode",
+        type=str,
+        default="full",
+        choices=["full", "short_anchors", "short_midpoints"],
+        help="How to run Phase-1 when use_wan=1. "
+        "'full' = run Wan on length-T sequence with interpolated missing frames (current behavior). "
+        "'short_anchors' = run Wan on length-K anchors only. "
+        "'short_midpoints' = run Wan on length-(2K-1) anchors+midpoints, then discard midpoints downstream.",
+    )
     p.add_argument("--steps", type=int, default=20000)
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
@@ -99,8 +110,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save_every", type=int, default=2000)
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--shuffle_buffer", type=int, default=200)
+    p.add_argument("--shuffle_buffer", type=int, default=64)
+    p.add_argument(
+        "--max_cpu_mem_percent",
+        type=float,
+        default=98.0,
+        help="Abort before the machine OOMs (common failure mode with WebDataset shuffles).",
+    )
     return p
+
+
+def _midpoint_indices(idx_base: torch.Tensor) -> torch.Tensor:
+    # idx_base: [B,K] sorted
+    if idx_base.dim() != 2:
+        raise ValueError("idx_base must be [B,K]")
+    left = idx_base[:, :-1]
+    right = idx_base[:, 1:]
+    gap = right - left
+    if torch.any(gap < 2):
+        raise ValueError("midpoints require all anchor gaps >= 2; reduce K or use phase1_input_mode=short_anchors")
+    mid = (left + right) // 2
+    mid = torch.minimum(torch.maximum(mid, left + 1), right - 1)
+    return mid
 
 
 def main() -> None:
@@ -129,6 +160,16 @@ def main() -> None:
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     writer = create_writer(args.log_dir)
+    proc = psutil.Process(os.getpid())
+
+    if args.num_workers > 0 and (int(args.num_workers) * int(args.shuffle_buffer)) >= 1000:
+        # Each worker holds its own shuffle buffer; with ~8MB/sample this can exhaust CPU RAM fast.
+        writer.add_text(
+            "warn/loader",
+            f"Large shuffle setting: num_workers={args.num_workers} shuffle_buffer={args.shuffle_buffer}. "
+            "CPU RAM can spike: consider reducing shuffle_buffer or num_workers.",
+            0,
+        )
 
     gen = torch.Generator(device=device)
     gen.manual_seed(args.seed + 17)
@@ -151,43 +192,45 @@ def main() -> None:
     sinkhorn_warper = None
     sinkhorn_angles = [float(x) for x in args.sinkhorn_angles]
     sinkhorn_angles_str = ",".join(str(a) for a in sinkhorn_angles)
-    if args.video_interp_mode == "smooth":
-        smooth_kernel = torch.tensor([float(x) for x in args.video_interp_smooth_kernel.split(",")], dtype=torch.float32)
-    elif args.video_interp_mode == "flow":
-        if not args.flow_interp_ckpt:
-            raise ValueError("--flow_interp_ckpt is required for video_interp_mode=flow")
-        from src.models.latent_flow_interpolator import load_latent_flow_interpolator
-        flow_dtype = resolve_dtype(args.wan_dtype) or get_autocast_dtype()
-        flow_warper, _ = load_latent_flow_interpolator(args.flow_interp_ckpt, device=device, dtype=flow_dtype)
-    elif args.video_interp_mode == "sinkhorn":
-        from src.models.sinkhorn_warp import SinkhornWarpInterpolator
-        from src.models.latent_straightener import load_latent_straightener
+    # Only needed when Phase-1 runs Wan on full-length T and needs to synthesize missing frames.
+    if args.phase1_input_mode == "full":
+        if args.video_interp_mode == "smooth":
+            smooth_kernel = torch.tensor([float(x) for x in args.video_interp_smooth_kernel.split(",")], dtype=torch.float32)
+        elif args.video_interp_mode == "flow":
+            if not args.flow_interp_ckpt:
+                raise ValueError("--flow_interp_ckpt is required for video_interp_mode=flow")
+            from src.models.latent_flow_interpolator import load_latent_flow_interpolator
+            flow_dtype = resolve_dtype(args.wan_dtype) or get_autocast_dtype()
+            flow_warper, _ = load_latent_flow_interpolator(args.flow_interp_ckpt, device=device, dtype=flow_dtype)
+        elif args.video_interp_mode == "sinkhorn":
+            from src.models.sinkhorn_warp import SinkhornWarpInterpolator
+            from src.models.latent_straightener import load_latent_straightener
 
-        straightener = None
-        if args.sinkhorn_straightener_ckpt:
-            s_dtype = resolve_dtype(args.sinkhorn_straightener_dtype) or get_autocast_dtype()
-            straightener, _ = load_latent_straightener(args.sinkhorn_straightener_ckpt, device=device, dtype=s_dtype)
-        angles = sinkhorn_angles
-        sinkhorn_warper = SinkhornWarpInterpolator(
-            in_channels=C0,
-            patch_size=args.patch_size,
-            win_size=args.sinkhorn_win,
-            win_stride=args.sinkhorn_stride,
-            global_mode=args.sinkhorn_global_mode,
-            phasecorr_mode=str(args.sinkhorn_phasecorr_mode),
-            phasecorr_level=str(args.sinkhorn_phasecorr_level),
-            angles_deg=angles,
-            shift_range=args.sinkhorn_shift,
-            sinkhorn_iters=args.sinkhorn_iters,
-            sinkhorn_tau=args.sinkhorn_tau,
-            dustbin_logit=args.sinkhorn_dustbin,
-            spatial_gamma=args.sinkhorn_spatial_gamma,
-            spatial_radius=args.sinkhorn_spatial_radius,
-            fb_sigma=args.sinkhorn_fb_sigma,
-            d_match=args.sinkhorn_d_match,
-            straightener=straightener,
-            warp_space=args.sinkhorn_warp_space,
-        ).to(device=device, dtype=get_autocast_dtype())
+            straightener = None
+            if args.sinkhorn_straightener_ckpt:
+                s_dtype = resolve_dtype(args.sinkhorn_straightener_dtype) or get_autocast_dtype()
+                straightener, _ = load_latent_straightener(args.sinkhorn_straightener_ckpt, device=device, dtype=s_dtype)
+            angles = sinkhorn_angles
+            sinkhorn_warper = SinkhornWarpInterpolator(
+                in_channels=C0,
+                patch_size=args.patch_size,
+                win_size=args.sinkhorn_win,
+                win_stride=args.sinkhorn_stride,
+                global_mode=args.sinkhorn_global_mode,
+                phasecorr_mode=str(args.sinkhorn_phasecorr_mode),
+                phasecorr_level=str(args.sinkhorn_phasecorr_level),
+                angles_deg=angles,
+                shift_range=args.sinkhorn_shift,
+                sinkhorn_iters=args.sinkhorn_iters,
+                sinkhorn_tau=args.sinkhorn_tau,
+                dustbin_logit=args.sinkhorn_dustbin,
+                spatial_gamma=args.sinkhorn_spatial_gamma,
+                spatial_radius=args.sinkhorn_spatial_radius,
+                fb_sigma=args.sinkhorn_fb_sigma,
+                d_match=args.sinkhorn_d_match,
+                straightener=straightener,
+                warp_space=args.sinkhorn_warp_space,
+            ).to(device=device, dtype=get_autocast_dtype())
 
     use_wan = bool(args.use_wan)
 
@@ -261,6 +304,12 @@ def main() -> None:
     pbar = tqdm(range(start_step, args.steps), dynamic_ncols=True)
     for step in pbar:
         step_start = time.perf_counter()
+        vm = psutil.virtual_memory()
+        if float(vm.percent) >= float(args.max_cpu_mem_percent):
+            raise RuntimeError(
+                f"CPU RAM usage {vm.percent:.1f}% exceeded max_cpu_mem_percent={args.max_cpu_mem_percent:.1f}. "
+                "Reduce --shuffle_buffer and/or --num_workers."
+            )
         log_this = step % args.log_every == 0
         if log_this:
             torch.cuda.reset_peak_memory_stats()
@@ -292,12 +341,22 @@ def main() -> None:
         if T != args.T:
             raise ValueError(f"T mismatch: batch={T} args={args.T}")
 
-        idx, _ = sample_fixed_k_indices_uniform_batch(B, T, args.K, generator=gen, device=device, ensure_endpoints=False)
-        z0_k = tokens.gather(1, idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D)).clone()
+        idx_base, _ = sample_fixed_k_indices_uniform_batch(
+            B, T, args.K, generator=gen, device=device, ensure_endpoints=False
+        )
+        if args.phase1_input_mode == "short_midpoints":
+            idx_mid = _midpoint_indices(idx_base)
+            idx_in = torch.cat([idx_base, idx_mid], dim=1)
+            idx_in = torch.sort(idx_in, dim=1).values
+        elif args.phase1_input_mode == "short_anchors":
+            idx_in = idx_base
+        else:
+            idx_in = idx_base
+        z0_in = tokens.gather(1, idx_in.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D)).clone()
 
         t = torch.randint(0, args.N_train, (B,), generator=gen, device=device, dtype=torch.long)
-        eps = torch.randn_like(z0_k)
-        z_t = schedule["sqrt_alpha_bar"][t].view(B, 1, 1, 1) * z0_k + schedule["sqrt_one_minus_alpha_bar"][t].view(
+        eps = torch.randn_like(z0_in)
+        z_t = schedule["sqrt_alpha_bar"][t].view(B, 1, 1, 1) * z0_in + schedule["sqrt_one_minus_alpha_bar"][t].view(
             B, 1, 1, 1
         ) * eps
 
@@ -308,8 +367,15 @@ def main() -> None:
                 text_embed[drop] = 0.0
         if use_wan and hasattr(model, "frame_cond_proj"):
             mask = torch.zeros((B, T), device=device, dtype=torch.bool)
-            mask.scatter_(1, idx, True)
-            frame_feat = frame_features_from_mask(mask, include_time=True).to(device=device, dtype=text_embed.dtype)
+            mask.scatter_(1, idx_base, True)
+            frame_feat_all = frame_features_from_mask(mask, include_time=True)  # [B,T,5]
+            if args.phase1_input_mode == "full":
+                frame_feat = frame_feat_all
+            else:
+                frame_feat = frame_feat_all.gather(
+                    1, idx_in.unsqueeze(-1).expand(-1, -1, frame_feat_all.shape[-1])
+                )
+            frame_feat = frame_feat.to(device=device, dtype=text_embed.dtype)
             frame_tokens = model.frame_cond_proj(frame_feat).to(dtype=text_embed.dtype)
             text_embed_cond = torch.cat([text_embed, frame_tokens], dim=1)
         else:
@@ -318,41 +384,51 @@ def main() -> None:
 
         model.train()
         if use_wan:
-            if args.video_interp_mode in ("flow", "sinkhorn"):
-                warper = flow_warper if args.video_interp_mode == "flow" else sinkhorn_warper
-                if warper is None:
-                    raise ValueError(f"{args.video_interp_mode} interpolator requested but not loaded")
-                z_seq = torch.zeros((B, T, N, D), device=device, dtype=z_t.dtype)
-                z_seq.scatter_(1, idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D), z_t)
-                latents_seq = unpatchify_tokens(z_seq, args.patch_size, spatial_shape)
-                try:
-                    flow_dtype = next(warper.parameters()).dtype
-                except StopIteration:
-                    flow_dtype = latents_seq.dtype
-                latents_seq_dtype = latents_seq.dtype
-                latents_seq = latents_seq.to(dtype=flow_dtype)
-                latents_interp, _ = warper.interpolate(latents_seq, idx)
-                latents_interp = latents_interp.to(dtype=latents_seq_dtype)
-                latents_t = latents_interp.permute(0, 2, 1, 3, 4)
+            if args.phase1_input_mode == "full":
+                if args.video_interp_mode in ("flow", "sinkhorn"):
+                    warper = flow_warper if args.video_interp_mode == "flow" else sinkhorn_warper
+                    if warper is None:
+                        raise ValueError(f"{args.video_interp_mode} interpolator requested but not loaded")
+                    z_seq = torch.zeros((B, T, N, D), device=device, dtype=z_t.dtype)
+                    z_seq.scatter_(1, idx_base.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D), z_t)
+                    latents_seq = unpatchify_tokens(z_seq, args.patch_size, spatial_shape)
+                    try:
+                        flow_dtype = next(warper.parameters()).dtype
+                    except StopIteration:
+                        flow_dtype = latents_seq.dtype
+                    latents_seq_dtype = latents_seq.dtype
+                    latents_seq = latents_seq.to(dtype=flow_dtype)
+                    latents_interp, _ = warper.interpolate(latents_seq, idx_base)
+                    latents_interp = latents_interp.to(dtype=latents_seq_dtype)
+                    latents_t = latents_interp.permute(0, 2, 1, 3, 4)
+                else:
+                    idx_rep = idx_base.repeat_interleave(N, dim=0)
+                    vals_rep = z_t.permute(0, 2, 1, 3).reshape(B * N, idx_base.shape[1], D)
+                    z_interp_flat = interpolate_video_from_indices(
+                        idx_rep, vals_rep, T, mode=args.video_interp_mode, smooth_kernel=smooth_kernel
+                    )
+                    z_interp = z_interp_flat.view(B, N, T, D).permute(0, 2, 1, 3).contiguous()
+                    z_interp = z_interp.scatter(1, idx_base.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D), z_t)
+                    latents_t = unpatchify_tokens(z_interp, args.patch_size, spatial_shape)
+                    latents_t = latents_t.permute(0, 2, 1, 3, 4)
             else:
-                idx_rep = idx.repeat_interleave(N, dim=0)
-                vals_rep = z_t.permute(0, 2, 1, 3).reshape(B * N, idx.shape[1], D)
-                z_interp_flat = interpolate_video_from_indices(
-                    idx_rep, vals_rep, T, mode=args.video_interp_mode, smooth_kernel=smooth_kernel
-                )
-                z_interp = z_interp_flat.view(B, N, T, D).permute(0, 2, 1, 3).contiguous()
-                z_interp = z_interp.scatter(1, idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D), z_t)
-                latents_t = unpatchify_tokens(z_interp, args.patch_size, spatial_shape)
-                latents_t = latents_t.permute(0, 2, 1, 3, 4)
+                # Short-sequence Phase-1: Wan runs only on selected slots (anchors or anchors+midpoints).
+                latents_in = unpatchify_tokens(z_t, args.patch_size, spatial_shape)  # [B,L,C,H,W]
+                latents_t = latents_in.permute(0, 2, 1, 3, 4)  # [B,C,L,H,W]
             with torch.cuda.amp.autocast(dtype=autocast_dtype):
                 pred_latents = model(latents_t, t, text_embed_cond).sample
-            pred_latents = pred_latents.permute(0, 2, 1, 3, 4)
+            pred_latents = pred_latents.permute(0, 2, 1, 3, 4)  # [B,L,C,H,W] or [B,T,C,H,W]
             pred_tokens, _ = patchify_latents(pred_latents, args.patch_size)
-            pred_key = pred_tokens.gather(1, idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D))
-            loss = (pred_key - eps).pow(2).mean()
+            if args.phase1_input_mode == "full":
+                pred_sel = pred_tokens.gather(1, idx_base.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D))
+                loss = (pred_sel - eps).pow(2).mean()
+            else:
+                loss = (pred_tokens - eps).pow(2).mean()
         else:
+            if args.phase1_input_mode != "full":
+                raise ValueError("phase1_input_mode != 'full' currently requires --use_wan 1")
             with torch.cuda.amp.autocast(dtype=autocast_dtype):
-                eps_hat = model(z_t, t, idx, cond, args.T, spatial_shape)
+                eps_hat = model(z_t, t, idx_base, cond, args.T, spatial_shape)
                 loss = (eps_hat - eps).pow(2).mean()
 
         optimizer.zero_grad(set_to_none=True)
@@ -372,7 +448,12 @@ def main() -> None:
             writer.add_scalar("train/loss", loss.item(), step)
             writer.add_scalar("train/step_time_sec", step_time, step)
             writer.add_scalar("train/samples_per_sec", float(B) / max(step_time, 1e-8), step)
-            writer.add_scalar("train/frames_per_sec", float(B * T) / max(step_time, 1e-8), step)
+            wan_T = int(T if args.phase1_input_mode == "full" else idx_in.shape[1])
+            writer.add_scalar("train/wan_frames_per_sec", float(B * wan_T) / max(step_time, 1e-8), step)
+            writer.add_scalar("train/fullT_frames_per_sec", float(B * T) / max(step_time, 1e-8), step)
+            rss_gb = proc.memory_info().rss / (1024**3)
+            writer.add_scalar("train/cpu_mem_percent", float(vm.percent), step)
+            writer.add_scalar("train/cpu_rss_gb", float(rss_gb), step)
             if log_this:
                 max_mem = torch.cuda.max_memory_allocated() / (1024**3)
                 writer.add_scalar("train/max_mem_gb", max_mem, step)
@@ -383,6 +464,7 @@ def main() -> None:
                 "stage": "keypoints_wansynth",
                 "T": args.T,
                 "K": args.K,
+                "phase1_input_mode": str(args.phase1_input_mode),
                 "data_dim": D,
                 "patch_size": args.patch_size,
                 "N_train": args.N_train,
@@ -435,6 +517,7 @@ def main() -> None:
         "stage": "keypoints_wansynth",
         "T": args.T,
         "K": args.K,
+        "phase1_input_mode": str(args.phase1_input_mode),
         "data_dim": D,
         "patch_size": args.patch_size,
         "N_train": args.N_train,

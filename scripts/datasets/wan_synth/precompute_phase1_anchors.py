@@ -121,61 +121,101 @@ def _sample_keypoints_ddim_wan(
     spatial_shape: tuple[int, int],
     patch_size: int,
     schedule_name: str = "quadratic",
+    phase1_input_mode: str = "full",
     interp_mode: str = "smooth",
     smooth_kernel: torch.Tensor | None = None,
     flow_warper: object | None = None,
     sinkhorn_warper: object | None = None,
 ) -> torch.Tensor:
+    def _midpoint_indices(idx_base: torch.Tensor) -> torch.Tensor:
+        left = idx_base[:, :-1]
+        right = idx_base[:, 1:]
+        gap = right - left
+        if torch.any(gap < 2):
+            raise ValueError("short_midpoints requires all anchor gaps >= 2; reduce K or use short_anchors/full")
+        mid = (left + right) // 2
+        mid = torch.minimum(torch.maximum(mid, left + 1), right - 1)
+        return mid
+
     device = idx.device
-    B, K = idx.shape
+    idx_base = idx
+    B, K = idx_base.shape
     B2, T2, N, D = tokens.shape
     if B2 != B or T2 != T:
         raise ValueError("tokens shape mismatch for wan sampling")
+    phase1_input_mode = str(phase1_input_mode)
+    if phase1_input_mode not in ("full", "short_anchors", "short_midpoints"):
+        raise ValueError(f"phase1_input_mode must be full/short_anchors/short_midpoints, got {phase1_input_mode}")
+    if phase1_input_mode == "short_midpoints":
+        idx_mid = _midpoint_indices(idx_base)
+        idx_in = torch.cat([idx_base, idx_mid], dim=1)
+        idx_in = torch.sort(idx_in, dim=1).values
+    else:
+        idx_in = idx_base
+    L = int(idx_in.shape[1])
     n_train = schedule["alpha_bar"].shape[0]
     times = _timesteps(n_train, steps, schedule=schedule_name)
     model_dtype = getattr(model, "dtype", next(model.parameters()).dtype)
     text_embed_cond = text_embed.to(dtype=model_dtype)
     if hasattr(model, "frame_cond_proj"):
         mask = torch.zeros((B, T), device=device, dtype=torch.bool)
-        mask.scatter_(1, idx, True)
-        frame_feat = frame_features_from_mask(mask, include_time=True).to(device=device, dtype=text_embed_cond.dtype)
+        mask.scatter_(1, idx_base, True)
+        frame_feat_all = frame_features_from_mask(mask, include_time=True)  # [B,T,5]
+        if phase1_input_mode == "full":
+            frame_feat = frame_feat_all
+        else:
+            frame_feat = frame_feat_all.gather(1, idx_in.unsqueeze(-1).expand(-1, -1, frame_feat_all.shape[-1]))
+        frame_feat = frame_feat.to(device=device, dtype=text_embed_cond.dtype)
         frame_tokens = model.frame_cond_proj(frame_feat).to(dtype=text_embed_cond.dtype)
         text_embed_cond = torch.cat([text_embed_cond, frame_tokens], dim=1)
-    z = torch.randn((B, K, N, D), device=device, dtype=model_dtype)
+    z = torch.randn((B, (K if phase1_input_mode == "full" else L), N, D), device=device, dtype=model_dtype)
     for i in range(len(times) - 1):
         t = torch.full((B,), int(times[i]), device=device, dtype=torch.long)
         t_prev = torch.full((B,), int(times[i + 1]), device=device, dtype=torch.long)
-        if interp_mode in ("flow", "sinkhorn"):
-            warper = flow_warper if interp_mode == "flow" else sinkhorn_warper
-            if warper is None:
-                raise ValueError(f"{interp_mode} interpolator requested but warper is None")
-            z_seq = torch.zeros((B, T, N, D), device=device, dtype=z.dtype)
-            z_seq.scatter_(1, idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D), z)
-            latents_seq = unpatchify_tokens(z_seq, patch_size, spatial_shape)
-            try:
-                flow_dtype = next(warper.parameters()).dtype
-            except StopIteration:
-                flow_dtype = latents_seq.dtype
-            latents_seq = latents_seq.to(dtype=flow_dtype)
-            latents_interp, _ = warper.interpolate(latents_seq, idx)
-            latents_t = latents_interp
+        if phase1_input_mode == "full":
+            if interp_mode in ("flow", "sinkhorn"):
+                warper = flow_warper if interp_mode == "flow" else sinkhorn_warper
+                if warper is None:
+                    raise ValueError(f"{interp_mode} interpolator requested but warper is None")
+                z_seq = torch.zeros((B, T, N, D), device=device, dtype=z.dtype)
+                z_seq.scatter_(1, idx_base.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D), z)
+                latents_seq = unpatchify_tokens(z_seq, patch_size, spatial_shape)
+                try:
+                    flow_dtype = next(warper.parameters()).dtype
+                except StopIteration:
+                    flow_dtype = latents_seq.dtype
+                latents_seq = latents_seq.to(dtype=flow_dtype)
+                latents_interp, _ = warper.interpolate(latents_seq, idx_base)
+                latents_t = latents_interp
+            else:
+                idx_rep = idx_base.repeat_interleave(N, dim=0)
+                vals_rep = z.permute(0, 2, 1, 3).reshape(B * N, K, D)
+                z_interp_flat = interpolate_video_from_indices(
+                    idx_rep, vals_rep, T, mode=interp_mode, smooth_kernel=smooth_kernel
+                )
+                z_interp = z_interp_flat.view(B, N, T, D).permute(0, 2, 1, 3).contiguous()
+                z_interp = z_interp.scatter(1, idx_base.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D), z)
+                latents_t = unpatchify_tokens(z_interp, patch_size, spatial_shape)
+            latents_t = latents_t.permute(0, 2, 1, 3, 4)  # [B,C,T,H,W]
         else:
-            idx_rep = idx.repeat_interleave(N, dim=0)
-            vals_rep = z.permute(0, 2, 1, 3).reshape(B * N, K, D)
-            z_interp_flat = interpolate_video_from_indices(
-                idx_rep, vals_rep, T, mode=interp_mode, smooth_kernel=smooth_kernel
-            )
-            z_interp = z_interp_flat.view(B, N, T, D).permute(0, 2, 1, 3).contiguous()
-            z_interp = z_interp.scatter(1, idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D), z)
-            latents_t = unpatchify_tokens(z_interp, patch_size, spatial_shape)
-        latents_t = latents_t.permute(0, 2, 1, 3, 4)
+            latents_in = unpatchify_tokens(z, patch_size, spatial_shape)  # [B,L,C,H,W]
+            latents_t = latents_in.permute(0, 2, 1, 3, 4)  # [B,C,L,H,W]
         latents_t = latents_t.to(dtype=model_dtype)
         with torch.no_grad():
             pred_latents = model(latents_t, t, text_embed_cond).sample
         pred_latents = pred_latents.permute(0, 2, 1, 3, 4)
         pred_tokens, _ = patchify_latents(pred_latents, patch_size)
-        pred_key = pred_tokens.gather(1, idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D))
-        z = ddim_step(z, pred_key, t, t_prev, schedule, eta=0.0)
+        if phase1_input_mode == "full":
+            pred = pred_tokens.gather(1, idx_base.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D))
+        else:
+            pred = pred_tokens
+        z = ddim_step(z, pred, t, t_prev, schedule, eta=0.0)
+    if phase1_input_mode == "short_midpoints":
+        pos = torch.searchsorted(idx_in.contiguous(), idx_base.contiguous())
+        check = idx_in.gather(1, pos).eq(idx_base)
+        if not bool(check.all()):
+            raise RuntimeError("idx_base not found in idx_in for short_midpoints")
+        z = z.gather(1, pos.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, N, D))
     return z
 
 
@@ -229,6 +269,7 @@ def main() -> None:
     # Load checkpoint meta if present.
     payload = torch.load(args.phase1_ckpt, map_location="cpu")
     meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+    phase1_input_mode = str(meta.get("phase1_input_mode", "full"))
 
     model = None
     cond_encoder = None
@@ -238,37 +279,43 @@ def main() -> None:
     sinkhorn_angles = [float(x) for x in args.sinkhorn_angles]
     sinkhorn_angles_str = ",".join(str(a) for a in sinkhorn_angles)
     in_channels = int(meta.get("in_channels", 16))
-    if args.video_interp_mode == "flow":
-        if not args.flow_interp_ckpt:
-            raise ValueError("--flow_interp_ckpt is required for video_interp_mode=flow")
-        from src.models.latent_flow_interpolator import load_latent_flow_interpolator
-        flow_dtype = resolve_dtype(args.wan_dtype) or get_autocast_dtype()
-        flow_warper, _ = load_latent_flow_interpolator(args.flow_interp_ckpt, device=device, dtype=flow_dtype)
-    elif args.video_interp_mode == "sinkhorn":
-        from src.models.sinkhorn_warp import SinkhornWarpInterpolator
-        from src.models.latent_straightener import load_latent_straightener
+    # Interpolators are only used when Phase-1 runs Wan on the full length-T sequence and
+    # needs to synthesize missing frames between anchors.
+    if bool(args.use_wan) and phase1_input_mode == "full":
+        if args.video_interp_mode == "flow":
+            if not args.flow_interp_ckpt:
+                raise ValueError("--flow_interp_ckpt is required for video_interp_mode=flow")
+            from src.models.latent_flow_interpolator import load_latent_flow_interpolator
 
-        straightener = None
-        if args.sinkhorn_straightener_ckpt:
-            s_dtype = resolve_dtype(args.sinkhorn_straightener_dtype) or get_autocast_dtype()
-            straightener, _ = load_latent_straightener(args.sinkhorn_straightener_ckpt, device=device, dtype=s_dtype)
-        angles = sinkhorn_angles
-        sinkhorn_warper = SinkhornWarpInterpolator(
-            in_channels=in_channels,
-            patch_size=args.patch_size,
-            win_size=args.sinkhorn_win,
-            global_mode=args.sinkhorn_global_mode,
-            phasecorr_mode=str(args.sinkhorn_phasecorr_mode),
-            phasecorr_level=str(args.sinkhorn_phasecorr_level),
-            angles_deg=angles,
-            shift_range=args.sinkhorn_shift,
-            sinkhorn_iters=args.sinkhorn_iters,
-            sinkhorn_tau=args.sinkhorn_tau,
-            dustbin_logit=args.sinkhorn_dustbin,
-            d_match=args.sinkhorn_d_match,
-            straightener=straightener,
-            warp_space=args.sinkhorn_warp_space,
-        ).to(device=device, dtype=get_autocast_dtype())
+            flow_dtype = resolve_dtype(args.wan_dtype) or get_autocast_dtype()
+            flow_warper, _ = load_latent_flow_interpolator(args.flow_interp_ckpt, device=device, dtype=flow_dtype)
+        elif args.video_interp_mode == "sinkhorn":
+            from src.models.sinkhorn_warp import SinkhornWarpInterpolator
+            from src.models.latent_straightener import load_latent_straightener
+
+            straightener = None
+            if args.sinkhorn_straightener_ckpt:
+                s_dtype = resolve_dtype(args.sinkhorn_straightener_dtype) or get_autocast_dtype()
+                straightener, _ = load_latent_straightener(
+                    args.sinkhorn_straightener_ckpt, device=device, dtype=s_dtype
+                )
+            angles = sinkhorn_angles
+            sinkhorn_warper = SinkhornWarpInterpolator(
+                in_channels=in_channels,
+                patch_size=args.patch_size,
+                win_size=args.sinkhorn_win,
+                global_mode=args.sinkhorn_global_mode,
+                phasecorr_mode=str(args.sinkhorn_phasecorr_mode),
+                phasecorr_level=str(args.sinkhorn_phasecorr_level),
+                angles_deg=angles,
+                shift_range=args.sinkhorn_shift,
+                sinkhorn_iters=args.sinkhorn_iters,
+                sinkhorn_tau=args.sinkhorn_tau,
+                dustbin_logit=args.sinkhorn_dustbin,
+                d_match=args.sinkhorn_d_match,
+                straightener=straightener,
+                warp_space=args.sinkhorn_warp_space,
+            ).to(device=device, dtype=get_autocast_dtype())
 
     anchor_dtype = torch.float16 if args.anchor_dtype == "float16" else torch.float32
     gen = torch.Generator(device=device)
@@ -412,6 +459,7 @@ def main() -> None:
                     spatial_shape,
                     args.patch_size,
                     schedule_name=args.ddim_schedule,
+                    phase1_input_mode=phase1_input_mode,
                     interp_mode=args.video_interp_mode,
                     smooth_kernel=smooth_kernel,
                     flow_warper=flow_warper,
@@ -450,6 +498,7 @@ def main() -> None:
     meta_out = {
         "source_pattern": args.data_pattern,
         "phase1_ckpt": args.phase1_ckpt,
+        "phase1_input_mode": phase1_input_mode,
         "T": args.T,
         "K": args.K,
         "patch_size": args.patch_size,
