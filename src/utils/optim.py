@@ -31,7 +31,11 @@ def create_optimizer(
 ) -> torch.optim.Optimizer:
     name = str(name).lower().strip()
     if name in {"adamw"}:
-        return torch.optim.AdamW(params, lr=float(lr), weight_decay=float(weight_decay))
+        # Prefer fused AdamW on CUDA when available; fall back cleanly otherwise.
+        try:
+            return torch.optim.AdamW(params, lr=float(lr), weight_decay=float(weight_decay), fused=True)
+        except Exception:
+            return torch.optim.AdamW(params, lr=float(lr), weight_decay=float(weight_decay))
 
     if name in {"muon"}:
         opt_cls = getattr(torch.optim, "Muon", None)
@@ -52,4 +56,3 @@ def create_optimizer(
 
 
 __all__ = ["create_optimizer"]
-
