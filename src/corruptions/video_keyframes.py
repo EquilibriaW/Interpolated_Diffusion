@@ -469,10 +469,14 @@ def build_video_token_interp_level_batch(
             )
             z0_sel_tokens = z0_flat_repl.view(b_sel, N, T, D).permute(0, 2, 1, 3)
             latents_sel = unpatchify_tokens(z0_sel_tokens, patch_size, spatial_shape)
-            try:
-                flow_dtype = next(warper.parameters()).dtype
-            except StopIteration:
-                flow_dtype = latents_sel_s.dtype
+            flow_dtype = None
+            if hasattr(warper, "parameters"):
+                try:
+                    flow_dtype = next(warper.parameters()).dtype
+                except StopIteration:
+                    flow_dtype = None
+            if flow_dtype is None:
+                flow_dtype = latents_sel.dtype
             latents_sel = latents_sel.to(dtype=flow_dtype)
             zs_lat, conf_flow = warper.interpolate(latents_sel, idx)
             uncertainty = (1.0 - conf_flow).clamp(0.0, 1.0)
@@ -576,6 +580,7 @@ def build_video_token_interp_adjacent_batch(
     interp_model: Optional[TinyTemporalInterpolator] = None,
     smooth_kernel: Optional[torch.Tensor] = None,
     flow_warper: Optional[object] = None,
+    sinkhorn_warper: Optional[object] = None,
     patch_size: Optional[int] = None,
     spatial_shape: Optional[Tuple[int, int]] = None,
     uncertainty_mode: str = "none",
@@ -731,10 +736,14 @@ def build_video_token_interp_adjacent_batch(
             z0_sel_tokens_p = z0_flat_p.view(b_sel, N, T, D).permute(0, 2, 1, 3)
             latents_sel_s = unpatchify_tokens(z0_sel_tokens_s, patch_size, spatial_shape)
             latents_sel_p = unpatchify_tokens(z0_sel_tokens_p, patch_size, spatial_shape)
-            try:
-                flow_dtype = next(warper.parameters()).dtype
-            except StopIteration:
-                flow_dtype = latents_sel.dtype
+            flow_dtype = None
+            if hasattr(warper, "parameters"):
+                try:
+                    flow_dtype = next(warper.parameters()).dtype
+                except StopIteration:
+                    flow_dtype = None
+            if flow_dtype is None:
+                flow_dtype = latents_sel_s.dtype
             latents_sel_s = latents_sel_s.to(dtype=flow_dtype)
             latents_sel_p = latents_sel_p.to(dtype=flow_dtype)
             zs_lat, conf_flow = warper.interpolate(latents_sel_s, idx)
