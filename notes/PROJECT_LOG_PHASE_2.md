@@ -13,14 +13,28 @@ Include: date, command/script, dataset/checkpoints, key settings, and observed r
 ## 2026-02-09
 
 ### Repo Fork Setup (Parallel Work)
-- Git worktree (branch `phase2`): `/workspace/Interpolated_Diffusion_phase2_wt`
-- Full clone (independent `.git`): `/workspace/Interpolated_Diffusion_phase2_clone`
-- Intention: do Phase 2 experiments/changes in the worktree or clone to avoid disrupting other agents on `main`.
-- Shared artifacts (symlinks in the forks to avoid copying multi-TB directories):
+- (Superseded) initial local worktree/clone setup for parallel work.
+
+## 2026-02-10
+
+### Dev Repo Setup (Parallel Work)
+- Phase-2 development repo: `/workspace/Interpolated_Diffusion_phase2` (branch `phase2`, pushed to `origin/phase2`)
+- Shared artifacts (symlinks to avoid copying multi-TB directories; write new outputs locally by default):
   - `data_shared` -> `/workspace/Interpolated_Diffusion/data`
   - `data/wan_synth` -> `../data_shared/wan_synth` (keep derived artifacts like anchors local under `data/`)
   - `checkpoints_shared` -> `/workspace/Interpolated_Diffusion/checkpoints`
   - `tmp_repos_shared` -> `/workspace/Interpolated_Diffusion/tmp_repos`
+
+### Implementation Fixes
+- `src/corruptions/video_keyframes.py`:
+  - `build_video_token_interp_adjacent_batch` now accepts `sinkhorn_warper` (previously training crashed due to unexpected kwarg).
+  - Fixed warper dtype fallback paths that referenced undefined variables when `warper.parameters()` is empty.
+  - Commit: `220dee8`
+
+### Throughput Reference (B200, Wan2.1 1.3B + SageSLA)
+- From prior calibration runs (`runs/interp_levels_wansynth_calib_sla_long`):
+  - Avg `step_time_sec` ≈ **2.64s** at `B=2`, `T=21` (≈ **0.76 samples/s**, **15–16 frames/s**)
+  - Rough wall-time estimate: `steps * 2.64s` (e.g. **20k steps ≈ 14.7 hours**)
 
 ### Phase 2, Standalone Definition (Assume GT Keyframes)
 Assume we are given ground-truth (or user-provided) keyframes (a storyboard) plus an interpolator.
