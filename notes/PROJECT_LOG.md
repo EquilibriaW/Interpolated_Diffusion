@@ -953,3 +953,9 @@ Anchors: `data/wan_synth_anchors_calib3/` (ddim_steps=4, B=4, 20 batches); joine
   - `src/train/train_sinkhorn_interp_wansynth.py`: training-time loader/meta updated to support transformer straighteners.
   - `scripts/diagnose_sinkhorn_outliers_wansynth.py`: backward-compatible matcher loading for older checkpoints.
 - **Commit**: `63c3a4d` ("straightener: add token-transformer arch").
+
+## 2026-02-10
+
+### Coordination
+- Parallelize Phase-2 work: a separate agent will develop Phase-2 in a fork of the repo and track progress in `notes/PROJECT_LOG_PHASE_2.md`.
+- Integration plan: Phase-2 agent will open PRs; we will review and merge selectively to keep Phase-1 experiments and shared infra stable.
