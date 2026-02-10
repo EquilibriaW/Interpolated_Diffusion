@@ -959,3 +959,17 @@ Anchors: `data/wan_synth_anchors_calib3/` (ddim_steps=4, B=4, 20 batches); joine
 ### Coordination
 - Parallelize Phase-2 work: a separate agent will develop Phase-2 in a fork of the repo and track progress in `notes/PROJECT_LOG_PHASE_2.md`.
 - Integration plan: Phase-2 agent will open PRs; we will review and merge selectively to keep Phase-1 experiments and shared infra stable.
+
+### Phase-1 Next Run (Midpoints vs Meanpool, With Val Curves)
+- tmux script: `scripts/run_phase1_cmp_tmux.sh` (now supports val args).
+- Started: `SESSION=phase1_cmp_10k`, `TAG=20260210_210949_b32_s10000_k4_L7`
+- Train shards: `shard-0000[0-7].tar`
+- Val shards: `shard-0000[8-9].tar`
+- Settings: `BATCH=32`, `STEPS=10000`, `K=4`, `WAN_ATTN=sagesla`, `SLA_TOPK=0.07`, `WAN_DTYPE=bfloat16`, `GRAD_CKPT=1`, `WAN_FRAME_COND=1`
+- Val: `--val_every 500 --val_batches 5 --val_num_workers 0`
+- Logs:
+  - `logs/phase1_cmp/20260210_210949_b32_s10000_k4_L7_midpoints.log`
+  - `logs/phase1_cmp/20260210_210949_b32_s10000_k4_L7_meanpool.log`
+- Outputs:
+  - `checkpoints/phase1_cmp/20260210_210949_b32_s10000_k4_L7/{midpoints,meanpool}/ckpt_final.pt`
+  - `runs/phase1_cmp/20260210_210949_b32_s10000_k4_L7/{midpoints,meanpool}/` (TensorBoard)
