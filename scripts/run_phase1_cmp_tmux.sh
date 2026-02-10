@@ -13,6 +13,7 @@ set -euo pipefail
 #   WAN_ATTN=sagesla SLA_TOPK=0.07 WAN_DTYPE=bfloat16 GRAD_CKPT=1
 #   NUM_WORKERS=4 SHUFFLE_BUFFER=32
 #   SAVE_EVERY=2500 SAVE_OPTIMIZER=0 MAX_CPU_MEM_PERCENT=98
+#   VAL_PATTERN='data/wan_synth/.../shard-0000[8-9].tar' VAL_EVERY=500 VAL_BATCHES=10 VAL_NUM_WORKERS=0
 #   TB_PORT=6006
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,6 +45,11 @@ SAVE_EVERY="${SAVE_EVERY:-2500}"
 SAVE_OPTIMIZER="${SAVE_OPTIMIZER:-0}"
 MAX_CPU_MEM_PERCENT="${MAX_CPU_MEM_PERCENT:-98}"
 
+VAL_PATTERN="${VAL_PATTERN:-}"
+VAL_EVERY="${VAL_EVERY:-0}"
+VAL_BATCHES="${VAL_BATCHES:-10}"
+VAL_NUM_WORKERS="${VAL_NUM_WORKERS:-0}"
+
 TB_PORT="${TB_PORT:-6006}"
 
 TAG="${TAG:-$(date +%Y%m%d_%H%M%S)_b${BATCH}_s${STEPS}_k${K}_L$((2 * K - 1))}"
@@ -71,6 +77,10 @@ mkdir -p "${MID_CKPT}" "${MP_CKPT}" "${MID_RUN}" "${MP_RUN}"
 
 COMMON_ARGS=(
   --data_pattern "${DATA_PATTERN}"
+  ${VAL_PATTERN:+--val_pattern} ${VAL_PATTERN:+"${VAL_PATTERN}"}
+  --val_every "${VAL_EVERY}"
+  --val_batches "${VAL_BATCHES}"
+  --val_num_workers "${VAL_NUM_WORKERS}"
   --use_wan 1
   --wan_repo "${WAN_REPO}"
   --wan_subfolder "${WAN_SUBFOLDER}"
