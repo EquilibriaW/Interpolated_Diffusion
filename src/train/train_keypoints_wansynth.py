@@ -125,6 +125,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--shuffle_buffer", type=int, default=64)
     p.add_argument(
+        "--val_pattern",
+        type=str,
+        default="",
+        help="Optional shard pattern for validation. If set, runs periodic validation on this pattern.",
+    )
+    p.add_argument("--val_every", type=int, default=0, help="Validate every N steps (0 disables).")
+    p.add_argument("--val_batches", type=int, default=10, help="Number of val batches per validation run.")
+    p.add_argument("--val_num_workers", type=int, default=0, help="Validation dataloader workers.")
+    p.add_argument(
         "--max_cpu_mem_percent",
         type=float,
         default=98.0,
@@ -192,6 +201,16 @@ def main() -> None:
         shardshuffle=True,
     )
     it = iter(loader)
+    val_loader = None
+    if args.val_pattern:
+        val_loader = create_wan_synth_dataloader(
+            args.val_pattern,
+            batch_size=args.batch,
+            num_workers=int(args.val_num_workers),
+            shuffle_buffer=0,
+            shuffle=False,
+            shardshuffle=False,
+        )
 
     betas = make_beta_schedule(args.schedule, args.N_train).to(device)
     schedule = make_alpha_bars(betas)
@@ -211,6 +230,8 @@ def main() -> None:
 
     gen = torch.Generator(device=device)
     gen.manual_seed(args.seed + 17)
+    val_gen = torch.Generator(device=device)
+    val_gen.manual_seed(args.seed + 1017)
 
     # Prime one batch to build the model.
     batch0 = next(it)
@@ -549,6 +570,111 @@ def main() -> None:
             if log_this:
                 max_mem = torch.cuda.max_memory_allocated() / (1024**3)
                 writer.add_scalar("train/max_mem_gb", max_mem, step)
+
+        if (
+            val_loader is not None
+            and int(args.val_every) > 0
+            and step % int(args.val_every) == 0
+            and step != start_step
+        ):
+            model.eval()
+            losses = []
+            losses_anchor = []
+            losses_summary = []
+            val_it = iter(val_loader)
+            for _ in range(int(args.val_batches)):
+                try:
+                    vbatch = next(val_it)
+                except StopIteration:
+                    val_it = iter(val_loader)
+                    vbatch = next(val_it)
+                if use_wan and model_dtype is not None:
+                    vlatents = vbatch["latents"].to(device, dtype=model_dtype, non_blocking=True)
+                    vtext_embed = vbatch["text_embed"].to(device, dtype=model_dtype, non_blocking=True)
+                else:
+                    vlatents = vbatch["latents"].to(device, non_blocking=True)
+                    vtext_embed = vbatch["text_embed"].to(device, non_blocking=True)
+                vtokens, vspatial_shape = patchify_latents(vlatents, args.patch_size)
+                VB, VT, VN, VD = vtokens.shape
+                vidx_base, _ = sample_fixed_k_indices_uniform_batch(
+                    VB, VT, args.K, generator=val_gen, device=device, ensure_endpoints=False
+                )
+                if args.phase1_input_mode == "short_midpoints":
+                    vidx_mid = _midpoint_indices(vidx_base)
+                    vidx_in = torch.cat([vidx_base, vidx_mid], dim=1)
+                    vidx_in = torch.sort(vidx_in, dim=1).values
+                elif args.phase1_input_mode == "short_meanpool":
+                    vidx_mid = _midpoint_indices(vidx_base)
+                    vidx_in = torch.cat([vidx_base, vidx_mid], dim=1)
+                    vidx_in = torch.sort(vidx_in, dim=1).values
+                elif args.phase1_input_mode == "short_anchors":
+                    vidx_in = vidx_base
+                else:
+                    vidx_in = vidx_base
+
+                vz0_in = vtokens.gather(1, vidx_in.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, VN, VD)).clone()
+                if args.phase1_input_mode == "short_meanpool":
+                    pooled = _meanpool_between_anchors(vtokens, vidx_base)  # [B,K-1,N,D]
+                    pos_mid = torch.searchsorted(vidx_in.contiguous(), vidx_mid.contiguous())
+                    vz0_in.scatter_(1, pos_mid.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, VN, VD), pooled)
+
+                vt = torch.randint(0, args.N_train, (VB,), generator=val_gen, device=device, dtype=torch.long)
+                veps = torch.randn_like(vz0_in)
+                vz_t = schedule["sqrt_alpha_bar"][vt].view(VB, 1, 1, 1) * vz0_in + schedule[
+                    "sqrt_one_minus_alpha_bar"
+                ][vt].view(VB, 1, 1, 1) * veps
+
+                if use_wan and hasattr(model, "frame_cond_proj"):
+                    vmask = torch.zeros((VB, VT), device=device, dtype=torch.bool)
+                    vmask.scatter_(1, vidx_base, True)
+                    vframe_feat_all = frame_features_from_mask(vmask, include_time=True)  # [B,T,5]
+                    if args.phase1_input_mode == "full":
+                        vframe_feat = vframe_feat_all
+                    else:
+                        vframe_feat = vframe_feat_all.gather(
+                            1, vidx_in.unsqueeze(-1).expand(-1, -1, vframe_feat_all.shape[-1])
+                        )
+                    vframe_feat = vframe_feat.to(device=device, dtype=vtext_embed.dtype)
+                    vframe_tokens = model.frame_cond_proj(vframe_feat).to(dtype=vtext_embed.dtype)
+                    vtext_embed_cond = torch.cat([vtext_embed, vframe_tokens], dim=1)
+                else:
+                    vtext_embed_cond = vtext_embed
+
+                if use_wan:
+                    from src.models.wan_abs_rope import set_wan_frame_indices
+
+                    if args.phase1_input_mode == "full":
+                        set_wan_frame_indices(model, None)
+                        raise ValueError("val for phase1_input_mode='full' not implemented in this helper yet")
+                    else:
+                        set_wan_frame_indices(model, vidx_in)
+                        vlatents_in = unpatchify_tokens(vz_t, args.patch_size, vspatial_shape)  # [B,L,C,H,W]
+                        vlatents_t = vlatents_in.permute(0, 2, 1, 3, 4)  # [B,C,L,H,W]
+                    with torch.cuda.amp.autocast(dtype=autocast_dtype):
+                        vpred_latents = model(vlatents_t, vt, vtext_embed_cond).sample
+                    vpred_latents = vpred_latents.permute(0, 2, 1, 3, 4)
+                    vpred_tokens, _ = patchify_latents(vpred_latents, args.patch_size)
+                    vloss = (vpred_tokens - veps).pow(2).mean()
+
+                    is_anchor_slot = (vidx_in.unsqueeze(-1) == vidx_base.unsqueeze(1)).any(dim=-1)  # [B,L]
+                    mse_slot = (vpred_tokens - veps).pow(2).mean(dim=(2, 3))  # [B,L]
+                    vloss_anchor = mse_slot.masked_select(is_anchor_slot).mean()
+                    vloss_summary = (
+                        mse_slot.masked_select(~is_anchor_slot).mean() if bool((~is_anchor_slot).any()) else None
+                    )
+                else:
+                    raise ValueError("val requires --use_wan 1")
+
+                losses.append(float(vloss.detach().item()))
+                losses_anchor.append(float(vloss_anchor.detach().item()))
+                if vloss_summary is not None:
+                    losses_summary.append(float(vloss_summary.detach().item()))
+
+            writer.add_scalar("val/loss", float(sum(losses) / max(len(losses), 1)), step)
+            writer.add_scalar("val/loss_anchor", float(sum(losses_anchor) / max(len(losses_anchor), 1)), step)
+            if losses_summary:
+                writer.add_scalar("val/loss_summary", float(sum(losses_summary) / max(len(losses_summary), 1)), step)
+            model.train()
 
         if step > 0 and step % args.save_every == 0:
             ckpt_path = os.path.join(args.ckpt_dir, f"ckpt_{step:07d}.pt")

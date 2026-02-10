@@ -28,6 +28,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wan_repo", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
     p.add_argument("--wan_subfolder", type=str, default="transformer")
     p.add_argument("--wan_dtype", type=str, default="bf16")
+    p.add_argument(
+        "--ckpt",
+        type=str,
+        default="",
+        help="Optional checkpoint path from our training scripts. If set, load weights from this ckpt.",
+    )
 
     p.add_argument("--sla_topk", type=float, default=0.07)
     p.add_argument("--sla_type", type=str, default="sagesla", choices=["sla", "sagesla"])
@@ -73,6 +79,47 @@ def main() -> None:
 
     replaced = apply_wan_sla(model_sla, topk=float(args.sla_topk), attention_type=str(args.sla_type), use_bf16=True)
     writer.add_scalar("eval/sla_layers", float(replaced), 0)
+
+    if args.ckpt:
+        payload = torch.load(args.ckpt, map_location="cpu")
+        sd = payload.get("model", {})
+        meta = payload.get("meta", {}) or {}
+
+        # If training attached a per-frame conditioning projector, attach it before loading.
+        if any(k.startswith("frame_cond_proj.") for k in sd.keys()):
+            from src.models.wan_frame_cond import FrameCondProjector
+
+            feat_dim = int(meta.get("wan_frame_cond_feat_dim", 5))
+            text_dim = int(meta.get("text_dim", 4096))
+            hidden_dim = int(meta.get("wan_frame_cond_hidden", 256))
+            n_layers = int(meta.get("wan_frame_cond_layers", 2))
+            dropout = float(meta.get("wan_frame_cond_dropout", 0.0))
+
+            proj_dtype = getattr(model_dense, "dtype", None) or wan_dtype
+            model_dense.frame_cond_proj = FrameCondProjector(
+                feat_dim=feat_dim,
+                text_dim=text_dim,
+                hidden_dim=hidden_dim,
+                n_layers=n_layers,
+                dropout=dropout,
+            ).to(device=device, dtype=proj_dtype)
+            model_sla.frame_cond_proj = FrameCondProjector(
+                feat_dim=feat_dim,
+                text_dim=text_dim,
+                hidden_dim=hidden_dim,
+                n_layers=n_layers,
+                dropout=dropout,
+            ).to(device=device, dtype=proj_dtype)
+
+        missing_dense, unexpected_dense = model_dense.load_state_dict(sd, strict=False)
+        missing_sla, unexpected_sla = model_sla.load_state_dict(sd, strict=False)
+        writer.add_text(
+            "eval/ckpt_load",
+            f"ckpt={args.ckpt}\n"
+            f"missing_dense={len(missing_dense)} unexpected_dense={len(unexpected_dense)}\n"
+            f"missing_sla={len(missing_sla)} unexpected_sla={len(unexpected_sla)}",
+            0,
+        )
 
     model_dense.eval()
     model_sla.eval()
@@ -158,4 +205,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
